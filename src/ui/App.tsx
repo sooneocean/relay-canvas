@@ -21,6 +21,7 @@ import {
   Activity,
   AlertCircle,
   ArrowRight,
+  ArrowLeft,
   Box,
   Check,
   ChevronDown,
@@ -32,8 +33,11 @@ import {
   Film,
   FolderPlus,
   GitBranch,
+  Home,
   Image as ImageIcon,
+  ImagePlus,
   Info,
+  LayoutGrid,
   Layers3,
   Link2,
   LoaderCircle,
@@ -45,6 +49,7 @@ import {
   Plus,
   RefreshCw,
   Save,
+  Search,
   Settings2,
   SlidersHorizontal,
   Sparkles,
@@ -52,6 +57,7 @@ import {
   StickyNote,
   Trash2,
   Upload,
+  Video,
   X,
   Zap,
 } from 'lucide-react';
@@ -81,10 +87,13 @@ import type {
   Status,
 } from '../shared/types.js';
 import { parseBoard } from '../shared/schema.js';
+import { deriveAssets, deriveProjects, type AssetItem, type ProjectCard } from './catalog.js';
 
 type FlowNode = Node<CanvasData & { previewUrl?: string; runStatus?: Status; runError?: string }, 'canvas'>;
 type FlowEdge = Edge;
 type Panel = 'inspector' | 'history' | 'providers' | 'help';
+type View = 'home' | 'canvas' | 'assets';
+type AssetFilter = 'all' | 'image' | 'video';
 type ApiState = 'loading' | 'ready' | 'offline';
 type BoardConflict = { boardId: string; localRevision: number; remoteRevision: number };
 
@@ -250,6 +259,76 @@ function assetForResult(result?: NodeResult): Artifact | undefined {
   return result?.artifacts?.[0];
 }
 
+function VideoThumbnail({ src, alt, className = '' }: { src: string; alt: string; className?: string }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const previewTimeRef = useRef<number | undefined>(undefined);
+  const [poster, setPoster] = useState<string>();
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    previewTimeRef.current = undefined;
+    setPoster(undefined);
+    setFailed(false);
+  }, [src]);
+
+  const captureFrame = useCallback(() => {
+    const video = videoRef.current;
+    if (!video || video.seeking || previewTimeRef.current === undefined || video.currentTime < previewTimeRef.current || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth || !video.videoHeight) return;
+    try {
+      const canvas = document.createElement('canvas');
+      const width = Math.min(video.videoWidth, 960);
+      canvas.width = width;
+      canvas.height = Math.max(1, Math.round(width * video.videoHeight / video.videoWidth));
+      const context = canvas.getContext('2d');
+      if (!context) return;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const nextPoster = canvas.toDataURL('image/jpeg', 0.82);
+      if (nextPoster.length > 32) setPoster(nextPoster);
+    } catch {
+      setFailed(true);
+    }
+  }, []);
+
+  const handleMetadata = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (!Number.isFinite(video.duration) || video.duration <= 0) { setFailed(true); return; }
+    // Seeking forces a decoded frame before capture; loadeddata at time zero can
+    // expose a black surface in Chromium even when the source's first frame is valid.
+    previewTimeRef.current = Math.min(0.1, video.duration / 2);
+    try { video.currentTime = previewTimeRef.current; } catch { setFailed(true); }
+  }, []);
+
+  return (
+    <span className={`video-thumbnail ${failed ? 'is-failed' : ''} ${className}`.trim()}>
+      <video
+        ref={videoRef}
+        src={src}
+        poster={poster}
+        muted
+        playsInline
+        preload="metadata"
+        crossOrigin="anonymous"
+        aria-label={alt}
+        onLoadedMetadata={handleMetadata}
+        onLoadedData={captureFrame}
+        onSeeked={captureFrame}
+        onError={() => setFailed(true)}
+      />
+      {!poster && failed && <span className="video-thumbnail-fallback" aria-hidden="true"><Film size={22} /></span>}
+    </span>
+  );
+}
+
+function createStarterNode(kind: CanvasData['kind']): FlowNode {
+  const meta = nodeKindMeta[kind];
+  return {
+    id: makeId(kind),
+    type: 'canvas',
+    position: { x: 0, y: 0 },
+    data: { kind, label: `01 / ${meta.label}`, ...defaultData[kind] },
+  };
+}
+
 function CanvasNodeView({ data, selected }: NodeProps<FlowNode>) {
   const meta = nodeKindMeta[data.kind];
   const Icon = meta.icon;
@@ -277,9 +356,18 @@ const nodeTypes = { canvas: CanvasNodeView };
 
 function AppShell() {
   const reactFlow = useReactFlow<FlowNode, FlowEdge>();
+  const reactFlowRef = useRef(reactFlow);
+  reactFlowRef.current = reactFlow;
   const [apiState, setApiState] = useState<ApiState>('loading');
   const [apiError, setApiError] = useState('');
   const [token, setToken] = useState('');
+  const [view, setView] = useState<View>('home');
+  const [projectQuery, setProjectQuery] = useState('');
+  const [assetQuery, setAssetQuery] = useState('');
+  const [assetFilter, setAssetFilter] = useState<AssetFilter>('all');
+  const [assetPreview, setAssetPreview] = useState<AssetItem>();
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [navigationPending, setNavigationPending] = useState(false);
   const [boards, setBoards] = useState<Board[]>([starterBoard()]);
   const [providers, setProviders] = useState<Provider[]>(defaultProviders);
   const [runs, setRuns] = useState<Run[]>([]);
@@ -309,12 +397,26 @@ function AppShell() {
   const conflictNoticeRef = useRef<string | undefined>(undefined);
   const autosaveTimer = useRef<number | undefined>(undefined);
   const pollTimers = useRef<Map<string, number>>(new Map());
+  const pendingCreateKindRef = useRef<CanvasData['kind'] | undefined>(undefined);
+  const pendingNodeIdRef = useRef<string | undefined>(undefined);
+  const navigationGuardRef = useRef<Promise<boolean> | null>(null);
 
   const activeBoard = useMemo(() => boards.find((board) => board.id === activeBoardId) ?? boards[0], [activeBoardId, boards]);
   const selectedNode = useMemo(() => nodes.find((node) => node.id === selectedNodeId), [nodes, selectedNodeId]);
   const latestRun = useMemo(() => runs.find((run) => run.boardId === activeBoardId && run.revision === activeBoard?.revision), [activeBoard?.revision, activeBoardId, runs]);
   const latestRunSignature = useMemo(() => latestRun ? JSON.stringify({ id: latestRun.id, status: latestRun.status, results: latestRun.results }) : '', [latestRun]);
   const activeRun = useMemo(() => runs.find((run) => run.boardId === activeBoardId && !terminalStatuses.has(run.status)), [activeBoardId, runs]);
+  const projectCards = useMemo(() => deriveProjects(boards, runs), [boards, runs]);
+  const filteredProjects = useMemo(() => {
+    const query = projectQuery.trim().toLocaleLowerCase();
+    if (!query) return projectCards;
+    return projectCards.filter((project) => project.name.toLocaleLowerCase().includes(query));
+  }, [projectCards, projectQuery]);
+  const assets = useMemo(() => deriveAssets(boards, runs), [boards, runs]);
+  const filteredAssets = useMemo(() => {
+    const query = assetQuery.trim().toLocaleLowerCase();
+    return assets.filter((asset) => (assetFilter === 'all' || asset.kind === assetFilter) && (!query || `${asset.boardName} ${asset.nodeId}`.toLocaleLowerCase().includes(query)));
+  }, [assetFilter, assetQuery, assets]);
 
   useEffect(() => { tokenRef.current = token; }, [token]);
   useEffect(() => { activeBoardIdRef.current = activeBoardId; }, [activeBoardId]);
@@ -346,8 +448,8 @@ function AppShell() {
     setEdges(boardToFlowEdges(board));
     if (options.resetSelection ?? true) setSelectedNodeId(undefined);
     setPlan(undefined);
-    if (options.restoreViewport ?? true) reactFlow.setViewport(board.viewport, { duration: 0 });
-  }, [reactFlow]);
+    if (options.restoreViewport ?? true) reactFlowRef.current.setViewport(board.viewport, { duration: 0 });
+  }, []);
 
   const hydrate = useCallback(async () => {
     setApiState('loading');
@@ -469,12 +571,24 @@ function AppShell() {
 
   useEffect(() => {
     if (!activeBoard) return;
+    const pendingCreateKind = pendingCreateKindRef.current;
+    pendingCreateKindRef.current = undefined;
+    const pendingNodeId = pendingNodeIdRef.current;
+    pendingNodeIdRef.current = undefined;
     paintBoard(activeBoard);
-    dirtyRef.current = false;
-    setDirty(false);
+    if (pendingNodeId) {
+      if (activeBoard.nodes.some((node) => node.id === pendingNodeId)) {
+        setSelectedNodeId(pendingNodeId);
+        setPanel('inspector');
+      } else {
+        notify('素材來源節點已不存在；已開啟專案畫布。', 'info');
+      }
+    }
+    dirtyRef.current = Boolean(pendingCreateKind);
+    setDirty(Boolean(pendingCreateKind));
     editVersionRef.current += 1;
     setConflict(undefined);
-  }, [activeBoardId, paintBoard]);
+  }, [activeBoardId, notify, paintBoard]);
 
   useEffect(() => () => {
     if (autosaveTimer.current) window.clearTimeout(autosaveTimer.current);
@@ -617,7 +731,42 @@ function AppShell() {
     return () => { if (autosaveTimer.current) window.clearTimeout(autosaveTimer.current); };
   }, [apiState, conflict, dirty, saveBoard]);
 
-  const createBoard = useCallback(async () => {
+  const guardNavigation = useCallback(async (action: () => void, destination: string): Promise<boolean> => {
+    if (navigationGuardRef.current) return navigationGuardRef.current;
+    const operation = (async () => {
+      if (!dirtyRef.current) {
+        action();
+        return true;
+      }
+      setNavigationPending(true);
+      const editVersionAtStart = editVersionRef.current;
+      let savedBoard: Board | undefined;
+      try {
+        savedBoard = await saveBoard();
+      } finally {
+        setNavigationPending(false);
+      }
+      if (!savedBoard) {
+        notify(`無法${destination}：畫布尚未成功保存，原畫面與編輯仍保留。`, 'error');
+        return false;
+      }
+      if (editVersionRef.current !== editVersionAtStart || dirtyRef.current || conflict) {
+        notify(`無法${destination}：保存期間有新的編輯，請先完成保存。`, 'error');
+        return false;
+      }
+      action();
+      return true;
+    })();
+    navigationGuardRef.current = operation;
+    try {
+      return await operation;
+    } finally {
+      if (navigationGuardRef.current === operation) navigationGuardRef.current = null;
+    }
+  }, [conflict, notify, saveBoard]);
+
+  const createBoard = useCallback(async (kind?: CanvasData['kind']) => {
+    if (!await guardNavigation(() => undefined, '建立新專案')) return;
     const name = window.prompt('新畫布名稱', 'Untitled direction');
     if (!name?.trim()) return;
     if (apiState !== 'ready') {
@@ -627,13 +776,52 @@ function AppShell() {
     try {
       const created = await requestJson<Board | { board: Board }>('/api/boards', { method: 'POST', body: JSON.stringify({ name: name.trim() }) });
       const board = 'board' in created ? created.board : created;
-      setBoards((current) => [...current, board]);
-      setActiveBoardId(board.id);
+      const localBoard = kind ? { ...board, nodes: [createStarterNode(kind)] } : board;
+      setBoards((current) => [...current, localBoard]);
+      pendingCreateKindRef.current = kind;
+      setActiveBoardId(localBoard.id);
+      setView('canvas');
+      setPanel('inspector');
+      setPanelOpen(false);
       notify('新畫布已建立。', 'success');
     } catch (error) {
       notify(`建立畫布失敗：${errorMessage(error)}`, 'error');
     }
-  }, [apiState, notify, requestJson]);
+  }, [apiState, guardNavigation, notify, requestJson]);
+
+  const openProject = useCallback((boardId: string, nodeId?: string) => {
+    void guardNavigation(() => {
+      pendingNodeIdRef.current = nodeId;
+      setActiveBoardId(boardId);
+      setView('canvas');
+      setPanel('inspector');
+      setPanelOpen(false);
+      if (boardId === activeBoardIdRef.current) {
+        if (nodeId && boardsRef.current.find((board) => board.id === boardId)?.nodes.some((node) => node.id === nodeId)) {
+          setSelectedNodeId(nodeId);
+        } else if (nodeId) {
+          pendingNodeIdRef.current = undefined;
+          notify('素材來源節點已不存在；已開啟專案畫布。', 'info');
+        }
+      }
+    }, '開啟專案');
+  }, [guardNavigation, notify]);
+
+  const goHome = useCallback(() => {
+    void guardNavigation(() => {
+      setView('home');
+      setPanelOpen(false);
+      setAssetPreview(undefined);
+    }, '返回首頁');
+  }, [guardNavigation]);
+
+  const openAssets = useCallback(() => {
+    void guardNavigation(() => {
+      setView('assets');
+      setPanelOpen(false);
+      setAssetPreview(undefined);
+    }, '開啟素材');
+  }, [guardNavigation]);
 
   const exportBoard = useCallback(() => {
     if (!activeBoard) return;
@@ -773,9 +961,14 @@ function AppShell() {
   }, [latestRunSignature]);
 
   const changeBoard = useCallback((event: ChangeEvent<HTMLSelectElement>) => {
-    if (dirtyRef.current && !window.confirm('目前畫布有尚未保存的變更，要切換嗎？')) return;
-    setActiveBoardId(event.target.value);
-  }, []);
+    const boardId = event.target.value;
+    void guardNavigation(() => {
+      setActiveBoardId(boardId);
+      setView('canvas');
+      setPanel('inspector');
+      setPanelOpen(false);
+    }, '切換專案');
+  }, [guardNavigation]);
 
   const updateProviderDraft = useCallback((patch: Partial<Provider>) => {
     setProviders((current) => current.map((provider) => provider.id === providerDraftId ? { ...provider, ...patch } : provider));
@@ -834,16 +1027,54 @@ function AppShell() {
 
   const selectedResult = selectedNodeId && latestRun ? latestRun.results[selectedNodeId] : undefined;
 
+  const toastView = toast ? <ToastView toast={toast} onClose={() => setToast(undefined)} /> : null;
+
+  if (view === 'home') {
+    return <HomePage
+      cards={filteredProjects}
+      query={projectQuery}
+      apiState={apiState}
+      apiError={apiError}
+      navigationPending={navigationPending}
+      onQueryChange={setProjectQuery}
+      onCreate={() => void createBoard()}
+      onCreateImage={() => void createBoard('image')}
+      onCreateVideo={() => void createBoard('video')}
+      onOpenProject={openProject}
+      onOpenAssets={openAssets}
+      onOpenCodex={() => { setView('canvas'); setPanel('help'); setPanelOpen(true); }}
+    >{toastView}</HomePage>;
+  }
+
+  if (view === 'assets') {
+    return <AssetsPage
+      assets={filteredAssets}
+      totalCount={assets.length}
+      query={assetQuery}
+      filter={assetFilter}
+      navigationPending={navigationPending}
+      onQueryChange={setAssetQuery}
+      onFilterChange={setAssetFilter}
+      onBack={goHome}
+      onOpenBoard={(boardId, nodeId) => openProject(boardId, nodeId)}
+      preview={assetPreview}
+      onPreview={setAssetPreview}
+      onClosePreview={() => setAssetPreview(undefined)}
+      onCreate={() => void createBoard()}
+    >{toastView}</AssetsPage>;
+  }
+
   return (
-    <div className="app-shell">
-      <header className="topbar">
+    <div className="app-shell app-canvas">
+      <header className="topbar canvas-topbar">
+        <button className="topbar-back" aria-label="back-home" onClick={goHome} disabled={navigationPending}><ArrowLeft size={15} />Projects</button>
         <div className="brand-lockup">
           <div className="brand-mark"><span /></div>
           <div>
             <div className="brand-name">Relay Canvas</div>
             <div className="brand-kicker">IDEAS, CONNECTED.</div>
           </div>
-          <span className="version-tag">v0.1.0</span>
+          <span className="version-tag">v0.2 Preview</span>
         </div>
         <div className="board-switcher">
           <Layers3 size={15} />
@@ -857,15 +1088,19 @@ function AppShell() {
             <span className="connection-dot" />
             {apiState === 'ready' ? 'LOCAL API' : apiState === 'loading' ? 'CONNECTING' : 'OFFLINE'}
           </div>
-          <button className="ghost-button" onClick={() => setPanel('help')}><CircleHelp size={15} />MCP help</button>
-          <button className="primary-button" aria-label="save" onClick={() => void saveBoard()} disabled={saving || !dirty}>
+          <button className="ghost-button" onClick={() => { setPanel('help'); setPanelOpen(true); }}><CircleHelp size={15} />MCP help</button>
+          <button className="primary-button" aria-label="save" onClick={() => void saveBoard()} disabled={saving || !dirty || navigationPending}>
             {saving ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />} {saving ? '保存中' : '保存'}
           </button>
         </div>
       </header>
 
-      <div className="workspace">
-        <aside className="left-rail">
+      <div className="workspace canvas-workspace">
+        <aside className="left-rail canvas-rail">
+          <div className="rail-navigation">
+            <button className="rail-nav-button" aria-label="home-nav" onClick={goHome} disabled={navigationPending}><Home size={15} /><span>Projects</span></button>
+            <button className="rail-nav-button" aria-label="assets-nav" onClick={openAssets} disabled={navigationPending}><LayoutGrid size={15} /><span>Assets</span></button>
+          </div>
           <div className="rail-section rail-section-main">
             <div className="rail-label">BUILD</div>
             {(Object.keys(nodeKindMeta) as CanvasData['kind'][]).map((kind) => {
@@ -887,9 +1122,9 @@ function AppShell() {
           </div>
           <div className="rail-spacer" />
           <div className="rail-section">
-            <button className={`rail-tool ${panel === 'history' ? 'is-active' : ''}`} onClick={() => setPanel('history')}><span className="rail-tool-icon"><Clock3 size={17} /></span><span>History</span></button>
-            <button className={`rail-tool ${panel === 'providers' ? 'is-active' : ''}`} aria-label="provider-settings" onClick={() => setPanel('providers')}><span className="rail-tool-icon"><Settings2 size={17} /></span><span>Providers</span></button>
-            <button className={`rail-tool ${panel === 'help' ? 'is-active' : ''}`} onClick={() => setPanel('help')}><span className="rail-tool-icon"><CircleHelp size={17} /></span><span>Guide</span></button>
+            <button className={`rail-tool ${panel === 'history' && panelOpen ? 'is-active' : ''}`} onClick={() => { setPanel('history'); setPanelOpen(true); }}><span className="rail-tool-icon"><Clock3 size={17} /></span><span>History</span></button>
+            <button className={`rail-tool ${panel === 'providers' && panelOpen ? 'is-active' : ''}`} aria-label="provider-settings" onClick={() => { setPanel('providers'); setPanelOpen(true); }}><span className="rail-tool-icon"><Settings2 size={17} /></span><span>Providers</span></button>
+            <button className={`rail-tool ${panel === 'help' && panelOpen ? 'is-active' : ''}`} onClick={() => { setPanel('help'); setPanelOpen(true); }}><span className="rail-tool-icon"><CircleHelp size={17} /></span><span>Guide</span></button>
           </div>
           <div className="rail-footnote"><span className="demo-chip">DEMO</span><span>Local-first</span></div>
         </aside>
@@ -916,10 +1151,8 @@ function AppShell() {
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
               onConnect={onConnect}
-              onNodeClick={(_, node) => { setSelectedNodeId(node.id); setPanel('inspector'); }}
+              onNodeClick={(_, node) => { setSelectedNodeId(node.id); setPanel('inspector'); setPanelOpen(false); }}
               onPaneClick={() => setSelectedNodeId(undefined)}
-              fitView
-              fitViewOptions={{ padding: 0.2, maxZoom: 1.05 }}
               deleteKeyCode={['Backspace', 'Delete']}
               snapToGrid
               snapGrid={[16, 16]}
@@ -934,19 +1167,21 @@ function AppShell() {
             </ReactFlow>
             <div className="canvas-watermark"><span className="watermark-pulse" />{apiState === 'ready' ? 'Connected to local runtime' : 'Demo canvas · local preview'}</div>
           </div>
+          {selectedNode && !panelOpen && panel === 'inspector' && <div className={`floating-composer${selectedNode.data.previewUrl || selectedNode.data.assetUrl ? ' has-media-preview' : ''}`} aria-label="floating-composer"><button className="floating-composer-close" aria-label="close-floating-composer" onClick={() => setSelectedNodeId(undefined)}><X size={14} /></button><InspectorPanel node={selectedNode} providers={providers} selectedResult={selectedResult} onChange={updateSelectedNode} onDelete={deleteSelectedNode} onOpenProviders={() => { setProviderDraftId(selectedNode.data.providerId ?? 'demo'); setPanel('providers'); setPanelOpen(true); }} /></div>}
           {plan && <div className={`validation-toast ${plan.errors.length ? 'has-errors' : ''}`}><span>{plan.errors.length ? <AlertCircle size={14} /> : <Check size={14} />}</span><div><strong>{plan.errors.length ? 'Validation needs attention' : 'Ready to run'}</strong><small>{plan.errors.length ? plan.errors[0] : `${plan.order.length} node${plan.order.length === 1 ? '' : 's'} in execution order`}</small></div><button aria-label="close-validation" onClick={() => setPlan(undefined)}><X size={14} /></button></div>}
         </main>
 
-        <aside className={`right-panel ${panel === 'inspector' ? '' : 'panel-mode'}`}>
+        {panelOpen && <aside className={`right-panel ${panel === 'inspector' ? '' : 'panel-mode'}`}>
+          <div className="panel-drawer-head"><span>Canvas tools</span><button className="icon-button" aria-label="close-panel" onClick={() => setPanelOpen(false)}><X size={15} /></button></div>
           <div className="panel-tabs">
             <button className={panel === 'inspector' ? 'is-active' : ''} onClick={() => setPanel('inspector')}><PanelRight size={15} />Inspector</button>
             <button className={panel === 'history' ? 'is-active' : ''} onClick={() => setPanel('history')}><Clock3 size={15} />History{runs.length > 0 && <span className="tab-count">{runs.length}</span>}</button>
           </div>
-          {panel === 'inspector' && <InspectorPanel node={selectedNode} providers={providers} selectedResult={selectedResult} onChange={updateSelectedNode} onDelete={deleteSelectedNode} onOpenProviders={() => { setProviderDraftId(selectedNode?.data.providerId ?? 'demo'); setPanel('providers'); }} />}
+          {panel === 'inspector' && <InspectorPanel node={selectedNode} providers={providers} selectedResult={selectedResult} onChange={updateSelectedNode} onDelete={deleteSelectedNode} onOpenProviders={() => { setProviderDraftId(selectedNode?.data.providerId ?? 'demo'); setPanel('providers'); setPanelOpen(true); }} />}
           {panel === 'history' && <HistoryPanel runs={runs.filter((run) => run.boardId === activeBoardId)} activeRunId={activeRun?.id} currentRevision={activeBoard?.revision} onSelect={(run) => { if (run.revision !== activeBoard?.revision) { notify('這筆執行來自較舊 revision，保留在 history，不覆蓋目前畫布。', 'info'); return; } setNodes((current) => current.map((node) => { const result = run.results[node.id]; const artifact = assetForResult(result); return result ? { ...node, data: { ...node.data, runStatus: result.status, runError: result.error, previewUrl: artifact?.url } } : node; })); }} />}
           {panel === 'providers' && <ProvidersPanel providers={providers} selectedId={providerDraftId} settings={settings} dirty={providersDirty} onSelect={setProviderDraftId} onChange={updateProviderDraft} onAdd={addProvider} onSave={() => void saveProviders()} />}
           {panel === 'help' && <HelpPanel />}
-        </aside>
+        </aside>}
       </div>
 
       <footer className="statusbar">
@@ -959,6 +1194,83 @@ function AppShell() {
       {confirmRun && <RunConfirmDialog confirm={confirmRun} providers={providers} onCancel={() => setConfirmRun(undefined)} onConfirm={() => void startRun(confirmRun.nodeId, true, confirmRun.operationId)} />}
     </div>
   );
+}
+
+function ToastView({ toast, onClose }: { toast: { tone: 'info' | 'error' | 'success'; message: string }; onClose: () => void }) {
+  return <div className={`toast toast-${toast.tone}`} role="status"><span className="toast-icon">{toast.tone === 'success' ? <Check size={15} /> : toast.tone === 'error' ? <AlertCircle size={15} /> : <Info size={15} />}</span>{toast.message}<button onClick={onClose} aria-label="close-message"><X size={14} /></button></div>;
+}
+
+function HomePage({ cards, query, apiState, apiError, navigationPending, onQueryChange, onCreate, onCreateImage, onCreateVideo, onOpenProject, onOpenAssets, onOpenCodex, children }: {
+  cards: ProjectCard[];
+  query: string;
+  apiState: ApiState;
+  apiError: string;
+  navigationPending: boolean;
+  onQueryChange: (value: string) => void;
+  onCreate: () => void;
+  onCreateImage: () => void;
+  onCreateVideo: () => void;
+  onOpenProject: (boardId: string) => void;
+  onOpenAssets: () => void;
+  onOpenCodex: () => void;
+  children?: ReactNode;
+}) {
+  return <div className="home-layout">
+    <aside className="home-sidebar">
+      <div className="home-brand"><div className="brand-mark"><span /></div><div><strong>Relay Canvas</strong><small>CREATOR WORKSPACE</small></div></div>
+      <nav className="home-nav" aria-label="主導覽">
+        <button className="home-nav-item is-active" aria-label="home-nav" onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}><Home size={16} />首頁</button>
+        <button className="home-nav-item" onClick={() => document.getElementById('projects-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}><FolderPlus size={16} />專案</button>
+        <button className="home-nav-item" aria-label="assets-nav" onClick={onOpenAssets} disabled={navigationPending}><LayoutGrid size={16} />素材</button>
+        <button className="home-nav-item" onClick={onOpenCodex}><Code2 size={16} />Codex MCP</button>
+      </nav>
+      <div className="home-sidebar-rule" />
+      <div className="home-sidebar-label">CREATE</div>
+      <button className="home-create-link" aria-label="create-image" onClick={onCreateImage} disabled={navigationPending}><span className="home-create-icon"><ImagePlus size={16} /></span><span><strong>圖片創作</strong><small>Image direction</small></span></button>
+      <button className="home-create-link" aria-label="create-video" onClick={onCreateVideo} disabled={navigationPending}><span className="home-create-icon video"><Video size={16} /></span><span><strong>影片創作</strong><small>Motion study</small></span></button>
+      <div className="home-sidebar-bottom"><span className="demo-chip">DEMO</span><span>v0.2 Preview</span><span className={`home-api-state ${apiState}`}><i />{apiState === 'ready' ? 'Local API' : apiState === 'loading' ? 'Connecting' : 'Offline'}</span></div>
+    </aside>
+    <main className="home-main">
+      <header className="home-header"><div><span className="home-eyebrow">PROJECTS / LOCAL WORKSPACE</span><h1>把想法變成畫面。</h1><p>從一個方向開始，讓素材沿著畫布流動。</p></div><div className="home-header-actions"><span className="preview-tag">v0.2 Preview</span><button className="home-codex-button" onClick={onOpenCodex}><Code2 size={15} />Codex help</button></div></header>
+      <section className="new-project-zone"><button className="new-project-card" aria-label="new-project" onClick={onCreate} disabled={navigationPending}><span className="new-project-plus"><Plus size={28} strokeWidth={1.5} /></span><strong>新建專案</strong><small>Start a new creative canvas</small></button></section>
+      <section className="quick-create"><div className="section-heading"><div><span className="home-eyebrow">QUICK START</span><h2>選一個入口</h2></div><span className="section-note">Local-first · API connected</span></div><div className="quick-create-grid"><button onClick={onCreateImage} aria-label="create-image" disabled={navigationPending}><span className="quick-icon image"><ImageIcon size={19} /></span><span><strong>圖片創作</strong><small>Build a still frame</small></span><ArrowRight size={15} /></button><button onClick={onCreateVideo} aria-label="create-video" disabled={navigationPending}><span className="quick-icon video"><Film size={19} /></span><span><strong>影片創作</strong><small>Turn a frame into motion</small></span><ArrowRight size={15} /></button></div></section>
+      <section id="projects-section" className="projects-section"><div className="section-heading projects-heading"><div><span className="home-eyebrow">YOUR WORK</span><h2>專案</h2></div><label className="project-search"><Search size={15} /><input aria-label="project-search" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜尋專案" /></label></div>{apiState === 'offline' && <div className="home-api-notice"><AlertCircle size={14} />{apiError || '服務離線；目前可查看 Demo 畫布。'}</div>}{cards.length === 0 ? <div className="empty-projects"><FolderPlus size={22} /><h3>還沒有符合的專案</h3><p>換一個搜尋字詞，或建立新的創作畫布。</p><button className="light-button" onClick={onCreate} disabled={navigationPending}><Plus size={14} />新建專案</button></div> : <div className="project-grid">{cards.map((card, index) => <ProjectCardView key={card.boardId} card={card} index={index} onOpen={() => onOpenProject(card.boardId)} />)}</div>}</section>
+      <footer className="home-footer"><span>Relay Canvas</span><span>Local runtime · protocol tested · live unverified</span></footer>
+    </main>
+    {children}
+  </div>;
+}
+
+function ProjectCardView({ card, index, onOpen }: { card: ProjectCard; index: number; onOpen: () => void }) {
+  const thumbnail = card.thumbnail;
+  return <button className="project-card" data-testid={card.boardId === 'welcome' ? 'project-card-welcome' : undefined} aria-label={card.boardId === 'welcome' ? 'project-card-welcome' : `project-card-${card.boardId}`} onClick={onOpen}><div className={`project-card-media ${thumbnail ? 'has-thumb' : 'is-empty'}`}>{thumbnail?.kind === 'image' && <img src={thumbnail.url} alt="" referrerPolicy="no-referrer" crossOrigin="anonymous" />}{thumbnail?.kind === 'video' && <VideoThumbnail src={thumbnail.url} alt="影片縮圖" />}{!thumbnail && <><span className="empty-canvas-mark"><LayoutGrid size={24} /></span><span>EMPTY CANVAS</span></>}</div><div className="project-card-body"><div><strong>{card.name}</strong><small>{card.thumbnailRunAt ? `上次生成 · ${new Date(card.thumbnailRunAt).toLocaleDateString('zh-TW')}` : card.latestRunAt ? `最近執行 · ${new Date(card.latestRunAt).toLocaleDateString('zh-TW')}` : `${card.nodeCount} nodes · ready to shape`}</small></div><span className="project-card-index">{String(index + 1).padStart(2, '0')}</span></div><div className="project-card-meta"><span>{card.nodeCount} nodes</span><span>{card.edgeCount} links</span><span className="project-open-label">開啟 <ArrowRight size={13} /></span></div></button>;
+}
+
+function AssetsPage({ assets, totalCount, query, filter, navigationPending, onQueryChange, onFilterChange, onBack, onOpenBoard, preview, onPreview, onClosePreview, onCreate, children }: {
+  assets: AssetItem[];
+  totalCount: number;
+  query: string;
+  filter: AssetFilter;
+  navigationPending: boolean;
+  onQueryChange: (value: string) => void;
+  onFilterChange: (value: AssetFilter) => void;
+  onBack: () => void;
+  onOpenBoard: (boardId: string, nodeId?: string) => void;
+  preview?: AssetItem;
+  onPreview: (asset: AssetItem) => void;
+  onClosePreview: () => void;
+  onCreate: () => void;
+  children?: ReactNode;
+}) {
+  return <div className="assets-layout"><header className="assets-header"><button className="topbar-back" aria-label="back-home" onClick={onBack} disabled={navigationPending}><ArrowLeft size={15} />Projects</button><div className="assets-brand"><div className="brand-mark"><span /></div><strong>Relay Canvas</strong><span className="preview-tag">v0.2 Preview</span></div><div className="assets-header-note">REAL OUTPUTS / LOCAL CATALOG</div></header><main className="assets-main"><div className="assets-heading"><div><span className="home-eyebrow">MEDIA LIBRARY</span><h1>素材</h1><p>只顯示已完成執行產生的真實圖片與影片。</p></div><div className="assets-actions"><label className="project-search"><Search size={15} /><input aria-label="asset-search" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜尋素材" /></label><button className="light-button" aria-label="new-project" onClick={onCreate} disabled={navigationPending}><Plus size={14} />新建專案</button></div></div><div className="asset-toolbar"><div className="asset-filters"><button className={filter === 'all' ? 'is-active' : ''} onClick={() => onFilterChange('all')}>全部 <span>{totalCount}</span></button><button className={filter === 'image' ? 'is-active' : ''} aria-label="gallery-filter-image" onClick={() => onFilterChange('image')}>圖片</button><button className={filter === 'video' ? 'is-active' : ''} aria-label="gallery-filter-video" onClick={() => onFilterChange('video')}>影片</button></div><span className="asset-count">{assets.length.toString().padStart(2, '0')} shown / {totalCount.toString().padStart(2, '0')} total</span></div>{assets.length === 0 ? <div className="empty-assets"><div className="empty-assets-icon"><LayoutGrid size={22} /></div><h2>尚無生成素材</h2><p>完成一次 Demo 或已確認的遠端執行後，成果會出現在這裡。</p><button className="light-button" onClick={onCreate} disabled={navigationPending}><Plus size={14} />建立第一個專案</button></div> : <div className="asset-grid">{assets.map((asset) => <AssetCard key={asset.id} asset={asset} onPreview={() => onPreview(asset)} onOpenBoard={() => onOpenBoard(asset.boardId, asset.nodeId)} />)}</div>}</main>{preview && <AssetPreview asset={preview} onClose={onClosePreview} onOpenBoard={() => { onClosePreview(); onOpenBoard(preview.boardId, preview.nodeId); }} />}{children}</div>;
+}
+
+function AssetCard({ asset, onPreview, onOpenBoard }: { asset: AssetItem; onPreview: () => void; onOpenBoard: () => void }) {
+  return <article className="asset-card"><button className="asset-preview-button" aria-label={`gallery-item-${asset.id}`} onClick={onPreview}>{asset.kind === 'image' ? <img src={asset.url} alt={asset.nodeId} referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <VideoThumbnail src={asset.url} alt={asset.nodeId} />}<span className="asset-kind-badge">{asset.artifact.demo ? 'DEMO' : asset.kind.toUpperCase()}</span><span className="asset-hover-icon"><Maximize2 size={15} /></span></button><div className="asset-card-info"><div><strong>{asset.boardName}</strong><small>{asset.nodeId} · {new Date(asset.startedAt).toLocaleDateString('zh-TW')}</small></div><button className="asset-open-board" aria-label={`open-board-${asset.boardId}`} onClick={onOpenBoard}>開啟畫布 <ArrowRight size={13} /></button></div></article>;
+}
+
+function AssetPreview({ asset, onClose, onOpenBoard }: { asset: AssetItem; onClose: () => void; onOpenBoard: () => void }) {
+  return <div className="asset-preview-scrim" role="presentation" onClick={onClose}><div className="asset-preview-dialog" role="dialog" aria-modal="true" aria-label="asset-preview" onClick={(event) => event.stopPropagation()}><button className="asset-preview-close" aria-label="close-asset-preview" onClick={onClose}><X size={16} /></button><div className="asset-preview-media">{asset.kind === 'image' ? <img src={asset.url} alt={asset.nodeId} referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <video src={asset.url} controls autoPlay muted playsInline crossOrigin="anonymous" />}</div><div className="asset-preview-caption"><div><span className="home-eyebrow">{asset.artifact.demo ? 'DEMO OUTPUT' : 'OUTPUT'}</span><h2>{asset.boardName}</h2><p>{asset.nodeId} · {new Date(asset.startedAt).toLocaleString('zh-TW')}</p></div><button className="light-button" onClick={onOpenBoard}>開啟專案 <ArrowRight size={14} /></button></div></div></div>;
 }
 
 function InspectorPanel({ node, providers, selectedResult, onChange, onDelete, onOpenProviders }: { node?: FlowNode; providers: Provider[]; selectedResult?: NodeResult; onChange: (patch: Partial<CanvasData>) => void; onDelete: () => void; onOpenProviders: () => void }) {
