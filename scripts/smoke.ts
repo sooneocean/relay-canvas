@@ -56,11 +56,23 @@ try {
   const header = await brief.locator('.node-heading').boundingBox(); assert.ok(header);
   await page.mouse.move(header.x + 30, header.y + 8); await page.mouse.down(); await page.mouse.move(header.x + 90, header.y + 65, { steps: 8 }); await page.mouse.up();
   await until(() => api<AppState>('/api/state'), s => s.boards[0].nodes.find(n => n.id === 'brief')!.position.x !== before.x, 'drag persisted');
+  // Exercise a real handle-to-handle gesture, adding text alongside the image input.
+  const source = await brief.locator('.react-flow__handle.source').boundingBox();
+  const target = await page.locator('.react-flow__node[data-id="motion"] .react-flow__handle.target').boundingBox();
+  assert.ok(source && target);
+  await page.mouse.move(source.x + source.width / 2, source.y + source.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 16 });
+  await page.mouse.up();
+  await until(() => api<AppState>('/api/state'), s => s.boards[0].edges.some(e => e.source === 'brief' && e.target === 'motion'), 'new connection persisted');
   await page.getByLabel('run-all', { exact: true }).click();
   const complete = await until(() => api<AppState>('/api/state'), s => s.runs[0]?.status === 'succeeded', 'Demo image/video workflow');
   assert.equal(complete.runs[0].results.motion.referenceUrl, complete.runs[0].results.frame.artifacts[0].url);
   await page.locator('.react-flow__node[data-id="frame"] img').waitFor();
   await until(() => page.locator('.react-flow__node[data-id="motion"] video').evaluate(el => (el as HTMLVideoElement).readyState), n => n >= 2, 'video ready');
+  await page.locator('.react-flow__node[data-id="motion"] video').evaluate(async el => { const video = el as HTMLVideoElement; video.muted = true; await video.play(); });
+  await until(() => page.locator('.react-flow__node[data-id="motion"] video').evaluate(el => (el as HTMLVideoElement).currentTime), n => n > 0.05, 'video playback advances');
+  await page.locator('.react-flow__node[data-id="motion"] video').evaluate(el => (el as HTMLVideoElement).pause());
   await page.screenshot({ path: path.join(artifacts, 'canvas-smoke.png'), fullPage: true });
   const downloadPromise = page.waitForEvent('download');
   await page.getByLabel('export-board').click();
@@ -98,7 +110,7 @@ try {
   await page.getByLabel('provider-settings').first().click();
   await page.getByText('Remote generation disabled', { exact: true }).waitFor();
   assert.deepEqual(failures, [], `Browser console errors: ${failures.join('\n')}`);
-  writeFileSync(path.join(artifacts, 'smoke-report.json'), JSON.stringify({ status: 'PASS', browser: await browser.version(), checks: ['UI load', 'edit/save', 'drag', 'Demo image to video exact reference', 'video playback ready', 'JSON export/import', 'reload', 'MCP list and patch', 'MCP run and idempotent replay', 'Agent UI sync', 'add/delete node', 'provider settings', 'no browser errors'], paidRequests: 0 }, null, 2));
+  writeFileSync(path.join(artifacts, 'smoke-report.json'), JSON.stringify({ status: 'PASS', browser: await browser.version(), checks: ['UI load', 'edit/save', 'drag', 'connect handles and persist', 'Demo image to video exact reference', 'video playback advances', 'JSON export/import', 'reload', 'MCP list and patch', 'MCP run and idempotent replay', 'Agent UI sync', 'add/delete node', 'provider settings', 'no browser errors'], paidRequests: 0 }, null, 2));
   console.log('PASS: browser canvas, persistence, Demo image/video, MCP tools, Agent UI sync; zero paid requests.');
 } catch (error) {
   console.error((error as Error).message);
