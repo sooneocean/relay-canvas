@@ -1,0 +1,40 @@
+{
+  "name": "relay-canvas",
+  "version": "0.1.0",
+  "description": "A local-first React Flow image and video canvas with a Codex MCP control surface.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22.12" },
+  "scripts": {
+    "dev": "tsx --env-file-if-exists=.env server/main.ts --dev",
+    "start": "node --env-file-if-exists=.env build/server/main.js",
+    "mcp": "node build/server/mcp.js",
+    "check": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "build": "vite build && tsc -p tsconfig.server.json",
+    "test": "tsx --test tests/*.test.ts",
+    "smoke": "tsx scripts/smoke.ts",
+    "package:release": "node scripts/package-release.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.0",
+    "@xyflow/react": "^12.10.0",
+    "express": "^5.1.0",
+    "ipaddr.js": "^2.2.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0",
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.19.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.1.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.2.0"
+  }
+}

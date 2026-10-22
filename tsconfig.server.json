@@ -1,0 +1,4 @@
+{
+  "compilerOptions": { "target": "ES2022", "lib": ["ES2022", "DOM"], "module": "NodeNext", "moduleResolution": "NodeNext", "strict": true, "esModuleInterop": true, "skipLibCheck": true, "outDir": "build", "rootDir": ".", "sourceMap": true },
+  "include": ["server", "src/shared", "tests", "scripts/*.ts"]
+}
