@@ -23,6 +23,7 @@ const child = spawn(process.execPath, ['build/server/main.js'], { cwd: root, env
 child.stdout.resume(); child.stderr.resume();
 let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 let client: Client | undefined;
+let comparisonFixtureError: string | undefined;
 async function until<T>(probe: () => Promise<T>, predicate: (value: T) => boolean, label: string, timeout = 30000): Promise<T> {
   const end = Date.now() + timeout;
   do { try { const value = await probe(); if (predicate(value)) return value; } catch { /* bounded startup/poll */ } await delay(100); } while (Date.now() < end);
@@ -271,14 +272,15 @@ try {
   const comparisonPattern = '**/api/boards/welcome/compare?*';
   await page.route(comparisonPattern, async route => {
     try {
-      // APIRequestContext does not preserve Chromium's sec-fetch metadata on GET.
-      const response = await route.fetch({ headers: { ...route.request().headers(), Origin: origin } });
-      if (!response.ok()) { await route.fulfill({ response }); return; }
-      const payload = await response.json() as RunComparison;
+      // Replay through our authenticated fixture API, independent of browser
+      // fetch-metadata headers stripped by Playwright's APIRequestContext.
+      const requested = new URL(route.request().url());
+      const payload = await api<RunComparison>(requested.pathname + requested.search);
       const artifact = payload.right.results.motion?.artifacts[0];
       if (artifact) artifact.url = exports[0].artifact!.localUrl!;
-      await route.fulfill({ response, json: payload });
-    } catch {
+      await route.fulfill({ status: 200, contentType: 'application/json', json: payload });
+    } catch (error) {
+      comparisonFixtureError = error instanceof Error ? error.message : 'Controlled comparison fixture failed';
       // Let the awaited UI acceptance fail through the outer finally cleanup.
       await route.abort('failed').catch(() => undefined);
     }
@@ -286,8 +288,11 @@ try {
   await page.getByTestId('compare-open').click();
   await compare.waitFor();
   await compare.getByTestId('compare-node').selectOption('motion');
-  await until(() => compare.locator('video').evaluateAll(elements => elements.map(element => (element as HTMLVideoElement).duration)), values => values.length === 2 && values.every(Number.isFinite) && Math.abs(values[0] - values[1]) > 0.5, 'unequal-duration actual media fixture loaded');
+  await until(() => compare.locator('video').evaluateAll(elements => elements.map(element => element.getAttribute('src'))), values => values.includes(exports[0].artifact!.localUrl!), 'controlled shorter video URL is selected');
+  // preload is advisory. Use the real creator Play action to load both sources
+  // before requiring their durations; do not depend on offscreen preload policy.
   await compare.getByTestId('compare-play').click();
+  await until(() => compare.locator('video').evaluateAll(elements => elements.map(element => (element as HTMLVideoElement).duration)), values => values.length === 2 && values.every(Number.isFinite) && Math.abs(values[0] - values[1]) > 0.5, 'unequal-duration actual media fixture loaded');
   await until(() => compare.locator('video').evaluateAll(elements => ({ ended: elements.some(element => (element as HTMLVideoElement).ended), continuing: elements.some(element => !(element as HTMLVideoElement).ended && !(element as HTMLVideoElement).paused) })), value => value.ended && value.continuing, 'short comparison source ends while longer source continues');
   assert.ok((await compare.getByTestId('compare-play').innerText()).includes('Pause videos'), 'a remaining playing source keeps Pause');
   await until(() => compare.getByTestId('compare-scrub').inputValue(), value => Number(value) > 2.15, 'comparison clock continues beyond the shorter source');
@@ -311,6 +316,7 @@ try {
 } catch (error) {
   const page = browser?.contexts()[0]?.pages()[0];
   if (page) {
+    console.error(JSON.stringify({ editorSmokeFailure: error instanceof Error ? error.message : 'Editor smoke failed', comparisonFixtureError, videos: await page.locator('video').evaluateAll(elements => elements.map(element => { const video = element as HTMLVideoElement; return { label: video.getAttribute('aria-label'), source: video.getAttribute('src'), time: video.currentTime, duration: video.duration, ready: video.readyState, paused: video.paused, mediaErrorCode: video.error?.code }; })) }));
     await page.screenshot({ path: path.join(artifacts, 'editor-smoke-failure.png'), fullPage: true });
     writeFileSync(path.join(artifacts, 'editor-smoke-failure.json'), JSON.stringify({ error: error instanceof Error ? error.message : 'Editor smoke failed', text: await page.locator('body').innerText(), videos: await page.locator('video').evaluateAll(elements => elements.map(element => ({ src: (element as HTMLVideoElement).getAttribute('src'), time: (element as HTMLVideoElement).currentTime, duration: (element as HTMLVideoElement).duration, ready: (element as HTMLVideoElement).readyState, paused: (element as HTMLVideoElement).paused, error: (element as HTMLVideoElement).error?.message }))), scrub: await page.getByTestId('timeline-scrub').inputValue().catch(() => undefined) }, null, 2));
   }
