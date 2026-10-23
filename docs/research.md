@@ -12,6 +12,8 @@ REA 觀察到首頁證據 `ev_7b8c4e4ae215c74bb74aa803fc4c37bb7cd45a797178d3f444
 
 ## 協定來源
 
+2026-10-23 v0.4 補充觀察：REA 隔離 Chromium 公開首頁證據 `ev_0bded9260e060398cebe91db1c7d9ecbc8920d967e2871854f9e90a506be7747`，可見 Agent、畫布、資產和智慧剪輯等入口。未取得登入內時間軸、匯出或版本比較證據；競品差距與一千輪改進計數方式見 [持續改進](competitive-progress.md)。
+
 - React Flow save／restore：<https://reactflow.dev/examples/interaction/save-and-restore>
 - fal queue：<https://fal.ai/docs/documentation/model-apis/inference/queue>
 - Replicate HTTP API：<https://replicate.com/docs/reference/http/>

@@ -101,7 +101,7 @@ try {
   client = new Client({ name: 'relay-smoke', version: '1.0.0' });
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'build/server/mcp.js')], cwd: root, env: { ...Object.fromEntries(Object.entries(process.env).filter((x): x is [string, string] => x[1] !== undefined)), RELAY_DATA_DIR: dataDir }, stderr: 'pipe' });
   await client.connect(transport);
-  const tools = await client.listTools(); assert.equal(tools.tools.length, 9);
+  const tools = await client.listTools(); assert.equal(tools.tools.length, 17);
   const list = await client.callTool({ name: 'list_boards', arguments: {} }); assert.equal(list.isError, false);
   const board = (await api<AppState>('/api/state')).boards[0];
   const patch = await client.callTool({ name: 'apply_operations', arguments: { boardId: board.id, expectedRevision: board.revision, operations: [{ type: 'update_node', id: 'brief', data: { prompt: 'Codex changed this exact canvas.' } }] } });

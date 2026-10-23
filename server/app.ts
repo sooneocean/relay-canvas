@@ -11,7 +11,7 @@ export function createApp(service: CanvasService, origin: string, token = random
   app.disable('x-powered-by');
   app.use(createBoundary({ origin, token, dev, policy: service.policy }));
   app.use(express.json({ limit: '6mb', strict: true }));
-  app.get('/healthz', (_req, res) => { res.json({ ok: true, version: '0.3.0' }); });
+  app.get('/healthz', (_req, res) => { res.json({ ok: true, version: '0.4.0' }); });
   app.get('/api/session', (_req, res) => {
     res.setHeader('Set-Cookie', `relay_canvas_media=${token}; HttpOnly; SameSite=Strict; Path=/api/media`);
     res.json({ token });
@@ -25,6 +25,14 @@ export function createApp(service: CanvasService, origin: string, token = random
   });
   app.post('/api/boards/:id/patch', (req, res) => { res.json(service.patch(String(req.params.id), req.body?.expectedRevision, req.body?.operations)); });
   app.post('/api/boards/:id/validate', (req, res) => { res.json(service.validate(String(req.params.id), req.body?.nodeId)); });
+  app.get('/api/editor/capabilities', async (_req, res) => { res.json(await service.editor.capabilities()); });
+  app.get('/api/boards/:id/timeline', (req, res) => { res.json(service.timeline(String(req.params.id))); });
+  app.put('/api/boards/:id/timeline', async (req, res) => { res.json(await service.saveTimeline(String(req.params.id), req.body)); });
+  app.post('/api/boards/:id/exports', (req, res) => { res.status(202).json(service.startExport(String(req.params.id), req.body)); });
+  app.get('/api/boards/:id/compare', (req, res) => {
+    if (Object.keys(req.query).some(key => key !== 'left' && key !== 'right') || typeof req.query.left !== 'string' || typeof req.query.right !== 'string') throw new AppError('INVALID_INPUT', '比較參數無效。', 400);
+    res.json(service.compare(String(req.params.id), req.query.left, req.query.right));
+  });
   app.put('/api/providers', (req, res) => {
     if (Array.isArray(req.body?.providers)) for (const p of req.body.providers) if (p?.protocol !== 'demo' && p?.baseUrl) validateBaseUrl(p.baseUrl, service.policy);
     res.json(service.providers(req.body?.providers));
@@ -36,13 +44,22 @@ export function createApp(service: CanvasService, origin: string, token = random
   app.post('/api/runs/:id/cancel', (req, res) => { res.json(service.cancel(String(req.params.id))); });
   app.post('/api/runs/:runId/artifacts/:nodeId/:index/save', async (req, res) => {
     if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) || Object.keys(req.body).length !== 0) throw new AppError('INVALID_INPUT', '請求內容必須為空物件。', 400);
-    if (!/^(?:0|[1-9][0-9]*)$/.test(String(req.params.index))) throw new AppError('INVALID_INPUT', '素材索引無效。', 400);
+    if (!/^(?:0|[1-9][0-9]?)$/.test(String(req.params.index))) throw new AppError('INVALID_INPUT', '素材索引無效。', 400);
     const index = Number(req.params.index);
     const controller = new AbortController();
     const abort = () => { if (!res.writableEnded) controller.abort(); };
     req.once('aborted', abort); res.once('close', abort);
     try { res.json(await service.saveArtifact(String(req.params.runId), String(req.params.nodeId), index, controller.signal)); }
     finally { req.off('aborted', abort); res.off('close', abort); }
+  });
+  app.get('/api/runs/:runId/artifacts/:nodeId/:index/info', async (req, res) => {
+    if (!/^(?:0|[1-9][0-9]?)$/.test(String(req.params.index))) throw new AppError('INVALID_INPUT', '素材索引無效。', 400);
+    res.json(await service.artifactInfo(String(req.params.runId), String(req.params.nodeId), Number(req.params.index)));
+  });
+  app.get('/api/exports/:id', (req, res) => { res.json(service.getExport(String(req.params.id))); });
+  app.post('/api/exports/:id/cancel', async (req, res) => {
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) || Object.keys(req.body).length !== 0) throw new AppError('INVALID_INPUT', '請求內容必須為空物件。', 400);
+    res.json(await service.cancelExport(String(req.params.id)));
   });
   const sendMedia: express.RequestHandler = (req, res) => {
     const artifact = service.mediaArtifact(String(req.params.localId));

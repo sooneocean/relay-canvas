@@ -39,8 +39,89 @@ export interface Artifact {
 export type Status = 'pending' | 'submitting' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | 'needs_review';
 export interface NodeResult { nodeId: string; status: Status; text?: string; artifacts: Artifact[]; error?: string; attemptId?: string; remoteId?: string; referenceUrl?: string }
 export interface Run { id: string; boardId: string; revision: number; operationId: string; status: Status; startedAt: string; finishedAt?: string; snapshot: Board; providers: Provider[]; order: string[]; results: Record<string, NodeResult>; error?: string }
-export interface StoreData { schemaVersion: 1; boards: Board[]; providers: Provider[]; runs: Run[] }
-export interface AppState extends StoreData { settings: { remoteEnabled: boolean; mediaOrigins: string[]; providerOrigins: string[] } }
+export type TimelineFormat = 'landscape' | 'portrait';
+export interface ClipSource { runId: string; nodeId: string; artifactIndex: number }
+export interface MediaInfo { duration: number; width: number; height: number; hasAudio: boolean }
+export interface TimelineClip {
+  id: string;
+  source: ClipSource;
+  inSeconds: number;
+  outSeconds: number;
+  artifact: Artifact;
+  media: MediaInfo;
+}
+export interface Timeline { boardId: string; revision: number; format: TimelineFormat; clips: TimelineClip[] }
+export interface TimelineInputClip { id: string; source: ClipSource; inSeconds: number; outSeconds: number }
+export interface TimelineInput { expectedRevision: number; format: TimelineFormat; clips: TimelineInputClip[] }
+export interface EditorCapabilities {
+  available: boolean;
+  ffmpeg: boolean;
+  ffprobe: boolean;
+  formats: Record<TimelineFormat, { width: number; height: number }>;
+  fps: 24;
+  limits: {
+    maxClips: 12;
+    maxClipSeconds: 60;
+    maxTimelineSeconds: 180;
+    maxSourceBytes: number;
+  };
+}
+export type ExportStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+export interface ExportJob {
+  id: string;
+  boardId: string;
+  timelineRevision: number;
+  operationId: string;
+  status: ExportStatus;
+  startedAt: string;
+  finishedAt?: string;
+  error?: string;
+  snapshot: Timeline;
+  artifact?: Artifact;
+}
+export interface StoredExportJob extends ExportJob { attemptNonce: string }
+export interface CanonicalArtifact { kind: MediaKind; url: string; demo?: boolean }
+export interface CanonicalNodeResult {
+  nodeId: string;
+  status: Status;
+  text?: string;
+  artifacts: CanonicalArtifact[];
+  error?: string;
+  attemptId?: string;
+  remoteId?: string;
+  referenceUrl?: string;
+}
+export interface CanonicalRun {
+  id: string;
+  boardId: string;
+  revision: number;
+  operationId: string;
+  status: Exclude<Status, 'pending' | 'submitting' | 'running'>;
+  startedAt: string;
+  finishedAt?: string;
+  snapshot: Board;
+  providers: Provider[];
+  order: string[];
+  results: Record<string, CanonicalNodeResult>;
+  error?: string;
+}
+export type RunComparisonField = 'presence' | 'status' | 'prompt' | 'providerId' | 'model' | 'params' | 'artifacts';
+export interface RunComparisonDifference { nodeId: string; fields: RunComparisonField[] }
+export interface RunComparison { boardId: string; left: CanonicalRun; right: CanonicalRun; differences: RunComparisonDifference[] }
+export interface ArtifactInfo { source: ClipSource; artifact: Artifact; media: MediaInfo }
+export interface ExportInput { expectedRevision: number; operationId: string }
+export interface StoreData {
+  schemaVersion: 1;
+  boards: Board[];
+  providers: Provider[];
+  runs: Run[];
+  timelines?: Timeline[];
+  exports?: StoredExportJob[];
+}
+export interface AppState extends Omit<StoreData, 'exports'> {
+  exports?: ExportJob[];
+  settings: { remoteEnabled: boolean; mediaOrigins: string[]; providerOrigins: string[] };
+}
 export type Operation = { type: 'add_node'; node: CanvasNode } | { type: 'update_node'; id: string; data?: Partial<CanvasData>; position?: { x: number; y: number } } | { type: 'remove_node'; id: string } | { type: 'connect'; edge: CanvasEdge } | { type: 'remove_edge'; id: string };
 export interface GenerationRequest { kind: MediaKind; model: string; prompt: string; params: Record<string, unknown>; referenceUrl?: string; referenceField: string; signal: AbortSignal; onSubmitted: (remoteId: string) => void | Promise<void> }
 export interface GenerationOutput { artifacts: Artifact[]; remoteId?: string }

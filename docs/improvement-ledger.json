@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "goal": "Deliver v0.4 timeline, video joining, and version comparison, then complete 1000 verified product improvement rounds toward LibTV competitiveness",
+  "targetRounds": 1000,
+  "countingPolicy": "competitive-progress.md#counting-a-round",
+  "completedRounds": [
+    {
+      "round": 1,
+      "milestone": "v0.4.0",
+      "problem": "Successful generated videos could not be assembled into a saved edit",
+      "result": "Proportional single-track timeline with source selection, reorder, duplicate, remove, pointer and numeric trim, ruler seek and sequential preview",
+      "evidence": ["scripts/editor-smoke.ts: timeline editing, proportional widths, pointer trim, cross-cut playback and reload", "tests/v04.test.ts: strict timeline schema and trim validation"],
+      "limits": "One video track; 12 clips, 60 seconds per trim, 180 seconds total"
+    },
+    {
+      "round": 2,
+      "milestone": "v0.4.0",
+      "problem": "A canvas could not deliver a joined usable video file",
+      "result": "Actual landscape and portrait H.264/AAC MP4 with source aspect preservation, ordered temporal trims, original audio and silent-source padding",
+      "evidence": ["tests/v04.test.ts: real decoded temporal colors, geometry and PCM in both formats", "scripts/editor-smoke.ts: both MP4 files play, download and match hashes", "scripts/package-smoke.mjs: clean installed package exports both formats"],
+      "limits": "Maintained system FFmpeg/ffprobe >=6 required on macOS/Linux; fixtures and Demo, no paid generation"
+    },
+    {
+      "round": 3,
+      "milestone": "v0.4.0",
+      "problem": "A failed response or interrupted export could duplicate work or publish stale output",
+      "result": "Durable immutable export snapshots, stable operationId retry, cancellation fences, visible terminal history and restart interruption without replay",
+      "evidence": ["tests/v04.test.ts: durable creation, idempotency, busy rejection, 100 cancellation races and real server SIGKILL", "scripts/editor-smoke.ts: response lost after commit retries the same job"],
+      "limits": "One active export per workspace; 100 retained export records"
+    },
+    {
+      "round": 4,
+      "milestone": "v0.4.0",
+      "problem": "Creators could not evaluate two generated versions together",
+      "result": "Read-only terminal A/B comparison of exact run/node settings and outputs, with media-driven clock, coordinated seek, unequal-duration playback and replay",
+      "evidence": ["tests/v04.test.ts: canonical immutable comparison independent of later local cache saves", "scripts/editor-smoke.ts: prompts, clock, ends/replay, backward seek after shorter end, detached-media rejection and close cleanup", "docs/v0.4-review-record.md: fresh independent CONFIRMED after reproduced P2 repairs"],
+      "limits": "Two terminal runs from the same board; first video artifact on each side uses coordinated controls"
+    },
+    {
+      "round": 5,
+      "milestone": "v0.4.0",
+      "problem": "Codex could not complete the save-to-edit-to-export journey",
+      "result": "17 MCP tools including strict artifact save/info, timeline revision editing, export/status/cancel and canonical comparison",
+      "evidence": ["tests/mcp-v04.test.ts: real stdio invalid/extra arguments rejected before dispatch", "scripts/editor-smoke.ts: real SDK save/info, timeline, idempotent export/status/cancel and comparison"],
+      "limits": "No arbitrary URL, path, credential, shell or FFmpeg arguments; remote generation retains explicit authorization"
+    },
+    {
+      "round": 6,
+      "milestone": "v0.4.0",
+      "problem": "Adding media processing introduces source-integrity, resource and orphan-process risks",
+      "result": "Reverified source fd/hash, fixed local demux/protocol arguments, revalidated system executables, bounded persistent/temporary reservations and supervised process-group cleanup",
+      "evidence": ["tests/v04.test.ts: tamper/inode/argv/environment/quota/late-commit/Range and real crash tests", "docs/v0.4-review-record.md: fresh security READY with reviewed source hashes"],
+      "limits": "Application controls are not an OS codec sandbox or a proof of codec memory safety"
+    },
+    {
+      "round": 7,
+      "milestone": "v0.4.0",
+      "problem": "New editing state must survive upgrades and concurrent human/agent edits without losing drafts",
+      "result": "Byte-exact pre-v0.4 workspace backup, capped additive persisted schemas, independent timeline CAS and dirty/focus/navigation guards",
+      "evidence": ["tests/v04.test.ts: exact v0.3 bytes preserved and failed durable creation starts zero workers", "scripts/editor-smoke.ts: concurrent edit/save, 409 conflict, controlled 500, deliberate reload, modal focus and persistence"],
+      "limits": "Upgrade still requires a full workspace/media backup; downgrade uses a separate restored copy"
+    }
+  ],
+  "currentMilestone": "v0.4.0",
+  "milestoneStatus": "accepted-for-guarded-release",
+  "verifiedOn": "2026-10-23",
+  "nextCandidates": ["compare-to-timeline-selection", "recognizable-video-source-browser"],
+  "goalComplete": false
+}

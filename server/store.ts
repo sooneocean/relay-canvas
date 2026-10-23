@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { providers, starterBoard } from '../src/shared/defaults.js';
 import type { StoreData } from '../src/shared/types.js';
-import { parseBoard, parseProviders } from '../src/shared/schema.js';
+import { parseStoreData } from '../src/shared/schema.js';
 
 export function atomicWrite(file: string, value: unknown) {
   const text = JSON.stringify(value);
@@ -39,6 +39,12 @@ function validateArtifactMetadata(value: StoreData): void {
       typeof artifact.mimeType !== 'string'
     )) throw new Error('Unsupported or corrupt workspace; original file preserved.');
   }
+  for (const job of value.exports ?? []) if (job.artifact) {
+    const artifact = job.artifact;
+    if (!artifact.localId || artifact.localId !== artifact.sha256 || artifact.localUrl !== `/api/media/${artifact.localId}` || artifact.mimeType !== 'video/mp4' || !Number.isSafeInteger(artifact.bytes)) {
+      throw new Error('Unsupported or corrupt workspace; original file preserved.');
+    }
+  }
 }
 export class Store {
   private data: StoreData;
@@ -53,13 +59,18 @@ export class Store {
     this.writer = options.write ?? atomicWrite;
     this.file = path.join(this.directory, 'workspace.json');
     const versionMarker = path.join(this.directory, '.workspace-v0.3');
+    const versionMarker04 = path.join(this.directory, '.workspace-v0.4');
     if (existsSync(this.file)) {
       if (statSync(this.file).size > 80 * 1024 * 1024) throw new Error('Workspace exceeds storage limit.');
       const original = readFileSync(this.file);
       const value = JSON.parse(original.toString('utf8')) as StoreData;
       if (value.schemaVersion !== 1 || !Array.isArray(value.boards) || !Array.isArray(value.runs) || value.boards.length > 20 || value.runs.length > 200) throw new Error('Unsupported or corrupt workspace; original file preserved.');
-      value.boards = value.boards.map(parseBoard); value.providers = parseProviders(value.providers);
+      const parsed = parseStoreData(value);
+      value.boards = parsed.boards; value.providers = parsed.providers; value.runs = parsed.runs; value.timelines = parsed.timelines; value.exports = parsed.exports;
       validateArtifactMetadata(value);
+      const v04Backup = path.join(directory, 'workspace.pre-v0.4.json');
+      if (!existsSync(versionMarker04) && !existsSync(v04Backup)) atomicBackup(v04Backup, original);
+      if (!existsSync(versionMarker04)) atomicBackup(versionMarker04, Buffer.from('0.4\n'));
       const backup = path.join(directory, 'workspace.pre-v0.3.json');
       if (!existsSync(versionMarker) && !existsSync(backup)) atomicBackup(backup, original);
       if (!existsSync(versionMarker)) atomicBackup(versionMarker, Buffer.from('0.3\n'));
@@ -70,19 +81,24 @@ export class Store {
         run.error = '服務曾中斷；未重新提交。遠端工作可能仍執行，請依 remoteId 查詢。';
         for (const result of Object.values(run.results)) if (active.includes(result.status)) result.status = 'interrupted';
       }
+      for (const job of this.data.exports ?? []) if (job.status === 'pending' || job.status === 'running') {
+        job.status = 'interrupted'; job.finishedAt = new Date().toISOString(); job.error = '匯出因服務中斷而停止；不會自動重試。';
+      }
       this.writer(this.file, this.data);
     } else {
       this.data = { schemaVersion: 1, boards: [starterBoard()], providers: structuredClone(providers), runs: [] };
       this.writer(this.file, this.data);
       atomicBackup(versionMarker, Buffer.from('0.3\n'));
+      atomicBackup(versionMarker04, Buffer.from('0.4\n'));
     }
   }
   read(): StoreData { return structuredClone(this.data); }
   private readPersisted(): StoreData {
     const value = JSON.parse(readFileSync(this.file, 'utf8')) as StoreData;
     if (value.schemaVersion !== 1 || !Array.isArray(value.boards) || !Array.isArray(value.providers) || !Array.isArray(value.runs) || value.boards.length > 20 || value.runs.length > 200) throw new Error('Unsupported or corrupt workspace; original file preserved.');
-    value.boards = value.boards.map(parseBoard); value.providers = parseProviders(value.providers); validateArtifactMetadata(value);
-    return value;
+    const parsed = parseStoreData(value);
+    validateArtifactMetadata(parsed);
+    return parsed;
   }
   transaction<T>(change: (next: StoreData) => T): T {
     const next = structuredClone(this.data), result = change(next);
@@ -96,6 +112,7 @@ export class Store {
   artifactReferenced(localId: string): boolean {
     const persisted = this.readPersisted();
     this.data = persisted;
-    return persisted.runs.some(run => Object.values(run.results).some(result => result.artifacts.some(artifact => artifact.localId === localId && artifact.sha256 === localId)));
+    return persisted.runs.some(run => Object.values(run.results).some(result => result.artifacts.some(artifact => artifact.localId === localId && artifact.sha256 === localId))) ||
+      (persisted.exports ?? []).some(job => job.artifact?.localId === localId && job.artifact.sha256 === localId);
   }
 }

@@ -4,7 +4,7 @@ Relay Canvas 是一個本機優先的圖片與影片創作畫布。啟動後從�
 
 ## 快速開始
 
-需求：Node.js 22.12 以上與 npm。
+需求：Node.js 22.12 以上與 npm。影片時間軸資訊與 MP4 匯出另需 macOS／Linux 上維持安全更新的 FFmpeg／ffprobe 6 以上，並支援 libx264／AAC；未安裝時仍可使用畫布生成與版本比較。
 
 ```bash
 npm ci
@@ -16,7 +16,7 @@ npm start
 
 ### 使用 GitHub Release 發行包
 
-下載並解壓縮 `relay-canvas-0.3.0.tar.gz` 後，在解壓縮目錄執行：
+下載並解壓縮 `relay-canvas-0.4.0.tar.gz` 後，在解壓縮目錄執行：
 
 ```bash
 npm ci --omit=dev
@@ -35,6 +35,8 @@ npm start
 
 - 創作首頁、可搜尋專案卡與圖片／影片快速建立。
 - 成功執行素材庫，支援篩選、預覽、返回來源節點及本機保存／下載。
+- 影片時間軸：排列／複製／裁切成功影片，連續預覽，匯出橫式或直式 H.264／AAC MP4。
+- 生成版本 A/B 比較：並排提示詞、模型、參數與產物，同步影片播放與定位。
 - 自訂中轉站模板、設定診斷與模型查詢；受限 Videos JSON 中轉站影片協定。
 - 中性深灰 React Flow 畫布與浮動工具列：prompt、image、video、asset 與 note 節點。
 - DAG 驗證、revision optimistic concurrency、原子本機保存與執行歷史。
@@ -59,26 +61,30 @@ codex mcp add relay-canvas \
 codex mcp list --json
 ```
 
-重新開啟 Codex 對話後，請先讓 agent 呼叫 `list_boards` 確認連線。它提供 `list_boards`、`read_board`、`create_board`、`apply_operations`、`validate_board`、`run_board`、`get_run`、`cancel_run` 與 `list_providers`。`RELAY_DATA_DIR` 必須和 server 使用的資料目錄相同；MCP 透過本機 session 檔連接已啟動的 server，不提供任意 shell、檔案或網頁抓取工具。詳見 [Codex 指南](docs/codex.md)。
+重新開啟 Codex 對話後，請先讓 agent 呼叫 `list_boards` 確認連線。17 個工具涵蓋畫布、生成、素材保存、時間軸、匯出與版本比較。`RELAY_DATA_DIR` 必須和 server 使用的資料目錄相同；MCP 透過本機 session 檔連接已啟動的 server，不提供任意 shell、檔案或網頁抓取工具。詳見 [Codex 指南](docs/codex.md) 與 [影片編輯](docs/editing.md)。
 
 ## 驗證與封裝
 
 ```bash
 npm run check
 npm test
+npm run test:release
 npm run build
 npx playwright install --with-deps chromium
 npm run smoke
 npm run package:release
+npm run smoke:package
 ```
 
-封裝腳本會以明確白名單產生 `release/relay-canvas-0.3.0.tar.gz` 與 SHA-256 檔，排除 `.relay-canvas`、`.env`、secrets 與 `node_modules`。CI 與發布邊界請看 [CHANGELOG](CHANGELOG.md) 及 [研究紀錄](docs/research.md)。
+封裝腳本會以明確白名單產生 `release/relay-canvas-0.4.0.tar.gz` 與 SHA-256 檔，排除 `.relay-canvas`、`.env`、secrets 與 `node_modules`。CI 與發布邊界請看 [CHANGELOG](CHANGELOG.md) 及 [研究紀錄](docs/research.md)。
 
 ## Roadmap
 
-- 後續版本：本機素材持久化、更多協定模板、模型能力探索、圖生圖、局部重繪與批次流程。
-- v0.3：鏡頭／角色資產、版本比較、影片串接與時間軸、預算上限、遠端取消與恢復查詢。
+- v0.3 已加入本機素材保存與中轉站設定；v0.4 支援時間軸、影片串接與版本比較。
+- 後續優化：鏡頭／角色資產、圖生圖、局部重繪、批次流程、預算上限、遠端取消與恢復查詢。
 - v1.0：工作區、多使用者權限與稽核、worker／queue、雲端部署、團隊協作與計費界線。
+
+與 LibTV 競爭及一千輪改進是持續目標；每輪須有實質變更與驗證，不以測試次數充數。詳見 [競品證據與進度](docs/competitive-progress.md)。
 
 ## License
 

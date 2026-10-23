@@ -1,6 +1,6 @@
 {
   "name": "relay-canvas",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A local-first React Flow image and video canvas with a Codex MCP control surface.",
   "private": true,
   "type": "module",
@@ -13,8 +13,10 @@
     "check": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
     "build": "vite build && tsc -p tsconfig.server.json",
     "test": "tsx --test tests/*.test.ts",
-    "smoke": "tsx scripts/smoke.ts",
-    "package:release": "node scripts/package-release.mjs"
+    "test:release": "node --test scripts/release-gate.test.mjs",
+    "smoke": "tsx scripts/smoke.ts && tsx scripts/editor-smoke.ts",
+    "package:release": "node scripts/package-release.mjs",
+    "smoke:package": "node scripts/package-smoke.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.0",

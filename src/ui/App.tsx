@@ -33,6 +33,7 @@ import {
   Film,
   FolderPlus,
   GitBranch,
+  GitCompareArrows,
   Home,
   Image as ImageIcon,
   ImagePlus,
@@ -49,6 +50,7 @@ import {
   Plus,
   RefreshCw,
   Save,
+  Scissors,
   Search,
   Settings2,
   SlidersHorizontal,
@@ -87,9 +89,12 @@ import type {
   ProviderModels,
   Run,
   Status,
+  ExportJob,
 } from '../shared/types.js';
 import { parseBoard } from '../shared/schema.js';
 import { deriveAssets, deriveProjects, type AssetItem, type ProjectCard } from './catalog.js';
+import RunCompare from './RunCompare.js';
+import TimelineEditor, { type SaveArtifact, type UiRequest } from './TimelineEditor.js';
 
 type FlowNode = Node<CanvasData & { previewUrl?: string; runStatus?: Status; runError?: string }, 'canvas'>;
 type FlowEdge = Edge;
@@ -380,6 +385,7 @@ function AppShell() {
   const [boards, setBoards] = useState<Board[]>([starterBoard()]);
   const [providers, setProviders] = useState<Provider[]>(defaultProviders);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [exports, setExports] = useState<ExportJob[]>([]);
   const [settings, setSettings] = useState<AppState['settings']>({ remoteEnabled: false, mediaOrigins: [], providerOrigins: [] });
   const [activeBoardId, setActiveBoardId] = useState('welcome');
   const [nodes, setNodes] = useState<FlowNode[]>(() => boardToFlowNodes(starterBoard()));
@@ -399,6 +405,8 @@ function AppShell() {
   const [providerModels, setProviderModels] = useState<Record<string, string[]>>({});
   const [modelsLoading, setModelsLoading] = useState(false);
   const [providersSaving, setProvidersSaving] = useState(false);
+  const [timelineOpen, setTimelineOpen] = useState(false);
+  const [compareOpen, setCompareOpen] = useState(false);
   const [assetSaveStates, setAssetSaveStates] = useState<Record<string, AssetSaveState>>({});
   const [conflict, setConflict] = useState<BoardConflict>();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -459,7 +467,9 @@ function AppShell() {
     try { payload = await response.json(); } catch { payload = undefined; }
     if (!response.ok) {
       const details = payload && typeof payload === 'object' && 'error' in payload ? String((payload as { error: unknown }).error) : `HTTP ${response.status}`;
-      throw new Error(details.slice(0, 180));
+      const error = new Error(details.slice(0, 180)) as Error & { status?: number };
+      error.status = response.status;
+      throw error;
     }
     return payload as T;
   }, []);
@@ -492,6 +502,7 @@ function AppShell() {
       }
       setProvidersDirty(false);
       if (state.runs) setRuns(state.runs);
+      if (state.exports) setExports(state.exports);
       if (state.settings) setSettings(state.settings);
       dirtyRef.current = false;
       setDirty(false);
@@ -514,6 +525,7 @@ function AppShell() {
     try {
       const state = await requestJson<AppState>('/api/state');
       if (state.runs) setRuns(state.runs);
+      if (state.exports) setExports(state.exports);
       if (state.settings) setSettings(state.settings);
       if (state.providers && !providersDirty && JSON.stringify(state.providers) !== JSON.stringify(providersRef.current)) {
         providerEditVersionRef.current += 1;
@@ -1000,24 +1012,24 @@ function AppShell() {
     }, '切換專案');
   }, [guardNavigation]);
 
-  const saveAsset = useCallback(async (runId: string, nodeId: string, artifactIndex: number) => {
+  const saveAsset = useCallback(async (runId: string, nodeId: string, artifactIndex: number): Promise<Artifact | undefined> => {
     const key = `${runId}:${nodeId}:${artifactIndex}`;
     const currentState = assetSaveStates[key];
-    if (currentState?.status === 'saving') return;
+    if (currentState?.status === 'saving') return undefined;
     const run = runs.find((candidate) => candidate.id === runId);
     const artifact = run?.results[nodeId]?.artifacts?.[artifactIndex];
     if (!artifact) {
       setAssetSaveStates((current) => ({ ...current, [key]: { status: 'failed', message: '找不到這份素材。' } }));
-      return;
+      return undefined;
     }
     if (artifact.localUrl || artifact.localId) {
       setAssetSaveStates((current) => ({ ...current, [key]: { status: 'saved' } }));
-      return;
+      return artifact;
     }
     if (apiState !== 'ready' || !tokenRef.current) {
       setAssetSaveStates((current) => ({ ...current, [key]: { status: 'failed', message: '服務尚未連線，請重試。' } }));
       notify('素材保存失敗，請確認服務連線後重試。', 'error');
-      return;
+      return undefined;
     }
     setAssetSaveStates((current) => ({ ...current, [key]: { status: 'saving' } }));
     try {
@@ -1037,9 +1049,11 @@ function AppShell() {
       }));
       setAssetSaveStates((current) => ({ ...current, [key]: { status: 'saved' } }));
       notify('素材已保存到本機。', 'success');
+      return savedArtifact;
     } catch {
       setAssetSaveStates((current) => ({ ...current, [key]: { status: 'failed', message: '保存失敗，請重試。' } }));
       notify('素材保存失敗，請重試。', 'error');
+      return undefined;
     }
   }, [apiState, assetSaveStates, notify, requestJson, runs]);
 
@@ -1255,7 +1269,7 @@ function AppShell() {
             <div className="brand-name">Relay Canvas</div>
             <div className="brand-kicker">IDEAS, CONNECTED.</div>
           </div>
-          <span className="version-tag">v0.3.0</span>
+          <span className="version-tag">v0.4.0</span>
         </div>
         <div className="board-switcher">
           <Layers3 size={15} />
@@ -1318,6 +1332,8 @@ function AppShell() {
             </div>
             <div className="canvas-toolbar-actions">
               <button className="toolbar-button" onClick={() => void validateBoard(selectedNodeId)}><Check size={14} />Validate</button>
+              <button className="toolbar-button" data-testid="timeline-open" onClick={() => setTimelineOpen(true)}><Scissors size={14} />Timeline</button>
+              <button className="toolbar-button" data-testid="compare-open" onClick={() => setCompareOpen(true)}><GitCompareArrows size={14} />Compare</button>
               <button className="toolbar-button" aria-label="export-board" onClick={exportBoard}><Download size={14} />Export</button>
               <button className="toolbar-button" aria-label="import-board" onClick={() => fileInputRef.current?.click()}><Upload size={14} />Import</button>
               <input ref={fileInputRef} type="file" accept="application/json,.json" onChange={(event) => void importBoard(event)} hidden />
@@ -1334,7 +1350,7 @@ function AppShell() {
               onConnect={onConnect}
               onNodeClick={(_, node) => { setSelectedNodeId(node.id); setPanel('inspector'); setPanelOpen(false); }}
               onPaneClick={() => setSelectedNodeId(undefined)}
-              deleteKeyCode={['Backspace', 'Delete']}
+              deleteKeyCode={timelineOpen || compareOpen ? null : ['Backspace', 'Delete']}
               snapToGrid
               snapGrid={[16, 16]}
               connectionLineStyle={{ stroke: '#c8ff5a', strokeWidth: 1.5 }}
@@ -1372,6 +1388,8 @@ function AppShell() {
 
       {toast && <div className={`toast toast-${toast.tone}`} role="status"><span className="toast-icon">{toast.tone === 'success' ? <Check size={15} /> : toast.tone === 'error' ? <AlertCircle size={15} /> : <Info size={15} />}</span>{toast.message}<button onClick={() => setToast(undefined)} aria-label="close-message"><X size={14} /></button></div>}
 
+      {timelineOpen && activeBoard && <TimelineEditor board={activeBoard} runs={runs} exports={exports} requestJson={requestJson as UiRequest} onSaveArtifact={saveAsset as SaveArtifact} onExportJob={(job) => setExports((current) => [job, ...current.filter((candidate) => candidate.id !== job.id)])} onClose={() => setTimelineOpen(false)} />}
+      {compareOpen && activeBoard && <RunCompare boardId={activeBoard.id} runs={runs} requestJson={requestJson as UiRequest} onClose={() => setCompareOpen(false)} />}
       {confirmRun && <RunConfirmDialog confirm={confirmRun} providers={providers} onCancel={() => setConfirmRun(undefined)} onConfirm={() => void startRun(confirmRun.nodeId, true, confirmRun.operationId)} />}
     </div>
   );

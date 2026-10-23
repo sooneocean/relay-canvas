@@ -4,9 +4,13 @@ import { Store } from './store.js';
 import { generate, preflightGeneration } from './providers.js';
 import { providerDiagnostics, providerModels, type ProviderTransport } from './providers.js';
 import { MediaStore } from './media.js';
+import { EditorRuntime } from './editor.js';
 import { readPolicy, validateBaseUrl, validateMediaUrl } from './security.js';
-import { parseBoard, parseOperations, parseProviders, parseRunInput } from '../src/shared/schema.js';
-import type { Artifact, Board, GenerationOutput, GenerationRequest, Provider, Run } from '../src/shared/types.js';
+import { parseBoard, parseExportInput, parseOperations, parseProviders, parseRunInput, parseTimelineInput } from '../src/shared/schema.js';
+import type {
+  Artifact, ArtifactInfo, Board, CanonicalArtifact, CanonicalRun, ClipSource, ExportJob, GenerationOutput,
+  GenerationRequest, Provider, Run, RunComparison, RunComparisonField, StoredExportJob, Timeline,
+} from '../src/shared/types.js';
 import { recommendedReferenceField } from '../src/shared/defaults.js';
 
 type Generator = (provider: Provider, request: GenerationRequest) => Promise<GenerationOutput>;
@@ -14,14 +18,25 @@ export class CanvasService {
   private active?: { id: string; controller: AbortController };
   private tasks = new Map<string, Promise<void>>();
   private artifactSaves = new Map<string, Promise<Artifact>>();
+  private activeExport?: { id: string; attemptNonce: string; controller: AbortController };
+  private exportTasks = new Map<string, Promise<void>>();
   readonly media: MediaStore;
+  readonly editor: EditorRuntime;
   constructor(
     readonly store: Store,
     readonly policy = readPolicy(),
     private generator: Generator = (p, r) => generate(p, r, { policy }),
     media?: MediaStore,
-  ) { this.media = media ?? new MediaStore(store.directory, policy); }
-  state() { return { ...this.store.read(), settings: this.policy }; }
+    editor?: EditorRuntime,
+  ) {
+    this.media = media ?? new MediaStore(store.directory, policy);
+    this.editor = editor ?? new EditorRuntime(store.directory, this.media);
+  }
+  state() {
+    const data = this.store.read();
+    const exports = data.exports?.map(({ attemptNonce: _attemptNonce, ...job }) => job);
+    return { ...data, exports, settings: this.policy };
+  }
   board(id: string) { const board = this.store.read().boards.find(b => b.id === id); if (!board) throw new AppError('NOT_FOUND', '找不到畫布。', 404); return board; }
   create(name: string) {
     if (typeof name !== 'string' || !name.trim() || name.length > 120) throw new AppError('INVALID_NAME', '畫布名稱需為 1–120 字。');
@@ -75,6 +90,149 @@ export class CanvasService {
   }
   validate(id: string, selected?: string) { return plan(this.board(id), this.store.read().providers, selected); }
   getRun(id: string) { const run = this.store.read().runs.find(r => r.id === id); if (!run) throw new AppError('NOT_FOUND', '找不到執行紀錄。', 404); return run; }
+  private source(boardId: string, source: ClipSource): Artifact {
+    const run = this.getRun(source.runId);
+    if (run.boardId !== boardId) throw new AppError('SOURCE_BOARD_MISMATCH', '素材不屬於此畫布。', 400);
+    const result = run.results[source.nodeId];
+    if (run.status !== 'succeeded' || result?.status !== 'succeeded') throw new AppError('SOURCE_NOT_SUCCEEDED', '只有成功且已保存的影片可以加入時間軸。', 409);
+    const artifact = result.artifacts[source.artifactIndex];
+    if (!artifact || artifact.kind !== 'video' || !artifact.localId || artifact.localId !== artifact.sha256 || !artifact.localUrl || !artifact.bytes || !['video/mp4', 'video/webm'].includes(artifact.mimeType ?? '')) {
+      throw new AppError('SOURCE_NOT_SAVED', '請先將影片保存到本機，再加入時間軸。', 409);
+    }
+    return artifact;
+  }
+  async artifactInfo(runId: string, nodeId: string, artifactIndex: number): Promise<ArtifactInfo> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(runId) || !/^[A-Za-z0-9_-]{1,64}$/.test(nodeId) || !Number.isSafeInteger(artifactIndex) || artifactIndex < 0 || artifactIndex > 99) throw new AppError('INVALID_INPUT', '素材識別無效。', 400);
+    const run = this.getRun(runId), source = { runId, nodeId, artifactIndex };
+    const artifact = this.source(run.boardId, source);
+    try { return { source, artifact, media: await this.editor.probe(artifact) }; }
+    catch (error) { if (error instanceof AppError) throw error; throw new AppError('PROBE_FAILED', '無法讀取影片資訊；請確認 FFmpeg 可用且檔案有效。', 400); }
+  }
+  timeline(boardId: string): Timeline {
+    this.board(boardId);
+    return this.store.read().timelines?.find(candidate => candidate.boardId === boardId) ?? { boardId, revision: 0, format: 'landscape', clips: [] };
+  }
+  async saveTimeline(boardId: string, input: unknown): Promise<Timeline> {
+    this.board(boardId);
+    const request = parseTimelineInput(input), initial = this.timeline(boardId);
+    if (initial.revision !== request.expectedRevision) throw new AppError('REVISION_CONFLICT', '時間軸已被其他視窗或 Agent 更新。', 409);
+    const clips = [] as Timeline['clips'];
+    for (const clip of request.clips) {
+      const artifact = this.source(boardId, clip.source);
+      let media;
+      try { media = await this.editor.probe(artifact); }
+      catch { throw new AppError('PROBE_FAILED', '無法驗證時間軸影片。', 400); }
+      if (clip.outSeconds > media.duration + 1e-6) throw new AppError('INVALID_TRIM', '裁切終點超過影片長度。', 400);
+      clips.push({ ...clip, artifact, media });
+    }
+    return this.store.transaction(data => {
+      const current = data.timelines?.find(candidate => candidate.boardId === boardId);
+      if ((current?.revision ?? 0) !== request.expectedRevision) throw new AppError('REVISION_CONFLICT', '時間軸已被其他視窗或 Agent 更新。', 409);
+      for (const clip of clips) {
+        const run = data.runs.find(candidate => candidate.id === clip.source.runId);
+        const artifact = run?.results[clip.source.nodeId]?.artifacts[clip.source.artifactIndex];
+        if (run?.boardId !== boardId || !artifact || artifact.localId !== clip.artifact.localId || artifact.sha256 !== clip.artifact.sha256) throw new AppError('REVISION_CONFLICT', '來源素材已變更，請重新載入。', 409);
+      }
+      const saved: Timeline = { boardId, revision: request.expectedRevision + 1, format: request.format, clips };
+      data.timelines ??= [];
+      const index = data.timelines.findIndex(candidate => candidate.boardId === boardId);
+      if (index < 0) data.timelines.push(saved); else data.timelines[index] = saved;
+      return saved;
+    });
+  }
+  private publicExport(job: StoredExportJob): ExportJob { const { attemptNonce: _attemptNonce, ...result } = job; return result; }
+  getExport(id: string): ExportJob {
+    const job = this.store.read().exports?.find(candidate => candidate.id === id);
+    if (!job) throw new AppError('NOT_FOUND', '找不到匯出工作。', 404);
+    return this.publicExport(job);
+  }
+  startExport(boardId: string, input: unknown): ExportJob {
+    this.board(boardId);
+    const request = parseExportInput(input), data = this.store.read();
+    const existing = data.exports?.find(candidate => candidate.operationId === request.operationId);
+    if (existing) {
+      if (existing.boardId !== boardId || existing.timelineRevision !== request.expectedRevision) throw new AppError('OPERATION_CONFLICT', 'operationId 已用於另一個匯出請求。', 409);
+      return this.publicExport(existing);
+    }
+    if (this.activeExport) throw new AppError('BUSY', '已有匯出工作進行中。', 409);
+    if ((data.exports?.length ?? 0) >= 100) throw new AppError('LIMIT', '此工作區已達 100 個匯出工作上限。', 400);
+    const timeline = this.timeline(boardId);
+    if (timeline.revision !== request.expectedRevision) throw new AppError('REVISION_CONFLICT', '時間軸版本已改變。', 409);
+    if (!timeline.clips.length) throw new AppError('EMPTY_TIMELINE', '時間軸沒有可匯出的片段。', 400);
+    const id = randomUUID(), attemptNonce = randomUUID(), controller = new AbortController();
+    const job: StoredExportJob = { id, boardId, timelineRevision: timeline.revision, operationId: request.operationId, status: 'pending', startedAt: new Date().toISOString(), snapshot: timeline, attemptNonce };
+    this.store.transaction(next => { next.exports ??= []; next.exports.unshift(job); });
+    this.activeExport = { id, attemptNonce, controller };
+    const task = Promise.resolve().then(() => this.executeExport(job, controller.signal)).finally(() => {
+      if (this.activeExport?.id === id && this.activeExport.attemptNonce === attemptNonce) this.activeExport = undefined;
+      this.exportTasks.delete(id);
+    });
+    this.exportTasks.set(id, task); void task.catch(() => undefined);
+    return this.publicExport(job);
+  }
+  private updateExport(id: string, attemptNonce: string, change: (job: StoredExportJob) => void): StoredExportJob {
+    return this.store.transaction(data => {
+      const job = data.exports?.find(candidate => candidate.id === id);
+      if (!job || job.attemptNonce !== attemptNonce || !['pending', 'running'].includes(job.status)) throw new AppError('EXPORT_FENCED', '匯出工作已結束。', 409);
+      change(job); return job;
+    });
+  }
+  private async executeExport(initial: StoredExportJob, signal: AbortSignal): Promise<void> {
+    try {
+      this.updateExport(initial.id, initial.attemptNonce, job => { job.status = 'running'; });
+      await this.editor.export(initial.snapshot, artifact => {
+        this.updateExport(initial.id, initial.attemptNonce, job => { job.status = 'succeeded'; job.artifact = artifact; job.finishedAt = new Date().toISOString(); });
+      }, localId => this.store.artifactReferenced(localId), signal);
+    } catch {
+      try { this.updateExport(initial.id, initial.attemptNonce, job => { job.status = signal.aborted ? 'cancelled' : 'failed'; job.finishedAt = new Date().toISOString(); job.error = signal.aborted ? '匯出已取消。' : '匯出失敗；請確認來源影片與 FFmpeg 設定。'; }); }
+      catch { /* cancellation or durable fence already won */ }
+    }
+  }
+  async cancelExport(id: string): Promise<ExportJob> {
+    const data = this.store.read(), job = data.exports?.find(candidate => candidate.id === id);
+    if (!job) throw new AppError('NOT_FOUND', '找不到匯出工作。', 404);
+    if (!['pending', 'running'].includes(job.status)) return this.publicExport(job);
+    const cancelled = this.updateExport(id, job.attemptNonce, current => { current.status = 'cancelled'; current.finishedAt = new Date().toISOString(); current.error = '匯出已取消。'; });
+    if (this.activeExport?.id === id && this.activeExport.attemptNonce === job.attemptNonce) this.activeExport.controller.abort();
+    await this.exportTasks.get(id);
+    return this.publicExport(cancelled);
+  }
+  async settledExport(id: string): Promise<ExportJob> { await this.exportTasks.get(id); return this.getExport(id); }
+  compare(boardId: string, leftId: string, rightId: string): RunComparison {
+    this.board(boardId);
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(leftId) || !/^[A-Za-z0-9_-]{1,64}$/.test(rightId) || leftId === rightId) throw new AppError('INVALID_INPUT', '比較執行識別無效。', 400);
+    const leftRun = this.getRun(leftId), rightRun = this.getRun(rightId);
+    if (leftRun.boardId !== boardId || rightRun.boardId !== boardId) throw new AppError('RUN_BOARD_MISMATCH', '執行紀錄不屬於此畫布。', 400);
+    const active = new Set(['pending', 'submitting', 'running']);
+    if (active.has(leftRun.status) || active.has(rightRun.status)) throw new AppError('RUN_NOT_TERMINAL', '執行仍在進行，完成後才能比較。', 409);
+    const canonicalize = (run: Run): CanonicalRun => ({
+      id: run.id, boardId: run.boardId, revision: run.revision, operationId: run.operationId,
+      status: run.status as CanonicalRun['status'], startedAt: run.startedAt, finishedAt: run.finishedAt,
+      snapshot: run.snapshot, providers: run.providers, order: run.order,
+      results: Object.fromEntries(Object.entries(run.results).map(([id, result]) => [id, {
+        nodeId: result.nodeId, status: result.status, text: result.text,
+        artifacts: result.artifacts.map(({ kind, url, demo }): CanonicalArtifact => ({ kind, url, ...(demo === undefined ? {} : { demo }) })),
+        error: result.error, attemptId: result.attemptId, remoteId: result.remoteId, referenceUrl: result.referenceUrl,
+      }])), error: run.error,
+    });
+    const left = canonicalize(leftRun), right = canonicalize(rightRun);
+    const nodeIds = [...new Set([...left.snapshot.nodes.map(node => node.id), ...right.snapshot.nodes.map(node => node.id)])].sort();
+    const differences = nodeIds.flatMap(nodeId => {
+      const a = left.snapshot.nodes.find(node => node.id === nodeId), b = right.snapshot.nodes.find(node => node.id === nodeId);
+      const fields: RunComparisonField[] = [];
+      if (!a || !b) fields.push('presence');
+      else {
+        if (a.data.prompt !== b.data.prompt) fields.push('prompt');
+        if (a.data.providerId !== b.data.providerId) fields.push('providerId');
+        if (a.data.model !== b.data.model) fields.push('model');
+        if (JSON.stringify(a.data.params ?? {}) !== JSON.stringify(b.data.params ?? {})) fields.push('params');
+      }
+      if (left.results[nodeId]?.status !== right.results[nodeId]?.status) fields.push('status');
+      if (JSON.stringify(left.results[nodeId]?.artifacts ?? []) !== JSON.stringify(right.results[nodeId]?.artifacts ?? [])) fields.push('artifacts');
+      return fields.length ? [{ nodeId, fields }] : [];
+    });
+    return { boardId, left, right, differences };
+  }
   async saveArtifact(runId: string, nodeId: string, index: number, signal?: AbortSignal): Promise<Artifact> {
     if (!Number.isSafeInteger(index) || index < 0) throw new AppError('INVALID_INPUT', '素材索引無效。', 400);
     const key = `${runId}\u0000${nodeId}\u0000${index}`;
@@ -121,6 +279,8 @@ export class CanvasService {
       const artifact = result.artifacts.find(candidate => candidate.localId === localId && candidate.sha256 === localId);
       if (artifact) return artifact;
     }
+    const exported = this.store.read().exports?.find(job => job.status === 'succeeded' && job.artifact?.localId === localId && job.artifact.sha256 === localId)?.artifact;
+    if (exported) return exported;
     throw new AppError('NOT_FOUND', '找不到素材。', 404);
   }
   private updateRun(id: string, change: (run: Run) => void) { return this.store.transaction(data => { const run = data.runs.find(r => r.id === id)!; change(run); return run; }); }

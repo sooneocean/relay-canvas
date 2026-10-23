@@ -19,6 +19,7 @@ const DEADLINE_MS = 30_000;
 
 export interface MediaPayload { bytes: Buffer; contentType: string }
 export type MediaFetcher = (url: string, policy: SecurityPolicy, signal?: AbortSignal) => Promise<MediaPayload>;
+export interface MediaReservation { readonly id: string; readonly bytes: number }
 export interface MediaDownloadOptions {
   signal?: AbortSignal;
   resolve?: (hostname: string) => Promise<Array<{ address: string; family: number }>>;
@@ -122,6 +123,7 @@ export class MediaStore {
   readonly directory: string;
   private queue: Promise<unknown> = Promise.resolve();
   private readonly opened = new Set<number>();
+  private readonly reservations = new Map<string, number>();
   private readonly rootIdentity: { dev: bigint; ino: bigint };
   private readonly mediaIdentity: { dev: bigint; ino: bigint };
   constructor(
@@ -158,6 +160,89 @@ export class MediaStore {
     if (!root.isDirectory() || root.isSymbolicLink() || root.dev !== this.rootIdentity.dev || root.ino !== this.rootIdentity.ino ||
       !media.isDirectory() || media.isSymbolicLink() || media.dev !== this.mediaIdentity.dev || media.ino !== this.mediaIdentity.ino ||
       realpathSync(this.directory) !== this.directory) throw mediaError('Unsafe media store');
+  }
+
+  private usage(): number {
+    let usage = 0;
+    for (const entry of readdirSync(this.directory)) {
+      const candidate = path.join(this.directory, entry); const stat = lstatSync(candidate);
+      if (stat.isSymbolicLink()) throw mediaError('Unsafe media store');
+      if (stat.isFile()) usage += stat.size;
+    }
+    return usage;
+  }
+
+  private reservedBytes(): number { return [...this.reservations.values()].reduce((sum, bytes) => sum + bytes, 0); }
+
+  async reserveDerived(maxBytes = MAX_MEDIA_BYTES): Promise<MediaReservation> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_MEDIA_BYTES) throw mediaError('Invalid media reservation');
+    const operation = this.queue.then(() => {
+      this.assertDirectories();
+      const available = MAX_MEDIA_QUOTA - this.usage() - this.reservedBytes();
+      const bytes = Math.min(maxBytes, available);
+      if (bytes < 1) throw mediaError('Media quota exceeded');
+      const reservation = { id: randomUUID(), bytes } as const;
+      this.reservations.set(reservation.id, bytes);
+      return reservation;
+    });
+    this.queue = operation.catch(() => undefined);
+    return await operation;
+  }
+
+  async releaseReservation(reservation: MediaReservation): Promise<void> {
+    const operation = this.queue.then(() => { this.reservations.delete(reservation.id); });
+    this.queue = operation.catch(() => undefined);
+    await operation;
+  }
+
+  async commitDerived(
+    reservation: MediaReservation,
+    fd: number,
+    expectedBytes: number,
+    commit: (artifact: Artifact) => void,
+    isReferenced?: (localId: string) => boolean,
+  ): Promise<Artifact> {
+    const operation = this.queue.then(() => {
+      this.assertDirectories();
+      if (this.reservations.get(reservation.id) !== reservation.bytes) throw mediaError('Media reservation expired');
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.size !== expectedBytes || stat.size < 1 || stat.size > reservation.bytes || stat.size > MAX_MEDIA_BYTES) throw mediaError('Derived media size mismatch');
+      const bytes = readFileSync(fd);
+      if (bytes.length !== stat.size) throw mediaError('Derived media size mismatch');
+      const detected = detect(bytes);
+      if (!detected || detected.mimeType !== 'video/mp4') throw mediaError('Derived media is not MP4');
+      const hash = createHash('sha256').update(bytes).digest('hex');
+      const artifact: Artifact = { kind: 'video', url: `/api/media/${hash}`, localId: hash, localUrl: `/api/media/${hash}`, bytes: bytes.length, sha256: hash, mimeType: 'video/mp4' };
+      const destination = path.join(this.directory, `${hash}.mp4`);
+      let created = false;
+      try {
+        if (existsSync(destination)) {
+          const existing = lstatSync(destination);
+          if (!existing.isFile() || existing.isSymbolicLink() || (existing.mode & 0o077) !== 0 || existing.size !== bytes.length) throw mediaError('Unsafe media store');
+          const existingFd = openSync(destination, constants.O_RDONLY | constants.O_NOFOLLOW);
+          try { if (createHash('sha256').update(readFileSync(existingFd)).digest('hex') !== hash) throw mediaError('Unsafe media store'); }
+          finally { closeSync(existingFd); }
+        } else {
+          if (this.usage() + bytes.length > MAX_MEDIA_QUOTA) throw mediaError('Media quota exceeded');
+          const temp = path.join(this.directory, `.${randomUUID()}.tmp`);
+          try {
+            const output = openSync(temp, 'wx', 0o600);
+            try { writeFileSync(output, bytes); fsyncSync(output); } finally { closeSync(output); }
+            this.assertDirectories(); renameSync(temp, destination); created = true;
+            const dir = openSync(this.directory, 'r'); try { fsyncSync(dir); } finally { closeSync(dir); }
+          } finally { if (existsSync(temp)) unlinkSync(temp); }
+        }
+        commit(artifact);
+        return artifact;
+      } catch (error) {
+        let referenced = true;
+        try { referenced = isReferenced?.(hash) ?? false; } catch { referenced = true; }
+        if (created && !referenced && existsSync(destination)) unlinkSync(destination);
+        throw error;
+      } finally { this.reservations.delete(reservation.id); }
+    });
+    this.queue = operation.catch(() => { this.reservations.delete(reservation.id); return undefined; });
+    return await operation;
   }
 
   async save(source: Artifact | (() => Artifact), commit: (artifact: Artifact) => void, options: { signal?: AbortSignal; isReferenced?: (localId: string) => boolean } = {}): Promise<Artifact> {
@@ -206,13 +291,8 @@ export class MediaStore {
       } finally { closeSync(existingFd); }
     } else {
       this.assertDirectories();
-      let usage = 0;
-      for (const entry of readdirSync(this.directory)) {
-        const candidate = path.join(this.directory, entry); const stat = lstatSync(candidate);
-        if (stat.isSymbolicLink()) throw mediaError('Unsafe media store');
-        if (stat.isFile()) usage += stat.size;
-      }
-      if (usage + payload.bytes.length > MAX_MEDIA_QUOTA) throw mediaError('Media quota exceeded');
+      const usage = this.usage();
+      if (usage + this.reservedBytes() + payload.bytes.length > MAX_MEDIA_QUOTA) throw mediaError('Media quota exceeded');
       const temp = path.join(this.directory, `.${randomUUID()}.tmp`);
       try {
         this.assertDirectories();

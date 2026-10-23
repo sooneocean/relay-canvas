@@ -5,8 +5,26 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 
 const directory = path.resolve(process.env.RELAY_DATA_DIR ?? path.join(process.cwd(), '.relay-canvas'));
-const server = new McpServer({ name: 'relay-canvas', version: '0.3.0' });
+const server = new McpServer({ name: 'relay-canvas', version: '0.4.0' });
 const id = z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/);
+const artifactIndex = z.number().int().min(0).max(99);
+const artifactIdentity = z.object({ runId: id, nodeId: id, artifactIndex }).strict();
+const clip = z.object({
+  id,
+  source: z.object({ runId: id, nodeId: id, artifactIndex }).strict(),
+  inSeconds: z.number().finite().min(0),
+  outSeconds: z.number().finite().positive(),
+}).strict();
+const readTimelineInput = z.object({ boardId: id }).strict();
+const updateTimelineInput = z.object({
+  boardId: id,
+  expectedRevision: z.number().int().nonnegative(),
+  format: z.enum(['landscape', 'portrait']),
+  clips: z.array(clip).max(12),
+}).strict();
+const exportTimelineInput = z.object({ boardId: id, expectedRevision: z.number().int().nonnegative(), operationId: id }).strict();
+const exportIdentity = z.object({ exportId: id }).strict();
+const compareRunsInput = z.object({ boardId: id, left: id, right: id }).strict();
 async function call(endpoint: string, method = 'GET', body?: unknown) {
   try {
     const session = JSON.parse(readFileSync(path.join(directory, 'session.json'), 'utf8')) as { origin: string; token: string };
@@ -38,4 +56,27 @@ server.registerTool('list_providers', { description: 'Read configured provider p
   if (!result.isError) { const state = JSON.parse(result.content[0].text); result.content[0].text = JSON.stringify({ providers: state.providers, settings: state.settings }); }
   return result;
 });
+server.registerTool('read_timeline', { description: 'Read the independently versioned timeline for a board.', inputSchema: readTimelineInput }, async ({ boardId }) => call(`/api/boards/${boardId}/timeline`));
+server.registerTool('update_timeline', {
+  description: 'Replace a board timeline with compare-and-swap revision protection. Sources must be saved successful local videos.',
+  inputSchema: updateTimelineInput,
+}, async ({ boardId, ...body }) => call(`/api/boards/${boardId}/timeline`, 'PUT', body));
+server.registerTool('export_timeline', {
+  description: 'Start an idempotent local H.264/AAC MP4 export of an immutable timeline snapshot.',
+  inputSchema: exportTimelineInput,
+}, async ({ boardId, ...body }) => call(`/api/boards/${boardId}/exports`, 'POST', body));
+server.registerTool('get_export', { description: 'Read durable timeline export status and its local artifact when complete.', inputSchema: exportIdentity }, async ({ exportId }) => call(`/api/exports/${exportId}`));
+server.registerTool('cancel_export', { description: 'Durably cancel a pending or running local export.', inputSchema: exportIdentity }, async ({ exportId }) => call(`/api/exports/${exportId}/cancel`, 'POST', {}));
+server.registerTool('compare_runs', {
+  description: 'Compare two terminal immutable generation runs from one board without changing state.',
+  inputSchema: compareRunsInput,
+}, async ({ boardId, left, right }) => call(`/api/boards/${boardId}/compare?left=${encodeURIComponent(left)}&right=${encodeURIComponent(right)}`));
+server.registerTool('save_artifact', {
+  description: 'Explicitly save one succeeded generation artifact into the authenticated local media store.',
+  inputSchema: artifactIdentity,
+}, async ({ runId, nodeId, artifactIndex }) => call(`/api/runs/${runId}/artifacts/${nodeId}/${artifactIndex}/save`, 'POST', {}));
+server.registerTool('get_artifact_info', {
+  description: 'Probe one already-saved video artifact and return its fixed source identity and media metadata.',
+  inputSchema: artifactIdentity,
+}, async ({ runId, nodeId, artifactIndex }) => call(`/api/runs/${runId}/artifacts/${nodeId}/${artifactIndex}/info`));
 await server.connect(new StdioServerTransport());

@@ -34,5 +34,15 @@ codex mcp list --json
 | `get_run` | 讀取 run 狀態與結果 |
 | `cancel_run` | 停止本機 polling |
 | `list_providers` | 列出 provider 設定，不回傳金鑰 |
+| `save_artifact` | 明確保存指定成功素材，不重新生成 |
+| `get_artifact_info` | 取得已保存本機影片的格式與時長 |
+| `read_timeline` | 讀取畫布的獨立時間軸與 revision |
+| `update_timeline` | 以 expectedRevision 保存來源、順序與入出點 |
+| `export_timeline` | 以 operationId 匯出實際 MP4 |
+| `get_export` | 讀取匯出快照、狀態與本機產物 |
+| `cancel_export` | 取消本機匯出，不修改原素材 |
+| `compare_runs` | 唯讀比較同一畫布兩個已結束 run |
 
 `run_board` 使用新的 `operationId` 表示一次有意義的點擊；重試同一 HTTP 請求才重用相同 id。遠端 run 需要 `confirmExternal=true`，且 server 必須啟用遠端。MCP 不提供任意 shell、檔案、URL 抓取或秘密設定工具。
+
+素材保存使用 `{runId,nodeId,artifactIndex}`（0..99 整數），先明確保存，再讀取影片資訊與設定時間軸。匯出使用已保存的時間軸快照；網路結果未知時重用原 operationId，避免重複處理。完整旅程與限制見 [影片編輯](editing.md)。
