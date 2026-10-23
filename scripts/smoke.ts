@@ -161,7 +161,10 @@ try {
       releaseSave?.();
       await page.unroute(savePattern);
     }
-    await page.getByLabel('save', { exact: true }).click();
+    // Autosave can finish between removing the fault and this click. The server
+    // read-back below must still prove that the exact retained draft was saved.
+    try { await page.getByLabel('save', { exact: true }).click({ timeout: 1000 }); }
+    catch (error) { if (!(error instanceof Error) || !error.message.includes('Timeout') || await page.getByLabel('save', { exact: true }).isEnabled()) throw error; }
     await until(() => api<AppState>('/api/state'), s => s.boards.find(b => b.id === 'welcome')?.nodes.find(n => n.id === 'brief')?.data.prompt === (fault === 'new-edit' ? `${text} edited during save` : text), 'draft saves after recovery');
     await until(async () => ({ disabled: await page.getByLabel('save', { exact: true }).isDisabled(), text: await page.getByLabel('save', { exact: true }).innerText() }), x => x.disabled && !x.text.includes('保存中'), 'recovered save settled');
     expectedNetworkFailure = false;

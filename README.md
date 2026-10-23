@@ -1,6 +1,6 @@
 # Relay Canvas
 
-Relay Canvas 是一個本機優先的圖片與影片創作畫布。啟動後會直接開啟可離線操作的範例畫布：編輯提示詞、連接圖片與影片節點、保存畫布，並在瀏覽器中看到 Demo 產物。Demo 不呼叫外部 AI，也不會消耗供應商額度。
+Relay Canvas 是一個本機優先的圖片與影片創作畫布。啟動後從創作首頁開啟專案或建立圖片／影片畫布：編輯提示詞、連接圖片與影片節點、保存畫布，並在瀏覽器中看到 Demo 產物。Demo 不呼叫外部 AI，也不會消耗供應商額度。
 
 ## 快速開始
 
@@ -16,7 +16,7 @@ npm start
 
 ### 使用 GitHub Release 發行包
 
-下載並解壓縮 `relay-canvas-0.1.0.tar.gz` 後，在解壓縮目錄執行：
+下載並解壓縮 `relay-canvas-0.2.0.tar.gz` 後，在解壓縮目錄執行：
 
 ```bash
 npm ci --omit=dev
@@ -33,7 +33,9 @@ npm start
 
 ## 主要能力
 
-- 深色 React Flow 畫布：prompt、image、video、asset 與 note 節點。
+- 創作首頁、可搜尋專案卡與圖片／影片快速建立。
+- 成功執行素材庫，支援篩選、預覽與返回來源節點。
+- 中性深灰 React Flow 畫布與浮動工具列：prompt、image、video、asset 與 note 節點。
 - DAG 驗證、revision optimistic concurrency、原子本機保存與執行歷史。
 - 內建 Demo 圖片與影片，適合離線試用與自動化驗證。
 - JSON 畫布匯入／匯出；匯入只接受單一 board，不會帶入 provider 或秘密。
@@ -69,11 +71,11 @@ npm run smoke
 npm run package:release
 ```
 
-封裝腳本會以明確白名單產生 `release/relay-canvas-0.1.0.tar.gz` 與 SHA-256 檔，排除 `.relay-canvas`、`.env`、secrets 與 `node_modules`。CI 與發布邊界請看 [CHANGELOG](CHANGELOG.md) 及 [研究紀錄](docs/research.md)。
+封裝腳本會以明確白名單產生 `release/relay-canvas-0.2.0.tar.gz` 與 SHA-256 檔，排除 `.relay-canvas`、`.env`、secrets 與 `node_modules`。CI 與發布邊界請看 [CHANGELOG](CHANGELOG.md) 及 [研究紀錄](docs/research.md)。
 
 ## Roadmap
 
-- v0.2：本機素材持久化、更多協定模板、模型能力探索、圖生圖、局部重繪與批次流程。
+- 後續版本：本機素材持久化、更多協定模板、模型能力探索、圖生圖、局部重繪與批次流程。
 - v0.3：鏡頭／角色資產、版本比較、影片串接與時間軸、預算上限、遠端取消與恢復查詢。
 - v1.0：工作區、多使用者權限與稽核、worker／queue、雲端部署、團隊協作與計費界線。
 

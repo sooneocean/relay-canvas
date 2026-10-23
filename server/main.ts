@@ -42,7 +42,7 @@ try {
     const session = { origin, token, pid: process.pid };
     atomicWrite(path.join(directory, 'session.json'), session);
     ownedSession = JSON.stringify(session);
-    console.log(`Relay Canvas v0.1.0 — ${origin}`);
+    console.log(`Relay Canvas v0.2.0 — ${origin}`);
     console.log(`Remote generation: ${service.policy.remoteEnabled ? 'enabled (confirmation required)' : 'disabled — Demo is ready'}`);
   });
   server.on('error', () => { console.error('Could not start local server. Check port and workspace ownership.'); process.exitCode = 1; });
