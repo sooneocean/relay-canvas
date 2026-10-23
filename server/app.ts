@@ -11,7 +11,7 @@ export function createApp(service: CanvasService, origin: string, token = random
   app.disable('x-powered-by');
   app.use(createBoundary({ origin, token, dev, policy: service.policy }));
   app.use(express.json({ limit: '6mb', strict: true }));
-  app.get('/healthz', (_req, res) => { res.json({ ok: true, version: '0.4.0' }); });
+  app.get('/healthz', (_req, res) => { res.json({ ok: true, version: '0.5.0' }); });
   app.get('/api/session', (_req, res) => {
     res.setHeader('Set-Cookie', `relay_canvas_media=${token}; HttpOnly; SameSite=Strict; Path=/api/media`);
     res.json({ token });

@@ -12,6 +12,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Store } from '../server/store.js';
 import { providers, starterBoard } from '../src/shared/defaults.js';
 import { verifyHandoffIntents } from './handoff-intents-smoke.js';
+import { sourceBrowserFixtures, verifySourceBrowser } from './source-browser-smoke.js';
+import { verifyThumbnailLifetime } from './thumbnail-lifetime-smoke.js';
 import type { AppState, Artifact, ArtifactInfo, Board, ExportJob, Run, RunComparison, Timeline } from '../src/shared/types.js';
 
 const root = process.cwd();
@@ -41,6 +43,9 @@ const fixtureStore = new Store(dataDir);
 fixtureStore.transaction(state => {
   state.boards.push(handoffBoard);
   state.runs.push(fixtureRun('handoff-a', 2, '2026-01-02T10:30:00Z'), fixtureRun('handoff-b', 3, '2026-01-03T12:45:00Z'));
+  const sources = sourceBrowserFixtures();
+  state.boards.push(sources.board);
+  state.runs.push(...sources.runs);
 });
 const artifacts = path.join(root, 'work'); mkdirSync(artifacts, { recursive: true });
 const portProbe = net.createServer();
@@ -66,7 +71,7 @@ try {
     assert.ok(response.ok, `${method} ${endpoint}: ${response.status}`);
     return response.json() as Promise<T>;
   }
-  client = new Client({ name: 'relay-editor-smoke', version: '0.4.0' });
+  client = new Client({ name: 'relay-editor-smoke', version: '0.5.0' });
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'build/server/mcp.js')], cwd: root, env: { ...Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined)), RELAY_DATA_DIR: dataDir }, stderr: 'pipe' }));
   const names = (await client.listTools()).tools.map(tool => tool.name);
   assert.equal(names.length, 17);
@@ -122,10 +127,10 @@ try {
   const nodesBeforeKeyboard = (await api<AppState>('/api/state')).boards[0].nodes.length;
   await dialog.getByTestId('timeline-close').focus(); await page.keyboard.press('Delete');
   assert.equal(await page.locator('.react-flow__node').count(), nodesBeforeKeyboard, 'modal Delete does not edit background graph');
-  await until(() => dialog.getByTestId('timeline-source').locator('option').count(), count => count >= 3, 'timeline source picker loaded');
-  const sourceValues = await dialog.getByTestId('timeline-source').locator('option').evaluateAll(options => options.filter(option => (option as HTMLOptionElement).value !== '' && !(option as HTMLOptionElement).disabled).map(option => (option as HTMLOptionElement).value));
+  await until(() => dialog.locator('[data-testid^="timeline-source-card-"]').count(), count => count >= 2, 'timeline source cards loaded');
+  const sourceValues = await dialog.locator('[data-testid^="timeline-source-card-"]').evaluateAll(cards => cards.map(card => card.getAttribute('data-source-key')!));
   assert.equal(sourceValues.length, 2);
-  await dialog.getByTestId('timeline-source').selectOption(sourceValues[0]);
+  await dialog.getByTestId(`timeline-source-card-${sourceValues[0]}`).locator('.timeline-source-card-select').click();
   await dialog.getByTestId('timeline-add').click();
   const clipElements = () => dialog.locator('[data-testid^="timeline-clip-"]');
   await until(() => clipElements().count(), count => count === 1, 'first clip added');
@@ -136,7 +141,7 @@ try {
   assert.equal(await clipElements().last().getAttribute('data-testid'), `timeline-clip-${firstId}`);
   await dialog.getByTestId(`timeline-remove-${firstId}`).click();
   await until(() => clipElements().count(), count => count === 1, 'clip removed');
-  await dialog.getByTestId('timeline-source').selectOption(sourceValues[1]);
+  await dialog.getByTestId(`timeline-source-card-${sourceValues[1]}`).locator('.timeline-source-card-select').click();
   await dialog.getByTestId('timeline-add').click();
   await until(() => clipElements().count(), count => count === 2, 'second source added');
   const clipIds = await clipElements().evaluateAll(elements => elements.map(element => element.getAttribute('data-testid')!.replace('timeline-clip-', '')));
@@ -349,6 +354,8 @@ try {
   const handoffCompare = () => page.getByTestId('compare-dialog');
   const handoffTimeline = () => page.getByTestId('timeline-dialog');
   const handoffSource = (runId: string, index: number) => `${runId}:archived-motion:${index}`;
+  const selectedHandoffSource = () => handoffTimeline().getByTestId('timeline-source-selected').getAttribute('data-source-key');
+  const chooseHandoffSource = (runId: string, index: number) => handoffTimeline().getByTestId(`timeline-source-card-${handoffSource(runId, index)}`).locator('.timeline-source-card-select').click();
   const handoffComparisonPath = '/api/boards/handoff/compare?left=handoff-a&right=handoff-b';
   const beforeHandoff = await api<AppState>('/api/state');
   const handoffCanonical = await api<RunComparison>(handoffComparisonPath);
@@ -382,8 +389,8 @@ try {
   releaseHandoffTimeline();
   await handoffTimelineResponse;
   await page.unroute(handoffTimelinePattern);
-  await until(() => handoffTimeline().getByTestId('timeline-source').inputValue(), value => value === handoffSource('handoff-a', 1), 'A exact artifact index1 is selected');
-  await until(() => handoffTimeline().getByTestId('timeline-source').isEnabled(), value => value, 'timeline loads without losing the intent');
+  await until(selectedHandoffSource, value => value === handoffSource('handoff-a', 1), 'A exact artifact index1 is selected');
+  await until(() => handoffTimeline().getByTestId('timeline-add').isEnabled(), value => value, 'timeline loads without losing the intent');
   assert.equal(await handoffTimeline().locator('[data-testid^="timeline-clip-"]').count(), 0, 'selection does not add a clip');
   assert.deepEqual(await api<Timeline>('/api/boards/handoff/timeline'), beforeTimeline, 'handoff leaves timeline/revision/format unchanged');
   assert.deepEqual(handoffTraffic, [], 'handoff does not save, probe or export');
@@ -393,23 +400,23 @@ try {
 
   // A manual choice must survive the ordinary one-second runs refresh and
   // delayed capabilities. It cannot be replaced by an already consumed intent.
-  await handoffTimeline().getByTestId('timeline-source').selectOption(handoffSource('handoff-b', 1));
+  await chooseHandoffSource('handoff-b', 1);
   const handoffCapabilitiesResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/editor/capabilities');
   releaseHandoffCapabilities();
   await handoffCapabilitiesResponse;
   await page.unroute(capabilitiesPattern);
   const refresh = page.waitForResponse(response => new URL(response.url()).pathname === '/api/state');
   await refresh;
-  assert.equal(await handoffTimeline().getByTestId('timeline-source').inputValue(), handoffSource('handoff-b', 1));
+  assert.equal(await selectedHandoffSource(), handoffSource('handoff-b', 1));
   await handoffTimeline().getByTestId('timeline-close').click();
   await page.getByTestId('timeline-open').click();
-  await until(() => handoffTimeline().getByTestId('timeline-source').locator('option').count(), count => count > 1, 'ordinary reopen sources loaded');
-  assert.notEqual(await handoffTimeline().getByTestId('timeline-source').inputValue(), handoffSource('handoff-a', 1), 'ordinary reopen does not replay A handoff');
+  await until(() => handoffTimeline().locator('[data-testid^="timeline-source-card-"]').count(), count => count > 1, 'ordinary reopen sources loaded');
+  assert.notEqual(await selectedHandoffSource(), handoffSource('handoff-a', 1), 'ordinary reopen does not replay A handoff');
   await handoffTimeline().getByTestId('timeline-close').click();
 
   await openHandoffCompare();
   await handoffCompare().getByTestId('compare-timeline-right-1').click();
-  await until(() => handoffTimeline().getByTestId('timeline-source').inputValue(), value => value === handoffSource('handoff-b', 1), 'B exact artifact index1 is selected');
+  await until(selectedHandoffSource, value => value === handoffSource('handoff-b', 1), 'B exact artifact index1 is selected');
   assert.deepEqual(handoffTraffic, [], 'both handoff sides remain selection only');
   await handoffTimeline().getByTestId('timeline-add').click();
   await until(() => handoffTimeline().locator('[data-testid^="timeline-clip-"]').count(), count => count === 1, 'explicit Add adds the selected historical B video');
@@ -425,7 +432,7 @@ try {
   await openHandoffCompare();
   const beforeRemoteTraffic = handoffTraffic.length;
   await handoffCompare().getByTestId('compare-timeline-left-0').click();
-  await until(() => handoffTimeline().getByTestId('timeline-source').inputValue(), value => value === handoffSource('handoff-a', 0), 'unsaved source selected exactly');
+  await until(selectedHandoffSource, value => value === handoffSource('handoff-a', 0), 'unsaved source selected exactly');
   assert.match(await handoffTimeline().getByTestId('timeline-add').innerText(), /保存並加入/);
   assert.equal(handoffTraffic.length, beforeRemoteTraffic, 'unsaved handoff still performs no save/probe');
   const retainedClipId = addedTimeline.clips[0].id;
@@ -500,17 +507,17 @@ try {
   await until(() => handoffCompare().getByTestId('compare-timeline-left-1').isEnabled(), value => value, 'restored exact identity can hand off again');
   const beforeDisappearanceTraffic = handoffTraffic.length;
   await handoffCompare().getByTestId('compare-timeline-left-1').click();
-  await until(() => handoffTimeline().getByTestId('timeline-source').inputValue(), value => value === handoffSource('handoff-a', 1), 'source selected before disappearance');
+  await until(selectedHandoffSource, value => value === handoffSource('handoff-a', 1), 'source selected before disappearance');
   catalogMode = 'missing-artifact';
   await until(async () => seenCatalogMode, value => value === 'missing-artifact', 'selected artifact disappears in live catalog');
   await handoffTimeline().getByTestId('timeline-source-unavailable').waitFor();
-  assert.equal(await handoffTimeline().getByTestId('timeline-source').inputValue(), handoffSource('handoff-a', 1), 'unavailable source keeps exact index and never substitutes another video');
+  assert.equal(await selectedHandoffSource(), handoffSource('handoff-a', 1), 'unavailable source keeps exact index and never substitutes another video');
   assert.equal(handoffTraffic.length, beforeDisappearanceTraffic, 'disappearance causes no hidden save, probe or timeline write');
   assert.deepEqual(await api<Timeline>('/api/boards/handoff/timeline'), retriedTimeline, 'disappearance does not alter persisted timeline');
-  await handoffTimeline().getByTestId('timeline-source').selectOption(handoffSource('handoff-b', 1));
+  await chooseHandoffSource('handoff-b', 1);
   catalogMode = 'normal';
   await until(async () => seenCatalogMode, value => value === 'normal', 'source catalog returns after manual choice');
-  assert.equal(await handoffTimeline().getByTestId('timeline-source').inputValue(), handoffSource('handoff-b', 1), 'reappearing old source cannot replace manual choice');
+  assert.equal(await selectedHandoffSource(), handoffSource('handoff-b', 1), 'reappearing old source cannot replace manual choice');
   await page.unroute(statePattern);
   page.off('request', watchHandoff);
   await handoffTimeline().getByTestId('timeline-close').click();
@@ -552,12 +559,14 @@ try {
     const response = page.waitForResponse(value => new URL(value.url()).pathname === '/api/boards/handoff' && value.request().method() === 'PUT');
     releaseCanvasGuard();
     await response;
-    await until(() => handoffTimeline().getByTestId('timeline-source').inputValue(), value => value === handoffSource('handoff-a', 1), 'successful guarded handoff opens exact selected source once');
+    await until(selectedHandoffSource, value => value === handoffSource('handoff-a', 1), 'successful guarded handoff opens exact selected source once');
     assert.equal(heldCanvasSaves, 1);
     assert.equal(await handoffCompare().count(), 0);
     assert.deepEqual(await api<Timeline>('/api/boards/handoff/timeline'), retriedTimeline, 'guarded handoff does not add or rewrite timeline');
   } finally { releaseCanvasGuard(); await page.unroute(boardSavePattern); }
   expectedFailure = false;
+  await verifySourceBrowser(browser, root, origin, api);
+  await verifyThumbnailLifetime(browser, root, origin);
   await verifyHandoffIntents(browser, root, handoffBoard, (await api<AppState>('/api/state')).runs.filter(run => run.boardId === 'handoff'), retriedTimeline);
   assert.equal(generationRequests, 0, 'editor and comparison never regenerate');
   assert.deepEqual(errors, [], 'no browser errors');

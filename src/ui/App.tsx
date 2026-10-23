@@ -95,6 +95,7 @@ import { parseBoard } from '../shared/schema.js';
 import { deriveAssets, deriveProjects, type AssetItem, type ProjectCard } from './catalog.js';
 import RunCompare from './RunCompare.js';
 import TimelineEditor, { validateTimelineHandoff, type SaveArtifact, type TimelineHandoffIntent, type UiRequest } from './TimelineEditor.js';
+import VideoThumbnail from './VideoThumbnail.js';
 
 type FlowNode = Node<CanvasData & { previewUrl?: string; runStatus?: Status; runError?: string }, 'canvas'>;
 type FlowEdge = Edge;
@@ -272,66 +273,6 @@ function artifactUrl(artifact?: Artifact): string | undefined {
 
 type AssetSaveState = { status: 'saving' | 'saved' | 'failed'; message?: string };
 type ProviderTemplate = 'openai' | 'newapi' | 'videos' | 'fal' | 'replicate';
-
-function VideoThumbnail({ src, alt, className = '' }: { src: string; alt: string; className?: string }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const previewTimeRef = useRef<number | undefined>(undefined);
-  const [poster, setPoster] = useState<string>();
-  const [failed, setFailed] = useState(false);
-  useEffect(() => {
-    previewTimeRef.current = undefined;
-    setPoster(undefined);
-    setFailed(false);
-  }, [src]);
-
-  const captureFrame = useCallback(() => {
-    const video = videoRef.current;
-    if (!video || video.seeking || previewTimeRef.current === undefined || video.currentTime < previewTimeRef.current || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth || !video.videoHeight) return;
-    try {
-      const canvas = document.createElement('canvas');
-      const width = Math.min(video.videoWidth, 960);
-      canvas.width = width;
-      canvas.height = Math.max(1, Math.round(width * video.videoHeight / video.videoWidth));
-      const context = canvas.getContext('2d');
-      if (!context) return;
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const nextPoster = canvas.toDataURL('image/jpeg', 0.82);
-      if (nextPoster.length > 32) setPoster(nextPoster);
-    } catch {
-      setFailed(true);
-    }
-  }, []);
-
-  const handleMetadata = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    if (!Number.isFinite(video.duration) || video.duration <= 0) { setFailed(true); return; }
-    // Seeking forces a decoded frame before capture; loadeddata at time zero can
-    // expose a black surface in Chromium even when the source's first frame is valid.
-    previewTimeRef.current = Math.min(0.1, video.duration / 2);
-    try { video.currentTime = previewTimeRef.current; } catch { setFailed(true); }
-  }, []);
-
-  return (
-    <span className={`video-thumbnail ${failed ? 'is-failed' : ''} ${className}`.trim()}>
-      <video
-        ref={videoRef}
-        src={src}
-        poster={poster}
-        muted
-        playsInline
-        preload="metadata"
-        crossOrigin="anonymous"
-        aria-label={alt}
-        onLoadedMetadata={handleMetadata}
-        onLoadedData={captureFrame}
-        onSeeked={captureFrame}
-        onError={() => setFailed(true)}
-      />
-      {!poster && failed && <span className="video-thumbnail-fallback" aria-hidden="true"><Film size={22} /></span>}
-    </span>
-  );
-}
 
 function createStarterNode(kind: CanvasData['kind']): FlowNode {
   const meta = nodeKindMeta[kind];
@@ -1350,7 +1291,7 @@ function AppShell() {
             <div className="brand-name">Relay Canvas</div>
             <div className="brand-kicker">IDEAS, CONNECTED.</div>
           </div>
-          <span className="version-tag">v0.4.0</span>
+          <span className="version-tag">v0.5.0</span>
         </div>
         <div className="board-switcher">
           <Layers3 size={15} />

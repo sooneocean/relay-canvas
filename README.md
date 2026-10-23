@@ -16,7 +16,7 @@ npm start
 
 ### 使用 GitHub Release 發行包
 
-下載並解壓縮 `relay-canvas-0.4.0.tar.gz` 後，在解壓縮目錄執行：
+下載並解壓縮 `relay-canvas-0.5.0.tar.gz` 後，在解壓縮目錄執行：
 
 ```bash
 npm ci --omit=dev
@@ -76,7 +76,7 @@ npm run package:release
 npm run smoke:package
 ```
 
-封裝腳本會以明確白名單產生 `release/relay-canvas-0.4.0.tar.gz` 與 SHA-256 檔，排除 `.relay-canvas`、`.env`、secrets 與 `node_modules`。CI 與發布邊界請看 [CHANGELOG](CHANGELOG.md) 及 [研究紀錄](docs/research.md)。
+封裝腳本會以明確白名單產生 `release/relay-canvas-0.5.0.tar.gz` 與 SHA-256 檔，排除 `.relay-canvas`、`.env`、secrets 與 `node_modules`。CI 與發布邊界請看 [CHANGELOG](CHANGELOG.md) 及 [研究紀錄](docs/research.md)。
 
 ## Roadmap
 

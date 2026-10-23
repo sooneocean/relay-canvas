@@ -59,21 +59,28 @@
       "result": "Byte-exact pre-v0.4 workspace backup, capped additive persisted schemas, independent timeline CAS and dirty/focus/navigation guards",
       "evidence": ["tests/v04.test.ts: exact v0.3 bytes preserved and failed durable creation starts zero workers", "scripts/editor-smoke.ts: concurrent edit/save, 409 conflict, controlled 500, deliberate reload, modal focus and persistence"],
       "limits": "Upgrade still requires a full workspace/media backup; downgrade uses a separate restored copy"
-    }
-  ],
-  "pendingRounds": [
+    },
     {
       "round": 8,
-      "milestone": "Unreleased after v0.4.0",
+      "milestone": "v0.5.0",
       "problem": "Choosing a video in comparison lost its exact identity when opening the timeline, requiring another search among versions",
       "result": "Explicit Compare-to-Timeline selection preserves run/node/output index, recognizable source time and known duration, with single-use intent, unavailable-source state and dirty-draft/navigation protection",
-      "evidence": ["scripts/editor-smoke.ts: A/B historical deleted-node index1 real backend Add/read-back, selection-only snapshots/traffic, save/probe failures, invalid catalogs and guarded double click", "scripts/handoff-intents-smoke.ts: actual component token/board-mismatch/delayed/manual-choice/draft checks", "docs/compare-handoff-review.md: fresh independent CONFIRMED on Chromium156 plus 64 core tests"],
+      "evidence": ["scripts/editor-smoke.ts: A/B historical deleted-node index1 real backend Add/read-back, selection-only snapshots/traffic, save/probe failures, invalid catalogs and guarded double click", "scripts/handoff-intents-smoke.ts: actual component token/board-mismatch/delayed/manual-choice/draft checks", "docs/compare-handoff-review.md: fresh CONFIRMED on Chromium156 plus 68/68 core tests and Ubuntu main CI 39933259939 success on e70084fd8ca18fb103b041ac4ae98ebdefb802b7"],
       "limits": "One source selected per handoff; no implicit save/add/probe; unread metadata duration stays unknown; no paid-provider live generation or competitor parity claim"
+    },
+    {
+      "round": 9,
+      "milestone": "v0.5.0",
+      "problem": "The dense timeline source picker made finding and previewing the right generated version difficult",
+      "result": "Searchable nine-card pages with exact source selection, persistent selected summary, local thumbnails, explicit playable preview and accessible seek, preserving drafts when preview or catalogs fail",
+      "evidence": ["scripts/source-browser-smoke.ts: 15 sources, search/page/refresh/keyboard, actual-media seek, zero implicit mutation traffic, real index1 backend Add and one/all-source disappearance", "scripts/thumbnail-lifetime-smoke.ts: actual component source change, unmount, unreadable fallback and recovery", "docs/source-browser-review.md: repaired root Chrome155 complete smoke and fresh independent Chromium156 CONFIRMED, check, 68/68 core tests, build and complete original/editor/17-tool journey"],
+      "limits": "One selected source and one preview; remote playback depends on a valid link and browser codec support; no paid-provider live generation or LibTV parity claim"
     }
   ],
-  "currentMilestone": "post-v0.4.0",
-  "milestoneStatus": "awaiting-repaired-main-ci",
+  "pendingRounds": [],
+  "currentMilestone": "v0.5.0",
+  "milestoneStatus": "acceptance-verified",
   "verifiedOn": "2026-10-23",
-  "nextCandidates": ["recognizable-video-source-browser"],
+  "nextCandidates": ["creator-acceptance-with-operator-configured-relays", "broader-media-source-compatibility"],
   "goalComplete": false
 }
