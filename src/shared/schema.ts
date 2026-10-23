@@ -6,6 +6,7 @@ import type {
   EditorCapabilities,
   ExportInput,
   ExportJob,
+  LocalAsset,
   MediaInfo,
   Operation,
   Provider,
@@ -106,10 +107,14 @@ const dataShape = {
   model: modelSchema.optional(),
   params: paramsSchema.optional(),
   referenceField: z.string().refine(isSafeReferenceField).optional(),
+  assetId: idSchema.optional(),
   assetUrl: z.string().refine(validAssetUrl).optional(),
   assetKind: z.enum(['image', 'video']).optional(),
 };
-const canvasDataSchema = z.object(dataShape).strict();
+const canvasDataSchema = z.object(dataShape).strict().superRefine((data, context) => {
+  if (data.assetId !== undefined && data.assetUrl !== undefined) context.addIssue({ code: z.ZodIssueCode.custom, message: 'asset identity conflict' });
+  if ((data.assetId !== undefined || data.assetUrl !== undefined) && data.kind !== 'asset') context.addIssue({ code: z.ZodIssueCode.custom, message: 'asset identity on non-asset node' });
+});
 const partialCanvasDataSchema = z.object({
   kind: dataShape.kind.optional(),
   label: dataShape.label.optional(),
@@ -118,6 +123,7 @@ const partialCanvasDataSchema = z.object({
   model: dataShape.model,
   params: dataShape.params,
   referenceField: dataShape.referenceField,
+  assetId: dataShape.assetId,
   assetUrl: dataShape.assetUrl,
   assetKind: dataShape.assetKind,
 }).strict();
@@ -226,6 +232,24 @@ const artifactSchema = z.object({
   if (count && (!artifact.mimeType || artifact.sha256 !== artifact.localId || artifact.localUrl !== `/api/media/${artifact.localId}`)) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: 'invalid local artifact metadata' });
   }
+});
+const localAssetSchema = z.object({
+  id: idSchema,
+  boardId: idSchema,
+  nodeId: idSchema,
+  name: shortText.refine(value => value.trim().length > 0),
+  createdAt: isoDateSchema,
+  artifact: artifactSchema,
+}).strict().superRefine((asset, context) => {
+  const artifact = asset.artifact;
+  if (!artifact.localId || artifact.localId !== artifact.sha256 || artifact.url !== artifact.localUrl || artifact.localUrl !== `/api/media/${artifact.localId}` || artifact.demo !== undefined || !artifact.bytes || !artifact.mimeType) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'invalid local asset artifact' });
+    return;
+  }
+  const valid = artifact.kind === 'image'
+    ? ['image/png', 'image/jpeg', 'image/webp'].includes(artifact.mimeType)
+    : ['video/mp4', 'video/webm'].includes(artifact.mimeType);
+  if (!valid) context.addIssue({ code: z.ZodIssueCode.custom, message: 'local asset kind mismatch' });
 });
 const savedVideoArtifactSchema = artifactSchema.superRefine((artifact, context) => {
   if (artifact.kind !== 'video' || !artifact.localId || !['video/mp4', 'video/webm'].includes(artifact.mimeType ?? '')) {
@@ -350,6 +374,7 @@ const storeDataSchema = z.object({
   runs: z.array(runSchema).max(200),
   timelines: z.array(timelineSchema).max(20).optional(),
   exports: z.array(storedExportJobSchema).max(100).optional(),
+  localAssets: z.array(localAssetSchema).max(200).optional(),
 }).strict().superRefine((data, context) => {
   const boardIds = new Set(data.boards.map(board => board.id));
   if (boardIds.size !== data.boards.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate board id' });
@@ -357,6 +382,18 @@ const storeDataSchema = z.object({
   if (new Set(data.runs.map(run => run.id)).size !== data.runs.length || new Set(data.runs.map(run => run.operationId)).size !== data.runs.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate run identity' });
   if (new Set((data.timelines ?? []).map(timeline => timeline.boardId)).size !== (data.timelines ?? []).length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate timeline board' });
   if (new Set((data.exports ?? []).map(job => job.id)).size !== (data.exports ?? []).length || new Set((data.exports ?? []).map(job => job.operationId)).size !== (data.exports ?? []).length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate export identity' });
+  const assets = data.localAssets ?? [];
+  if (new Set(assets.map(asset => asset.id)).size !== assets.length || new Set(assets.map(asset => asset.nodeId)).size !== assets.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate local asset identity' });
+  const assetsById = new Map(assets.map(asset => [asset.id, asset]));
+  for (const asset of assets) if (!boardIds.has(asset.boardId)) context.addIssue({ code: z.ZodIssueCode.custom, message: 'local asset board missing' });
+  const validateAssetReferences = (board: Board) => {
+    for (const node of board.nodes) if (node.data.assetId) {
+      const asset = assetsById.get(node.data.assetId);
+      if (!asset || asset.boardId !== board.id || node.data.kind !== 'asset' || node.data.assetKind !== asset.artifact.kind) context.addIssue({ code: z.ZodIssueCode.custom, message: 'invalid local asset reference' });
+    }
+  };
+  for (const board of data.boards) validateAssetReferences(board);
+  for (const run of data.runs) validateAssetReferences(run.snapshot);
   for (const timeline of data.timelines ?? []) if (!boardIds.has(timeline.boardId)) context.addIssue({ code: z.ZodIssueCode.custom, message: 'timeline board missing' });
   for (const job of data.exports ?? []) if (!boardIds.has(job.boardId)) context.addIssue({ code: z.ZodIssueCode.custom, message: 'export board missing' });
 });
@@ -410,6 +447,7 @@ export function parseTimeline(value: unknown): Timeline { return parseSafe(timel
 export function parseTimelineInput(value: unknown): TimelineInput { return parseSafe(timelineInputSchema, value); }
 export function parseMediaInfo(value: unknown): MediaInfo { return parseSafe(mediaInfoSchema, value); }
 export function parseArtifact(value: unknown): Artifact { return parseSafe(artifactSchema, value); }
+export function parseLocalAsset(value: unknown): LocalAsset { return parseSafe(localAssetSchema, value); }
 export function parseExportInput(value: unknown): ExportInput { return parseSafe(exportInputSchema, value); }
 export function parseExportJob(value: unknown): ExportJob { return parseSafe(exportJobSchema, value); }
 export function parseStoredExportJob(value: unknown): StoredExportJob { return parseSafe(storedExportJobSchema, value); }
@@ -425,6 +463,7 @@ export const schemaLimits = Object.freeze({
   maxTimelines: 20,
   maxTimelineClips: 12,
   maxExports: 100,
+  maxLocalAssets: 200,
   maxTimelineSeconds: 180,
   maxRequestBytes: 6 * 1024 * 1024,
 });

@@ -251,7 +251,7 @@ test('export HTTP hides attempt fences and diagnostics while token, cookie and R
   const board = store.read().boards[0];
   store.transaction(data => {
     data.timelines = [{ boardId: board.id, revision: 1, format: 'landscape', clips: [{ id: 'clip', source: { runId: 'run', nodeId: 'node', artifactIndex: 0 }, inSeconds: 0, outSeconds: 1, artifact: artifact!, media: { duration: 1, width: 640, height: 360, hasAudio: false } }] }];
-    data.exports = [{ id: 'export-http', boardId: board.id, timelineRevision: 1, operationId: 'export-http-operation', status: 'succeeded', startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), snapshot: data.timelines[0], artifact: artifact!, attemptNonce: 'private-attempt' }];
+    data.exports = [{ id: 'export-http', boardId: board.id, timelineRevision: 1, operationId: 'export-http-operation', status: 'succeeded', startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), snapshot: data.timelines[0], artifact: artifact!, attemptNonce: '11111111-1111-4111-8111-111111111111' }];
   });
   const sensitive = `${directory}/private-source.mp4 SECRET_DIAGNOSTIC`;
   const failingEditor = { capabilities: async () => ({ available: true }), export: async () => { throw new Error(sensitive); } } as unknown as EditorRuntime;
@@ -263,9 +263,9 @@ test('export HTTP hides attempt fences and diagnostics while token, cookie and R
     const publicJobResponse = await fetch(`${origin}/api/exports/export-http`, { headers });
     assert.equal(publicJobResponse.status, 200);
     const publicJobText = await publicJobResponse.text();
-    assert.equal(publicJobText.includes('attemptNonce') || publicJobText.includes('private-attempt'), false);
+    assert.equal(publicJobText.includes('attemptNonce') || publicJobText.includes('11111111-1111-4111-8111-111111111111'), false);
     const stateText = await (await fetch(`${origin}/api/state`, { headers })).text();
-    assert.equal(stateText.includes('attemptNonce') || stateText.includes('private-attempt'), false);
+    assert.equal(stateText.includes('attemptNonce') || stateText.includes('11111111-1111-4111-8111-111111111111'), false);
     assert.equal((await fetch(`${origin}${artifact!.localUrl}`)).status, 403);
     const tokenRange = await fetch(`${origin}${artifact!.localUrl}`, { headers: { Origin: origin, 'X-Canvas-Token': token, Range: 'bytes=0-3' } });
     assert.equal(tokenRange.status, 206); assert.deepEqual(Buffer.from(await tokenRange.arrayBuffer()), bytes.subarray(0, 4));

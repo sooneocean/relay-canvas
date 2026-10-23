@@ -6,7 +6,7 @@
 
 影片資訊與匯出使用系統 FFmpeg／ffprobe，支援 macOS 和 Linux，最低 major 6，需含 libx264 和 AAC encoder。使用維持安全更新的系統套件；發行包不包含這些第三方二進位。Ubuntu 可安裝 `ffmpeg` 套件；macOS 請使用已安裝的套件管理方式。工具缺少或不相容時，編輯器會顯示無法處理影片的狀態，畫布與比較仍可使用。
 
-時間軸只接受同一畫布中已成功生成並保存本機的 MP4／WebM。遠端連結須先明確保存，或選擇「保存並加入」；過期連結需供應商提供可讀來源。FFmpeg 不下載遠端網址。保存與加入不會重新生成，來源檔案不會被修改。
+時間軸接受同一畫布中已成功生成並保存本機的 MP4／WebM，也接受已匯入並明確執行的本機 asset node。遠端連結須先明確保存，或選擇「保存並加入」；過期連結需供應商提供可讀來源。FFmpeg 不下載遠端網址。保存與加入不會重新生成，來源檔案不會被修改。匯入的本機影片與生成影片共用既有 run／node／artifact identity，可在同一時間軸混合、裁切與重新排序。
 
 ## 編輯與匯出
 
@@ -15,7 +15,7 @@
 3. 選擇橫式 1280×720 或直式 720×1280。輸出為 24fps，以黑邊保留來源比例。
 4. 保存時間軸；它有獨立 revision，不會更改畫布生成設定。保存失敗或有新編輯時，草稿保留；衝突時先處理版本，再繼續。
 5. 匯出使用已保存時間軸的快照。匯出期間可繼續編輯，這些新編輯不會改變進行中的匯出。
-6. 完成後在本機預覽或下載 MP4。有聲來源保留首個音訊軌，無聲片段補靜音。取消或失敗不產生可用的部分結果；重試是一次明確的新匯出。
+6. 完成後在本機預覽或下載真正的 MP4。有聲來源保留首個音訊軌，無聲片段補靜音；MP4 與 WebM 混合時仍由受控 FFmpeg 路徑重新封裝／編碼成目標 MP4。取消或失敗不產生可用的部分結果；重試是一次明確的新匯出。
 
 每張時間軸最多 12 段、每段裁切最多 60 秒、總長最多 180 秒。單檔輸出最多 64 MiB；已有媒體與輸出合計持久保存限額 512 MiB。可用空間不足 64 MiB 時，匯出預算會相應縮小，超出預算明確失敗。全工作區同時一個匯出、最多 100 筆匯出紀錄；暫存檔另有 192 MiB 界線。匯出中斷不會自動重跑，重啟後標為 interrupted。
 
@@ -51,7 +51,7 @@ MCP 的 `save_artifact`、`get_artifact_info` 使用 `{runId,nodeId,artifactInde
 
 ## 輸出驗證與保存可靠性
 
-Provider 回傳成功前必須有 1 至 100 個 artifacts，並逐一驗證每個 artifact 的 kind 與媒體 URL allowlist；任一項錯誤就整批失敗，不會保存部分結果，也不會讓下游節點開始。remote artifact 不能藉由 `demo` 標記取得 Demo 本機路徑權限。這些規則同時保護 Compare、保存與後續影片參考。
+Provider 回傳成功前必須有 1 至 100 個 artifacts，並逐一驗證每個 artifact 的 kind 與媒體 URL allowlist；任一項錯誤就整批失敗，不會保存部分結果，也不會讓下游節點開始。remote artifact 不能藉由 `demo` 標記取得 Demo 本機路徑權限。這些規則同時保護 Compare、保存與後續影片參考。實際執行的本機 asset 結果也必須通過 registry、私有檔案 metadata／雜湊與 board ownership 驗證，才可進入相同的 Gallery／Compare／Timeline 流程。
 
 保存本機素材時，server 只接受 identity，不接受呼叫端自帶 URL。請求開始、排隊工作開始與 durable commit 會重新比對 canonical kind、URL、run 與結果狀態；來源在保存期間改變就回傳 conflict，保留新來源與既有已引用檔案，不覆寫成舊版本。這讓 Compare 的延遲保存與 Timeline 的明確加入可以安全重試，而不會因回應順序造成版本倒退。
 
@@ -59,4 +59,4 @@ Provider 回傳成功前必須有 1 至 100 個 artifacts，並逐一驗證每�
 
 首次 v0.4 改寫前保留 byte-identical `workspace.pre-v0.4.json`。升級前仍需停止舊服務並備份完整資料目錄。降版請在另一份資料副本恢復升級前 workspace，保留新版資料與 media；只替換程式碼無法復原資料。
 
-FFmpeg 會解析不可信媒體；來源雜湊、固定 demux／protocol、私有檔案與受控子程序能限制應用層行為，並非 OS codec sandbox 或無漏洞保證。此版驗證使用可重現本機影片 fixtures 和 Demo，不代表付費中轉站的真實生成已通過驗證。
+FFmpeg 會解析不可信媒體；來源雜湊、固定 demux／protocol、私有檔案與受控子程序能限制應用層行為，並非 OS codec sandbox 或無漏洞保證。此版驗證使用可重現本機影片 fixtures 和 Demo，以及 provider adapter contract fixtures；這些驗證不代表付費中轉站、所有 relay 或任何特定模型的 live generation 已通過驗證。

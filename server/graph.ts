@@ -51,7 +51,7 @@ export function plan(board: Board, providers: Provider[], selected?: string): Ex
   }
   for (const id of result.order) {
     const node = board.nodes.find(n => n.id === id)!;
-    if (node.data.kind === 'asset' && !node.data.assetUrl) result.errors.push(`${node.data.label}：請加入素材 URL。`);
+    if (node.data.kind === 'asset' && !node.data.assetUrl && !node.data.assetId) result.errors.push(`${node.data.label}：請加入素材。`);
     if (node.data.kind !== 'image' && node.data.kind !== 'video') continue;
     const provider = providers.find(p => p.id === node.data.providerId);
     if (!provider) { result.errors.push(`${node.data.label}：請選擇供應商。`); continue; }

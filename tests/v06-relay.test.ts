@@ -101,7 +101,7 @@ test('current stores reload relay while existing protocol stores retain their gr
 test('relay delegates image and video to fixed existing contracts with exact auth, bodies, refs and durable IDs', async () => {
   const imageCalls: Array<{ url: string; method: string; authorization?: string; body: unknown }> = [];
   const image = await generate(provider('relay'), request({
-    params: { prompt: 'attacker', model: 'attacker', n: 9, quality: 'high', output_format: 'png' },
+    params: { prompt: 'attacker', model: 'attacker', quality: 'high', output_format: 'png' },
   }), { policy, env, transport: async (url, options) => {
     imageCalls.push({ url, method: options.method, authorization: options.headers.authorization, body: options.body });
     return { data: [{ url: 'https://media.example.com/image.png' }] };

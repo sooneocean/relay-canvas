@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import {
   closeSync, constants, existsSync, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync,
-  readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync,
+  readSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync, writeSync,
 } from 'node:fs';
 import { request as httpsRequest } from 'node:https';
 import type { RequestOptions } from 'node:https';
@@ -20,6 +20,14 @@ const DEADLINE_MS = 30_000;
 export interface MediaPayload { bytes: Buffer; contentType: string }
 export type MediaFetcher = (url: string, policy: SecurityPolicy, signal?: AbortSignal) => Promise<MediaPayload>;
 export interface MediaReservation { readonly id: string; readonly bytes: number }
+export interface ImportedMedia {
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly mimeType: string;
+  readonly kind: MediaKind;
+  readonly temp?: string;
+  readonly reservation?: MediaReservation;
+}
 export interface MediaDownloadOptions {
   signal?: AbortSignal;
   resolve?: (hostname: string) => Promise<Array<{ address: string; family: number }>>;
@@ -110,6 +118,29 @@ function detect(bytes: Buffer): { mimeType: string; extension: string; kind: Med
   return undefined;
 }
 
+function detectStreamed(prefix: Buffer, suffix: Buffer, bytes: number): { mimeType: string; extension: string; kind: MediaKind } | undefined {
+  if (prefix.length >= 24 && prefix.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) && prefix.toString('ascii', 12, 16) === 'IHDR') return { mimeType: 'image/png', extension: 'png', kind: 'image' };
+  if (prefix.length >= 2 && prefix[0] === 0xff && prefix[1] === 0xd8 && suffix.length >= 2 && suffix[suffix.length - 2] === 0xff && suffix[suffix.length - 1] === 0xd9) return { mimeType: 'image/jpeg', extension: 'jpg', kind: 'image' };
+  if (prefix.length >= 12 && prefix.toString('ascii', 0, 4) === 'RIFF' && prefix.toString('ascii', 8, 12) === 'WEBP' && prefix.readUInt32LE(4) + 8 === bytes) return { mimeType: 'image/webp', extension: 'webp', kind: 'image' };
+  if (prefix.length >= 12 && prefix.toString('ascii', 4, 8) === 'ftyp') {
+    const box = prefix.readUInt32BE(0); if (box >= 8 && box <= bytes) return { mimeType: 'video/mp4', extension: 'mp4', kind: 'video' };
+  }
+  if (prefix.length >= 4 && prefix.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))) return { mimeType: 'video/webm', extension: 'webm', kind: 'video' };
+  return undefined;
+}
+
+function streamedHash(fd: number): string {
+  const hash = createHash('sha256');
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  let position = 0;
+  for (;;) {
+    const bytes = readSync(fd, chunk, 0, chunk.length, position);
+    if (!bytes) break;
+    hash.update(chunk.subarray(0, bytes)); position += bytes;
+  }
+  return hash.digest('hex');
+}
+
 function parseDataUrl(value: string): MediaPayload {
   if (value.length > Math.ceil(MAX_MEDIA_BYTES * 4 / 3) + 128) throw mediaError('Media exceeds file limit');
   const match = /^data:(image\/(?:png|jpeg|webp)|video\/(?:mp4|webm));base64,([A-Za-z0-9+/]*={0,2})$/i.exec(value);
@@ -124,6 +155,7 @@ export class MediaStore {
   private queue: Promise<unknown> = Promise.resolve();
   private readonly opened = new Set<number>();
   private readonly reservations = new Map<string, number>();
+  private readonly activeImportTemps = new Set<string>();
   private readonly rootIdentity: { dev: bigint; ino: bigint };
   private readonly mediaIdentity: { dev: bigint; ino: bigint };
   constructor(
@@ -167,7 +199,7 @@ export class MediaStore {
     for (const entry of readdirSync(this.directory)) {
       const candidate = path.join(this.directory, entry); const stat = lstatSync(candidate);
       if (stat.isSymbolicLink()) throw mediaError('Unsafe media store');
-      if (stat.isFile()) usage += stat.size;
+      if (stat.isFile() && !this.activeImportTemps.has(candidate)) usage += stat.size;
     }
     return usage;
   }
@@ -186,6 +218,134 @@ export class MediaStore {
       return reservation;
     });
     this.queue = operation.catch(() => undefined);
+    return await operation;
+  }
+
+  async reserveImport(bytes: number): Promise<MediaReservation> {
+    if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > MAX_MEDIA_BYTES) throw mediaError('Invalid media reservation');
+    const operation = this.queue.then(() => {
+      this.assertDirectories();
+      if (this.usage() + this.reservedBytes() + bytes > MAX_MEDIA_QUOTA) throw mediaError('Media quota exceeded');
+      const reservation = { id: randomUUID(), bytes } as const;
+      this.reservations.set(reservation.id, bytes);
+      return reservation;
+    });
+    this.queue = operation.catch(() => undefined);
+    return await operation;
+  }
+
+  async receiveImport(
+    input: IncomingMessage,
+    mimeType: string,
+    kind: MediaKind,
+    expectedBytes: number,
+    options: { reservation?: MediaReservation; signal?: AbortSignal; deadlineMs?: number } = {},
+  ): Promise<ImportedMedia> {
+    const discard = options.reservation === undefined;
+    let temp: string | undefined;
+    let fd: number | undefined;
+    let total = 0;
+    let prefix = Buffer.alloc(0), suffix = Buffer.alloc(0);
+    let hash: ReturnType<typeof createHash> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const abort = () => input.destroy(mediaError('Media import aborted'));
+    let abortRegistered = false;
+    try {
+      if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 1 || expectedBytes > MAX_MEDIA_BYTES) throw mediaError('Invalid media length');
+      if (!discard && options.reservation!.bytes !== expectedBytes) throw mediaError('Invalid media reservation');
+      this.assertDirectories();
+      temp = discard ? undefined : path.join(this.directory, `.${randomUUID()}.import`);
+      hash = createHash('sha256');
+      const deadlineMs = options.deadlineMs ?? DEADLINE_MS;
+      if (!Number.isInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > DEADLINE_MS) throw mediaError('Invalid media deadline');
+      timer = setTimeout(() => input.destroy(mediaError('Media import timed out')), deadlineMs);
+      options.signal?.addEventListener('abort', abort, { once: true }); abortRegistered = options.signal !== undefined;
+      if (options.signal?.aborted) throw mediaError('Media import aborted');
+      if (temp) { fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); fchmodSync(fd, 0o600); this.activeImportTemps.add(temp); }
+      for await (const value of input) {
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        total += chunk.length;
+        if (total > expectedBytes || total > MAX_MEDIA_BYTES) throw mediaError('Media length mismatch');
+        hash.update(chunk);
+        if (prefix.length < 32) prefix = Buffer.concat([prefix, chunk.subarray(0, 32 - prefix.length)]);
+        suffix = chunk.length >= 32 ? chunk.subarray(chunk.length - 32) : Buffer.concat([suffix, chunk]).subarray(-32);
+        if (fd !== undefined) {
+          let offset = 0;
+          while (offset < chunk.length) {
+            const written = writeSync(fd, chunk, offset, chunk.length - offset);
+            if (written < 1) throw mediaError('Media import write failed');
+            offset += written;
+          }
+        }
+      }
+      if (total !== expectedBytes) throw mediaError('Media length mismatch');
+      const detected = detectStreamed(prefix, suffix, total);
+      if (!detected || detected.mimeType !== mimeType || detected.kind !== kind) throw mediaError('Unsupported media signature');
+      if (fd !== undefined) fsyncSync(fd);
+      return { bytes: total, sha256: hash.digest('hex'), mimeType, kind, ...(temp ? { temp, reservation: options.reservation } : {}) };
+    } catch (error) {
+      if (fd !== undefined) { try { closeSync(fd); } catch { /* cleanup */ } fd = undefined; }
+      if (temp && existsSync(temp)) unlinkSync(temp);
+      if (temp) this.activeImportTemps.delete(temp);
+      if (options.reservation) await this.releaseReservation(options.reservation);
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (abortRegistered) options.signal?.removeEventListener('abort', abort);
+      if (fd !== undefined) closeSync(fd);
+    }
+  }
+
+  async commitImport(
+    upload: ImportedMedia,
+    commit: (artifact: Artifact) => void,
+    options: { signal?: AbortSignal; isReferenced?: (localId: string) => boolean } = {},
+  ): Promise<Artifact> {
+    if (!upload.temp || !upload.reservation) throw mediaError('Invalid media import');
+    const operation = this.queue.then(() => {
+      this.assertDirectories();
+      if (options.signal?.aborted) throw mediaError('Media import aborted');
+      if (this.reservations.get(upload.reservation!.id) !== upload.bytes) throw mediaError('Media reservation expired');
+      const metadata = lstatSync(upload.temp!, { bigint: true });
+      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size !== BigInt(upload.bytes) || (metadata.mode & 0o777n) !== 0o600n) throw mediaError('Unsafe media store');
+      const fd = openSync(upload.temp!, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const opened = fstatSync(fd, { bigint: true });
+        if (!opened.isFile() || opened.dev !== metadata.dev || opened.ino !== metadata.ino || streamedHash(fd) !== upload.sha256) throw mediaError('Unsafe media store');
+      } finally { closeSync(fd); }
+      if (options.signal?.aborted) throw mediaError('Media import aborted');
+      const extension = ({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'video/mp4': 'mp4', 'video/webm': 'webm' } as Record<string, string>)[upload.mimeType];
+      const destination = path.join(this.directory, `${upload.sha256}.${extension}`);
+      const artifact: Artifact = { kind: upload.kind, url: `/api/media/${upload.sha256}`, localId: upload.sha256, localUrl: `/api/media/${upload.sha256}`, bytes: upload.bytes, sha256: upload.sha256, mimeType: upload.mimeType };
+      let created = false;
+      try {
+        if (existsSync(destination)) {
+          const existing = lstatSync(destination, { bigint: true });
+          if (!existing.isFile() || existing.isSymbolicLink() || existing.size !== BigInt(upload.bytes) || (existing.mode & 0o777n) !== 0o600n) throw mediaError('Unsafe media store');
+          const existingFd = openSync(destination, constants.O_RDONLY | constants.O_NOFOLLOW);
+          try { if (streamedHash(existingFd) !== upload.sha256) throw mediaError('Unsafe media store'); } finally { closeSync(existingFd); }
+          unlinkSync(upload.temp!);
+        } else {
+          if (options.signal?.aborted) throw mediaError('Media import aborted');
+          renameSync(upload.temp!, destination); created = true;
+          const dir = openSync(this.directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+          try { fsyncSync(dir); } finally { closeSync(dir); }
+        }
+        if (options.signal?.aborted) throw mediaError('Media import aborted');
+        commit(artifact);
+        return artifact;
+      } catch (error) {
+        let referenced = true;
+        try { referenced = options.isReferenced?.(upload.sha256) ?? false; } catch { referenced = true; }
+        if (created && !referenced && existsSync(destination)) unlinkSync(destination);
+        throw error;
+      } finally {
+        this.reservations.delete(upload.reservation!.id);
+        if (existsSync(upload.temp!)) unlinkSync(upload.temp!);
+        this.activeImportTemps.delete(upload.temp!);
+      }
+    });
+    this.queue = operation.catch(() => { this.reservations.delete(upload.reservation!.id); if (existsSync(upload.temp!)) unlinkSync(upload.temp!); this.activeImportTemps.delete(upload.temp!); return undefined; });
     return await operation;
   }
 
@@ -332,13 +492,38 @@ export class MediaStore {
       fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
       const opened = fstatSync(fd);
       this.assertDirectories();
-      if (!opened.isFile() || opened.size !== artifact.bytes) throw mediaError('Unknown media');
+      if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== artifact.bytes || (opened.mode & 0o077) !== 0) throw mediaError('Unknown media');
       this.opened.add(fd);
       return { file, fd, size: opened.size };
     } catch (error) {
       if (fd !== undefined) closeSync(fd);
       throw error;
     }
+  }
+  verifyArtifact(artifact: Artifact): Artifact {
+    const located = this.fileFor(artifact);
+    try {
+      if (streamedHash(located.fd) !== artifact.sha256) throw mediaError('Unknown media');
+      const after = fstatSync(located.fd);
+      if (!after.isFile() || after.size !== artifact.bytes) throw mediaError('Unknown media');
+      return structuredClone(artifact);
+    } finally { this.releaseFile(located.fd); }
+  }
+  providerDataUrl(artifact: Artifact, maxBytes = 4 * 1024 * 1024): string {
+    if (artifact.kind !== 'image' || !['image/png', 'image/jpeg', 'image/webp'].includes(artifact.mimeType ?? '') || !artifact.bytes || artifact.bytes > maxBytes) throw mediaError('Local image exceeds provider reference limit');
+    const located = this.fileFor(artifact);
+    try {
+      const bytes = Buffer.allocUnsafe(located.size);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const count = readSync(located.fd, bytes, offset, bytes.length - offset, offset);
+        if (!count) throw mediaError('Unknown media');
+        offset += count;
+      }
+      const after = fstatSync(located.fd);
+      if (!after.isFile() || after.size !== artifact.bytes || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) throw mediaError('Unknown media');
+      return `data:${artifact.mimeType};base64,${bytes.toString('base64')}`;
+    } finally { this.releaseFile(located.fd); }
   }
   releaseFile(fd: number): void {
     if (!this.opened.delete(fd)) return;

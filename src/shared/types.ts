@@ -10,6 +10,7 @@ export interface CanvasData extends Record<string, unknown> {
   model?: string;
   params?: Record<string, unknown>;
   referenceField?: string;
+  assetId?: string;
   assetUrl?: string;
   assetKind?: MediaKind;
 }
@@ -36,6 +37,21 @@ export interface Artifact {
   bytes?: number;
   sha256?: string;
 }
+export interface LocalAsset {
+  id: string;
+  boardId: string;
+  nodeId: string;
+  name: string;
+  createdAt: string;
+  artifact: Artifact;
+}
+export interface ImportAssetInput {
+  expectedRevision: number;
+  operationId: string;
+  kind: MediaKind;
+  name: string;
+}
+export interface ImportAssetResult { board: Board; asset: LocalAsset; nodePresent: boolean }
 export type Status = 'pending' | 'submitting' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | 'needs_review';
 export interface NodeResult { nodeId: string; status: Status; text?: string; artifacts: Artifact[]; error?: string; attemptId?: string; remoteId?: string; referenceUrl?: string }
 export interface Run { id: string; boardId: string; revision: number; operationId: string; status: Status; startedAt: string; finishedAt?: string; snapshot: Board; providers: Provider[]; order: string[]; results: Record<string, NodeResult>; error?: string }
@@ -117,6 +133,7 @@ export interface StoreData {
   runs: Run[];
   timelines?: Timeline[];
   exports?: StoredExportJob[];
+  localAssets?: LocalAsset[];
 }
 export interface AppState extends Omit<StoreData, 'exports'> {
   exports?: ExportJob[];

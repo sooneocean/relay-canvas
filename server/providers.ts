@@ -52,6 +52,43 @@ function ownString(record: Record<string, unknown>, key: string): string | undef
   return typeof value === 'string' ? value : undefined;
 }
 
+const MAX_PROVIDER_OUTPUTS = 100;
+const MAX_AGGREGATE_BASE64 = 6 * 1024 * 1024;
+const BASE64_PAYLOAD = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}(?:==)?|[A-Za-z0-9+/]{3}=?)?$/;
+const DATA_URL_PAYLOAD = /^data:(?:image\/(?:png|jpeg|webp)|video\/(?:mp4|webm));base64,([A-Za-z0-9+/]*={0,2})$/i;
+
+function boundedDenseArray(value: unknown): unknown[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_PROVIDER_OUTPUTS) {
+    fail('Provider returned an invalid response');
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(value, index)) fail('Provider returned an invalid response');
+  }
+  return value;
+}
+
+function base64Length(value: string, allowEmpty = false): number {
+  if ((!allowEmpty && value.length === 0) || !BASE64_PAYLOAD.test(value)) {
+    fail('Provider returned an invalid response');
+  }
+  return value.length;
+}
+
+function dataUrlBase64Length(value: string): number {
+  if (!value.toLowerCase().startsWith('data:')) return 0;
+  const match = DATA_URL_PAYLOAD.exec(value);
+  if (!match) fail('Provider returned an invalid response');
+  return base64Length(match[1], true);
+}
+
+function addAggregateBase64(total: number, length: number): number {
+  const next = total + length;
+  if (!Number.isSafeInteger(next) || next > MAX_AGGREGATE_BASE64) {
+    fail('Provider returned an invalid response');
+  }
+  return next;
+}
+
 function readSecret(env: NodeJS.ProcessEnv, key: string): string {
   if (!key || !Object.prototype.hasOwnProperty.call(env, key)) fail('Provider credential is unavailable');
   const value = env[key];
@@ -115,9 +152,21 @@ function inspectGeneration(
   if (provider.protocol === 'videos' || (provider.protocol === 'relay' && request.kind === 'video')) {
     try { parseVideosParams(request.params); } catch { fail('Invalid provider configuration'); }
   }
-  if ((provider.protocol === 'openai' || (provider.protocol === 'relay' && request.kind === 'image')) && Object.prototype.hasOwnProperty.call(request.params, 'output_format')) {
-    const format = request.params.output_format;
-    if (format !== 'png' && format !== 'jpeg' && format !== 'webp') fail('Invalid provider configuration');
+  if (provider.protocol === 'openai' || (provider.protocol === 'relay' && request.kind === 'image')) {
+    if (Object.prototype.hasOwnProperty.call(request.params, 'output_format')) {
+      const format = request.params.output_format;
+      if (format !== 'png' && format !== 'jpeg' && format !== 'webp') fail('Invalid provider configuration');
+    }
+    if (Object.prototype.hasOwnProperty.call(request.params, 'n')) {
+      const count = request.params.n;
+      if (!Number.isInteger(count) || (count as number) < 1 || (count as number) > 4) {
+        fail('Invalid provider configuration');
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(request.params, 'response_format')) {
+      const responseFormat = request.params.response_format;
+      if (responseFormat !== 'url' && responseFormat !== 'b64_json') fail('Invalid provider configuration');
+    }
   }
   if (provider.protocol === 'fal') validateFalModel(request.model);
   if (provider.protocol === 'replicate') validateReplicateModel(request.model);
@@ -147,8 +196,28 @@ function sameOriginProviderUrl(value: string, origin: string, policy: SecurityPo
   return url.href;
 }
 
+function normalizedArtifact(kind: MediaKind, value: string, policy: SecurityPolicy): GenerationOutput['artifacts'][number] {
+  try {
+    return { kind, url: validateMediaUrl(value, policy) };
+  } catch {
+    fail('Provider returned an invalid response');
+  }
+}
+
 function artifact(kind: MediaKind, value: string, policy: SecurityPolicy): GenerationOutput {
-  return { artifacts: [{ kind, url: validateMediaUrl(value, policy) }] };
+  return { artifacts: [normalizedArtifact(kind, value, policy)] };
+}
+
+function orderedUrlArtifacts(kind: MediaKind, values: unknown, policy: SecurityPolicy): GenerationOutput {
+  const entries = boundedDenseArray(values);
+  let aggregateBase64 = 0;
+  const artifacts: GenerationOutput['artifacts'] = [];
+  for (const entry of entries) {
+    if (typeof entry !== 'string' || entry.length === 0) fail('Provider returned an invalid response');
+    aggregateBase64 = addAggregateBase64(aggregateBase64, dataUrlBase64Length(entry));
+    artifacts.push(normalizedArtifact(kind, entry, policy));
+  }
+  return { artifacts };
 }
 
 export function providerDiagnostics(
@@ -232,11 +301,14 @@ function demo(request: GenerationRequest, policy: SecurityPolicy): GenerationOut
 function extractFalOutput(value: unknown, kind: MediaKind, policy: SecurityPolicy): GenerationOutput {
   if (!isRecord(value)) fail('Provider returned an invalid response');
   if (kind === 'image') {
-    const images = value.images;
-    if (!Array.isArray(images) || !isRecord(images[0])) fail('Provider returned an invalid response');
-    const url = ownString(images[0], 'url');
-    if (!url) fail('Provider returned an invalid response');
-    return artifact('image', url, policy);
+    const images = boundedDenseArray(value.images);
+    const urls = images.map((image) => {
+      if (!isRecord(image)) fail('Provider returned an invalid response');
+      const url = ownString(image, 'url');
+      if (!url) fail('Provider returned an invalid response');
+      return url;
+    });
+    return orderedUrlArtifacts('image', urls, policy);
   }
   const video = value.video;
   if (!isRecord(video)) fail('Provider returned an invalid response');
@@ -246,9 +318,8 @@ function extractFalOutput(value: unknown, kind: MediaKind, policy: SecurityPolic
 }
 
 function extractReplicateOutput(value: unknown, kind: MediaKind, policy: SecurityPolicy): GenerationOutput {
-  const candidate = typeof value === 'string' ? value : Array.isArray(value) ? value.find((entry) => typeof entry === 'string') : undefined;
-  if (typeof candidate !== 'string') fail('Provider returned an invalid response');
-  return artifact(kind, candidate, policy);
+  if (typeof value === 'string') return artifact(kind, value, policy);
+  return orderedUrlArtifacts(kind, value, policy);
 }
 
 async function pause(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -278,21 +349,37 @@ async function openAi(
   policy: SecurityPolicy,
 ): Promise<GenerationOutput> {
   if (request.kind !== 'image' || request.referenceUrl) fail('Provider capability is not supported');
-  const body: Record<string, unknown> = { ...request.params, model: request.model, prompt: request.prompt, n: 1 };
+  const count = request.params.n ?? 1;
+  const body: Record<string, unknown> = { ...request.params, model: request.model, prompt: request.prompt, n: count };
   const response = await transport(joinFixedPath(base, '/images/generations'), {
     method: 'POST', headers: { authorization: `Bearer ${key}` }, body, signal: request.signal,
   }, policy);
-  if (!isRecord(response) || !Array.isArray(response.data) || !isRecord(response.data[0])) fail('Provider returned an invalid response');
-  const first = response.data[0];
-  const url = ownString(first, 'url');
-  if (url) return artifact('image', url, policy);
-  const base64 = ownString(first, 'b64_json');
-  if (!base64 || base64.length > 6 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)) {
-    fail('Provider returned an invalid response');
-  }
+  if (!isRecord(response)) fail('Provider returned an invalid response');
+  const entries = boundedDenseArray(response.data);
   const format = request.params.output_format ?? 'png';
   if (format !== 'png' && format !== 'jpeg' && format !== 'webp') fail('Invalid provider configuration');
-  return artifact('image', `data:image/${format};base64,${base64}`, policy);
+  let aggregateBase64 = 0;
+  const artifacts: GenerationOutput['artifacts'] = [];
+  for (const entry of entries) {
+    if (!isRecord(entry)) fail('Provider returned an invalid response');
+    const hasUrl = Object.prototype.hasOwnProperty.call(entry, 'url');
+    const hasBase64 = Object.prototype.hasOwnProperty.call(entry, 'b64_json');
+    const url = ownString(entry, 'url');
+    const base64 = ownString(entry, 'b64_json');
+    if (hasUrl && !url) fail('Provider returned an invalid response');
+    if (hasBase64) {
+      if (base64 === undefined) fail('Provider returned an invalid response');
+      aggregateBase64 = addAggregateBase64(aggregateBase64, base64Length(base64));
+    }
+    if (!hasUrl && !hasBase64) fail('Provider returned an invalid response');
+    if (url !== undefined) {
+      aggregateBase64 = addAggregateBase64(aggregateBase64, dataUrlBase64Length(url));
+      artifacts.push(normalizedArtifact('image', url, policy));
+    } else {
+      artifacts.push(normalizedArtifact('image', `data:image/${format};base64,${base64!}`, policy));
+    }
+  }
+  return { artifacts };
 }
 
 async function videos(

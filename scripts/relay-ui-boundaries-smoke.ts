@@ -62,6 +62,15 @@ export async function verifyRelayUiBoundaries(browser: Browser, root: string): P
       equal(appended.edges[199].source, appended.imageNodeId, 'relay edge source must be image node');
       equal(appended.edges[199].target, appended.videoNodeId, 'relay edge target must be video node');
 
+      const occupied = [[0,0],[380,0],[760,0],[0,300],[380,300],[200,500],[620,500]].map(([x,y], index) => ({ ...flowNode('occupied-' + index), position: { x,y } }));
+      const occupiedSnapshot = JSON.stringify(occupied);
+      const free = buildRelayFlow(occupied, [], relayProvider(), prefix => prefix + '-free');
+      if (!free) fail('occupied canvas must still find room for a pair');
+      const overlaps = (a,b) => Math.abs(a.position.x - b.position.x) < 340 && Math.abs(a.position.y - b.position.y) < 300;
+      for (const next of free.nodes.slice(-2)) if (occupied.some(current => overlaps(next,current))) fail('new relay pair overlaps an imported/custom node');
+      if (overlaps(free.nodes[7],free.nodes[8])) fail('new relay pair nodes overlap one another');
+      equal(JSON.stringify(occupied), occupiedSnapshot, 'finding free positions must not move existing nodes');
+
       const tooManyNodes = Array.from({ length: 99 }, (_, index) => flowNode('node-' + index));
       const tooManyEdges = Array.from({ length: 200 }, (_, index) => flowEdge('edge-' + index));
       const failureInputs = { nodes: tooManyNodes, edges: tooManyEdges, selection: 'failure-selection', dirty: false };

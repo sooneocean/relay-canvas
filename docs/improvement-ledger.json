@@ -91,12 +91,28 @@
       "result": "Per-output Compare save/download/retry with canonical authority and async identity fences, carrying exact video selection into saved timeline edits and local MP4 delivery",
       "evidence": ["scripts/relay-ui-boundaries-smoke.ts: actual Compare index1, double click, drift and late response guards", "tests/v06-relay.test.ts: queued and durable-save CAS races without stale metadata or new orphan", "scripts/relay-flow-smoke.ts: image/video download hashes, handoff, trims/order, both MP4 formats and reload/CDN-unavailable local playback", "docs/v0.6-review-record.md: root Chrome155 and fresh independent Chromium156 complete journeys"],
       "limits": "Same-board successful exact outputs only; timeline retains one track, 12 clips and 180 seconds total; system FFmpeg/ffprobe required"
+    },
+    {
+      "round": 12,
+      "milestone": "v0.7.0",
+      "problem": "Relay responses lost additional image candidates and creators could not request image count or response format",
+      "result": "Ordered complete image outputs for OpenAI, fal and Replicate, bounded OpenAI/relay quantity and response format, with exact index1 version save/download continuing into editing",
+      "evidence": ["tests/v07-provider-outputs.test.ts: complete atomic output validation and preflight limits", "scripts/media-sources-smoke.ts: two multi-output versions and exact second-output Compare save/download/hash", "docs/v0.7-review-record.md: security READY and fresh Chromium156 CONFIRMED"],
+      "limits": "Fixed adapter contracts only; paid relay live generation and arbitrary response envelopes remain unverified"
+    },
+    {
+      "round": 13,
+      "milestone": "v0.7.0",
+      "problem": "Creators could not use their local images and videos in the generation-to-editing workflow",
+      "result": "Authenticated streaming import for five media formats, stable retry and same-board asset authority, disclosed local image reference transfer, mixed local/generated timeline and both actual MP4 exports",
+      "evidence": ["tests/v07-local-assets.test.ts: import integrity, authority, quota, upgrade and cleanup failures", "scripts/import-network-smoke.ts: real duplicate header, socket disconnect and production30s deadline", "scripts/media-sources-smoke.ts: five real formats, MCP, response-loss retry, late edits, mixed MP4/WebM trims/order/reload/offline and actual export/download hashes", "docs/v0.7-review-record.md: root Chrome155 and fresh independent Chromium156 complete journeys"],
+      "limits": "64MiB per file, 512MiB workspace media, 200 retained imported assets; no asset deletion/GC; existing single-track editor and FFmpeg requirements remain"
     }
   ],
   "pendingRounds": [],
-  "currentMilestone": "v0.6.0",
+  "currentMilestone": "v0.7.0",
   "milestoneStatus": "acceptance-verified",
   "verifiedOn": "2026-10-23",
-  "nextCandidates": ["operator-configured-paid-relay-acceptance", "broader-media-source-compatibility"],
+  "nextCandidates": ["operator-configured-paid-relay-acceptance", "additional-evidence-backed-provider-contracts", "local-asset-lifecycle-management"],
   "goalComplete": false
 }

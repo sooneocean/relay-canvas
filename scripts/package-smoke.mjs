@@ -53,10 +53,54 @@ try {
   }
   const info = await api(`/api/runs/${run.id}/artifacts/motion/0/info`);
   assert.ok(info.media.duration >= 2.9 && info.media.duration <= 3.1, 'packaged ffprobe reads bundled saved video');
+  const importedBytes = readFileSync(path.join(directory, 'dist', 'demo-motion.mp4'));
+  const importedSha256 = createHash('sha256').update(importedBytes).digest('hex');
+  const importQuery = new URLSearchParams({ expectedRevision: '0', operationId: 'package-import', kind: 'video', name: 'package-source.mp4' });
+  const importEndpoint = `${origin}/api/boards/welcome/imports?${importQuery}`;
+  const importHeaders = { Origin: origin, 'X-Canvas-Token': token, 'Content-Type': 'video/mp4', 'Content-Length': String(importedBytes.length) };
+  async function importPackageSource() {
+    const response = await fetch(importEndpoint, { method: 'POST', headers: importHeaders, body: importedBytes });
+    assert.equal(response.status, 201, `POST ${importEndpoint}: ${response.status}`);
+    return response.json();
+  }
+  const imported = await importPackageSource();
+  assert.equal(imported.asset.id, 'package-import');
+  assert.equal(imported.asset.name, 'package-source.mp4');
+  assert.equal(imported.asset.artifact.kind, 'video');
+  assert.equal(imported.asset.artifact.mimeType, 'video/mp4');
+  assert.equal(imported.asset.artifact.bytes, importedBytes.length);
+  assert.equal(imported.asset.artifact.sha256, importedSha256);
+  assert.equal(imported.asset.artifact.localId, importedSha256);
+  assert.equal(imported.asset.artifact.localUrl, `/api/media/${importedSha256}`);
+  assert.equal(imported.nodePresent, true);
+  assert.equal(imported.board.revision, 1);
+  const replayedImport = await importPackageSource();
+  assert.deepEqual(replayedImport.asset, imported.asset, 'identical import replay returns the same asset');
+  assert.equal(replayedImport.board.revision, imported.board.revision, 'identical import replay does not increase board revision');
+  assert.equal(replayedImport.nodePresent, true);
+  const importedRun = await api('/api/runs', 'POST', { boardId: 'welcome', expectedRevision: imported.board.revision, operationId: 'package-local-source', nodeId: imported.asset.nodeId, confirmExternal: false });
+  const importedResult = await until(() => api(`/api/runs/${importedRun.id}`), value => value.status === 'succeeded', 'packaged imported passthrough workflow');
+  assert.deepEqual(importedResult.order, [imported.asset.nodeId]);
+  assert.equal(importedResult.results[imported.asset.nodeId].status, 'succeeded');
+  const importedArtifact = importedResult.results[imported.asset.nodeId].artifacts[0];
+  assert.equal(importedArtifact.localId, importedSha256);
+  assert.equal(importedArtifact.localUrl, `/api/media/${importedSha256}`);
+  assert.equal(importedArtifact.bytes, importedBytes.length);
+  assert.equal(importedArtifact.sha256, importedSha256);
+  assert.equal(importedArtifact.mimeType, 'video/mp4');
+  assert.equal(importedArtifact.demo, undefined);
+  assert.equal(importedResult.results[imported.asset.nodeId].remoteId, undefined);
+  const importedPrivate = await fetch(`${origin}${importedArtifact.localUrl}`);
+  assert.equal(importedPrivate.status, 403);
+  const importedReadBack = await fetch(`${origin}${importedArtifact.localUrl}`, { headers });
+  assert.equal(importedReadBack.status, 200);
+  const importedReadBackBytes = Buffer.from(await importedReadBack.arrayBuffer());
+  assert.equal(importedReadBackBytes.length, importedBytes.length);
+  assert.equal(createHash('sha256').update(importedReadBackBytes).digest('hex'), importedSha256);
   let timeline = await api('/api/boards/welcome/timeline');
   const clips = [
     { id: 'package-clip-a', source: { runId: run.id, nodeId: 'motion', artifactIndex: 0 }, inSeconds: 0.25, outSeconds: 1.25 },
-    { id: 'package-clip-b', source: { runId: run.id, nodeId: 'motion', artifactIndex: 0 }, inSeconds: 1.5, outSeconds: 2.5 },
+    { id: 'package-clip-b', source: { runId: importedRun.id, nodeId: imported.asset.nodeId, artifactIndex: 0 }, inSeconds: 1.5, outSeconds: 2.5 },
   ];
   const formats = [];
   for (const format of ['landscape', 'portrait']) {
@@ -90,7 +134,7 @@ try {
     assert.equal(range.status, 206); assert.equal((await range.arrayBuffer()).byteLength, 32);
     formats.push({ format, width: video.width, height: video.height, sha256: output.sha256 });
   }
-  writeFileSync(path.join(root, 'work', 'package-smoke.json'), JSON.stringify({ status: 'PASS', platform: process.platform, version: pkg.version, archive, checks: ['clean extraction', 'production dependency install', 'packaged startup/UI/Demo', 'private local save and hash read-back', 'real ffprobe', 'real trimmed two-clip landscape and portrait MP4 exports', 'idempotency', 'H264/AAC/duration/dimensions', 'export auth/Range/hash'], formats, paidRequests: 0 }, null, 2));
+  writeFileSync(path.join(root, 'work', 'package-smoke.json'), JSON.stringify({ status: 'PASS', platform: process.platform, version: pkg.version, archive, checks: ['clean extraction', 'production dependency install', 'packaged startup/UI/Demo', 'private local save and hash read-back', 'real ffprobe', 'raw MP4 import with saved artifact hash/bytes and node identity', 'identical import replay preserves asset/node and board revision', 'private local passthrough run with no remote generation', 'real trimmed two-clip mixed Demo/imported landscape and portrait MP4 exports', 'idempotency', 'H264/AAC/duration/dimensions', 'export auth/Range/hash'], formats, paidRequests: 0 }, null, 2));
   console.log('PASS: clean release install, actual packaged landscape/portrait MP4 export and private media read-back.');
 } finally {
   const stopped = new Promise(resolve => child.once('exit', resolve));

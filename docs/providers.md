@@ -12,7 +12,7 @@ Demo 不做外連。它產生固定程式生成的 SVG data URL 或本機 `/demo
 
 ## OpenAI-compatible / New API
 
-以 `POST {baseUrl}/images/generations` 傳送 Bearer env key、model、prompt、`n: 1` 與受限參數，讀取 `data[].url` 或 `data[].b64_json`。此圖片協定支援 text-to-image，不接受 image input；影片需另選 Videos JSON、fal 或 Replicate 協定。OpenAI 圖片 API 的實際欄位應以 operator 選定服務的文件為準。
+以 `POST {baseUrl}/images/generations` 傳送 Bearer env key、model、prompt 與受限參數。OpenAI／relay 圖片請求可選 `n` 1–4（預設 1）及 `response_format` `url`／`b64_json`；UI 只在這兩種圖片契約顯示這些控制，其他協定維持既有欄位。回應的 `data[]` 必須是有序、非空且最多 100 個項目；每個項目都逐一驗證，優先使用 `url`，只有 URL 欄位不存在時才退回 `b64_json`。存在但空白、無效或不允許的 URL 會令整批拒絕；即使 URL 勝出，所有出現的 Base64（包含 data URL 文字）仍計入總 6 MiB 上限。任何後續項目失敗、稀疏陣列、超過 100 個或總量超限，都不保存部分結果。此圖片協定支援 text-to-image，不接受 image input；影片需另選 Videos JSON、fal 或 Replicate 協定。圖片輸出的實際 MIME 仍由 `output_format`／預設 PNG 與保存後的 bytes 共同驗證。OpenAI 圖片 API 的實際欄位應以 operator 選定服務的文件為準。協定欄位參考：[New API plugin usage](https://docs.newapi.ai/en/docs/plugins/usage)。
 
 ## 自訂中轉站設定
 
@@ -26,7 +26,7 @@ Demo 不做外連。它產生固定程式生成的 SVG data URL 或本機 `/demo
 
 ## Image + Video JSON 中轉站（`relay`）
 
-`relay` 是一個明確的複合 profile：同一個 HTTPS base URL、exact provider origin 與 `RELAY_KEY_*` 環境變數，分別設定 `imageModel` 和 `videoModel`。它只重用本產品已定義的兩個固定契約：圖片使用 `POST {base}/images/generations`，影片使用 `POST {base}/videos`，再以 `GET {base}/videos/{id}` 輪詢。它不接受任意 endpoint、header、腳本、欄位映射或模型路徑。
+`relay` 是一個明確的複合 profile：同一個 HTTPS base URL、exact provider origin 與 `RELAY_KEY_*` 環境變數，分別設定 `imageModel` 和 `videoModel`。它只重用本產品已定義的兩個固定契約：圖片使用 `POST {base}/images/generations`（支援 `n` 1–4 與 `response_format` `url`／`b64_json`），影片使用 `POST {base}/videos`，再以 `GET {base}/videos/{id}` 輪詢。圖片多輸出會保留 provider 回應順序；影片契約與參數維持不變。它不接受任意 endpoint、header、腳本、欄位映射或模型路徑。
 
 OpenAI-compatible 仍是 image-only；Videos JSON 仍是 video-only。`relay` 不把這兩者改成官方 OpenAI Videos，也不宣稱任意中轉站、所有 relay API 或任意模型都相容。image 與 video model 必須分開填寫，並依各自固定契約驗證輸入；圖轉影固定使用 `input_reference.image_url` 傳送同一 run 的上游圖片 URL。
 
@@ -53,11 +53,11 @@ fixture 測試證明請求與錯誤處理契約，不等同於任何實際中轉
 
 ## fal
 
-預設 queue origin 是 `https://queue.fal.run`。模型路徑與參數會依固定 adapter 形狀組合，建立後只接受同 origin 的 status／response URL，處理 `IN_QUEUE`、`IN_PROGRESS`、`COMPLETED`，並讀取 `images[].url` 或 `video.url`。官方 queue 文件：<https://fal.ai/docs/documentation/model-apis/inference/queue>。
+預設 queue origin 是 `https://queue.fal.run`。模型路徑與參數會依固定 adapter 形狀組合，建立後只接受同 origin 的 status／response URL，處理 `IN_QUEUE`、`IN_PROGRESS`、`COMPLETED`。圖片完成回應的 `images[]` 會依順序保留 1–100 個有效 `url`；任一項無效或缺失就整批拒絕。影片仍只讀取固定的 `video.url`，影片契約不變。官方 queue 文件：<https://fal.ai/docs/documentation/model-apis/inference/queue>。
 
 ## Replicate
 
-預設 API origin 是 `https://api.replicate.com/v1`。模型使用 `owner/name` profile，建立 `POST /models/{owner}/{name}/predictions`，以 Bearer env key 傳送 `input`，再以 `GET /predictions/{id}` 輪詢 `starting`、`processing`、`succeeded`、`failed` 或 `canceled`。官方 HTTP 文件：<https://replicate.com/docs/reference/http/>。
+預設 API origin 是 `https://api.replicate.com/v1`。模型使用 `owner/name` profile，建立 `POST /models/{owner}/{name}/predictions`，以 Bearer env key 傳送 `input`，再以 `GET /predictions/{id}` 輪詢 `starting`、`processing`、`succeeded`、`failed` 或 `canceled`。圖片成功輸出可為有序字串或字串陣列，最多 100 個；每個 URL 會逐一驗證，空值、稀疏或混合無效輸出會令整批拒絕。影片輸出仍沿用既有固定影片形狀。官方 HTTP 文件：<https://replicate.com/docs/reference/http/>。
 
 ## 來源與限制
 

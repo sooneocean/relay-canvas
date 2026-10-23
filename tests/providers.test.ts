@@ -93,7 +93,7 @@ test('OpenAI-compatible image uses exact path/body and normalizes URL output', a
   };
   const output = await generate(provider('openai'), request({
     model: 'gpt-image-1',
-    params: { prompt: 'attacker', model: 'attacker', n: 99, quality: 'high' },
+    params: { prompt: 'attacker', model: 'attacker', quality: 'high' },
   }), { policy, env, transport });
   assert.deepEqual(calls, [{
     url: 'https://api.example.com/v1/images/generations',

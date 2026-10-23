@@ -71,7 +71,7 @@ try {
     assert.ok(response.ok, `${method} ${endpoint}: ${response.status}`);
     return response.json() as Promise<T>;
   }
-  client = new Client({ name: 'relay-editor-smoke', version: '0.6.0' });
+  client = new Client({ name: 'relay-editor-smoke', version: '0.7.0' });
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'build/server/mcp.js')], cwd: root, env: { ...Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined)), RELAY_DATA_DIR: dataDir }, stderr: 'pipe' }));
   const names = (await client.listTools()).tools.map(tool => tool.name);
   assert.equal(names.length, 17);

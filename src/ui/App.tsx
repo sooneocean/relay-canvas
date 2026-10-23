@@ -83,6 +83,8 @@ import type {
   CanvasEdge,
   CanvasNode,
   ExecutionPlan,
+  LocalAsset,
+  ImportAssetResult,
   NodeResult,
   Provider,
   ProviderDiagnostic,
@@ -106,6 +108,11 @@ type ApiState = 'loading' | 'ready' | 'offline';
 type BoardConflict = { boardId: string; localRevision: number; remoteRevision: number };
 
 const MAX_IMPORT_BYTES = 6 * 1024 * 1024;
+const MAX_MEDIA_IMPORT_BYTES = 64 * 1024 * 1024;
+const MAX_LOCAL_REFERENCE_BYTES = 4 * 1024 * 1024;
+const MEDIA_IMPORT_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'video/mp4', 'video/webm']);
+const MEDIA_IMPORT_ACCEPT = 'image/png,image/jpeg,image/webp,video/mp4,video/webm';
+const BOARD_IMPORT_ACCEPT = 'application/json,.json';
 
 const terminalStatuses = new Set<Status>(['succeeded', 'failed', 'cancelled', 'interrupted', 'needs_review']);
 
@@ -139,7 +146,7 @@ function cleanData(data: CanvasData): CanvasData {
     kind: data.kind,
     label: data.label,
   };
-  for (const key of ['prompt', 'providerId', 'model', 'params', 'referenceField', 'assetUrl', 'assetKind'] as const) {
+  for (const key of ['prompt', 'providerId', 'model', 'params', 'referenceField', 'assetId', 'assetUrl', 'assetKind'] as const) {
     if (data[key] !== undefined) {
       allowed[key] = data[key] as never;
     }
@@ -164,12 +171,18 @@ function cleanBoard(board: Board): Board {
   };
 }
 
-function boardToFlowNodes(board: Board): FlowNode[] {
+function boardToFlowNodes(board: Board, localAssets: LocalAsset[] = []): FlowNode[] {
+  const assetsById = new Map(localAssets.map((asset) => [asset.id, asset]));
   return board.nodes.map((node) => ({
     id: node.id,
     type: 'canvas',
     position: node.position,
-    data: { ...node.data },
+    data: {
+      ...node.data,
+      ...(node.data.assetId && assetsById.has(node.data.assetId)
+        ? { previewUrl: artifactUrl(assetsById.get(node.data.assetId)?.artifact) }
+        : {}),
+    },
   }));
 }
 
@@ -214,7 +227,7 @@ function canConnect(nodes: FlowNode[], edges: FlowEdge[], connection: Connection
     if (sourceOutput !== 'text' || incoming.length >= 1) return false;
   }
   if (targetKind === 'video') {
-    if (sourceOutput !== 'text' && sourceOutput !== 'image') return false;
+    if (sourceOutput !== 'text' && sourceOutput !== 'image' && sourceOutput !== 'asset') return false;
     if (incoming.some((edge) => outputKind(getNodeKind(nodes, edge.source) ?? 'note') === sourceOutput)) return false;
     if (incoming.length >= 2) return false;
   }
@@ -238,6 +251,30 @@ function canConnect(nodes: FlowNode[], edges: FlowEdge[], connection: Connection
     stack.push(...(adjacency.get(current) ?? []));
   }
   return true;
+}
+
+function localImageReferenceInfo(nodes: FlowNode[], edges: FlowEdge[], generationIds: string[], localAssets: LocalAsset[]): LocalImageReferenceInfo {
+  const nodesById = new Map(nodes.map((node) => [node.id, node]));
+  const incoming = new Map<string, string[]>();
+  for (const edge of edges) incoming.set(edge.target, [...(incoming.get(edge.target) ?? []), edge.source]);
+  const assetsById = new Map(localAssets.map((asset) => [asset.id, asset]));
+  const visited = new Set<string>();
+  const matched = new Set<string>();
+  const stack = [...generationIds];
+  while (stack.length) {
+    const id = stack.pop();
+    if (!id || visited.has(id)) continue;
+    visited.add(id);
+    const node = nodesById.get(id);
+    if (node?.data.kind === 'asset' && node.data.assetId) {
+      const asset = assetsById.get(node.data.assetId);
+      const kind = node.data.assetKind ?? asset?.artifact.kind;
+      if (kind === 'image') matched.add(node.data.assetId);
+    }
+    stack.push(...(incoming.get(id) ?? []));
+  }
+  const oversized = [...matched].some((assetId) => (assetsById.get(assetId)?.artifact.bytes ?? 0) > MAX_LOCAL_REFERENCE_BYTES);
+  return { count: matched.size, oversized };
 }
 
 function statusLabel(status?: Status): string {
@@ -271,7 +308,36 @@ function artifactUrl(artifact?: Artifact): string | undefined {
   return artifact?.localUrl ?? artifact?.url;
 }
 
+function mediaKindForFile(file: File): 'image' | 'video' | undefined {
+  if (file.type.startsWith('image/')) return 'image';
+  if (file.type.startsWith('video/')) return 'video';
+  return undefined;
+}
+
+function formatBytes(bytes?: number): string {
+  if (!Number.isFinite(bytes)) return '大小未知';
+  if (bytes! >= 1024 * 1024) return `${(bytes! / (1024 * 1024)).toFixed(1)} MiB`;
+  if (bytes! >= 1024) return `${Math.round(bytes! / 1024)} KiB`;
+  return `${bytes} B`;
+}
+
 type AssetSaveState = { status: 'saving' | 'saved' | 'failed'; message?: string };
+type MediaImportState = {
+  file: File;
+  operationId: string;
+  kind: 'image' | 'video';
+  status: 'saving' | 'uploading' | 'failed';
+  error?: string;
+  boardId: string;
+};
+type LocalImageReferenceInfo = { count: number; oversized: boolean };
+type RunConfirmState = {
+  nodeId?: string;
+  operationId: string;
+  plan: ExecutionPlan;
+  requestedImageCount: number;
+  localImageReference: LocalImageReferenceInfo;
+};
 type ProviderTemplate = 'openai' | 'newapi' | 'videos' | 'relay' | 'fal' | 'replicate';
 
 export type RelayFlowAppend = {
@@ -300,12 +366,40 @@ export function buildRelayFlow(
     imageNodeId === videoNodeId || existingIds.has(imageNodeId) || existingIds.has(videoNodeId) || existingIds.has(edgeId)
   ) return undefined;
 
-  const row = Math.floor(nodes.length / 3);
-  const column = nodes.length % 3;
+  // Creator nodes are roughly 340x300 in the canvas. Search a deterministic
+  // grid for a horizontal pair with a 40px gap, while keeping a small safety
+  // margin around existing nodes. This preserves every existing position and
+  // keeps the newly-added image node selectable when imported/custom nodes are
+  // already clustered near the usual insertion coordinates.
+  const footprint = { width: 340, height: 300 } as const;
+  const margin = 20;
+  const pairGap = 40;
+  const pairStepX = footprint.width + pairGap;
+  const pairStepY = footprint.height + pairGap;
+  const occupied = nodes.map((node) => ({
+    x: node.position.x - margin,
+    y: node.position.y - margin,
+    width: footprint.width + margin * 2,
+    height: footprint.height + margin * 2,
+  }));
+  const overlaps = (left: { x: number; y: number; width: number; height: number }, right: typeof left) =>
+    left.x < right.x + right.width && left.x + left.width > right.x &&
+    left.y < right.y + right.height && left.y + left.height > right.y;
+  let position: { x: number; y: number } | undefined;
+  for (let row = 0; row <= nodes.length + 1 && !position; row += 1) {
+    for (let column = 0; column < 6; column += 1) {
+      const image = { x: column * pairStepX, y: row * pairStepY, width: footprint.width, height: footprint.height };
+      const video = { x: image.x + footprint.width + pairGap, y: image.y, width: footprint.width, height: footprint.height };
+      if (occupied.some((node) => overlaps(image, node) || overlaps(video, node))) continue;
+      position = { x: image.x, y: image.y };
+      break;
+    }
+  }
+  if (!position) return undefined;
   const imageNode: FlowNode = {
     id: imageNodeId,
     type: 'canvas',
-    position: { x: 240 + column * 300, y: 140 + row * 210 },
+    position,
     data: {
       kind: 'image',
       label: `${String(nodes.length + 1).padStart(2, '0')} / Relay image`,
@@ -318,7 +412,7 @@ export function buildRelayFlow(
   const videoNode: FlowNode = {
     id: videoNodeId,
     type: 'canvas',
-    position: { x: imageNode.position.x + 380, y: imageNode.position.y },
+    position: { x: imageNode.position.x + footprint.width + pairGap, y: imageNode.position.y },
     data: {
       kind: 'video',
       label: `${String(nodes.length + 2).padStart(2, '0')} / Relay video`,
@@ -386,6 +480,7 @@ function AppShell() {
   const [providers, setProviders] = useState<Provider[]>(defaultProviders);
   const [runs, setRuns] = useState<Run[]>([]);
   const [exports, setExports] = useState<ExportJob[]>([]);
+  const [localAssets, setLocalAssets] = useState<LocalAsset[]>([]);
   const [settings, setSettings] = useState<AppState['settings']>({ remoteEnabled: false, mediaOrigins: [], providerOrigins: [] });
   const [activeBoardId, setActiveBoardId] = useState('welcome');
   const [nodes, setNodes] = useState<FlowNode[]>(() => boardToFlowNodes(starterBoard()));
@@ -397,7 +492,7 @@ function AppShell() {
   const [toast, setToast] = useState<{ tone: 'info' | 'error' | 'success'; message: string }>();
   const [plan, setPlan] = useState<ExecutionPlan>();
   const [runBusy, setRunBusy] = useState(false);
-  const [confirmRun, setConfirmRun] = useState<{ nodeId?: string; operationId: string; plan: ExecutionPlan }>();
+  const [confirmRun, setConfirmRun] = useState<RunConfirmState>();
   const [providerDraftId, setProviderDraftId] = useState('demo');
   const [providersDirty, setProvidersDirty] = useState(false);
   const [providerDiagnostics, setProviderDiagnostics] = useState<Record<string, ProviderDiagnostic>>({});
@@ -410,11 +505,16 @@ function AppShell() {
   const [handoffIntent, setHandoffIntent] = useState<TimelineHandoffIntent>();
   const [assetSaveStates, setAssetSaveStates] = useState<Record<string, AssetSaveState>>({});
   const [conflict, setConflict] = useState<BoardConflict>();
+  const [mediaImport, setMediaImport] = useState<MediaImportState>();
+  const [mediaImportNotice, setMediaImportNotice] = useState<string>();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const fileInputModeRef = useRef<'board' | 'media'>('board');
   const tokenRef = useRef(token);
   const activeBoardIdRef = useRef(activeBoardId);
+  const selectedNodeIdRef = useRef(selectedNodeId);
   const dirtyRef = useRef(dirty);
   const boardsRef = useRef(boards);
+  const localAssetsRef = useRef(localAssets);
   const editVersionRef = useRef(0);
   const saveInFlightRef = useRef<Promise<Board | undefined> | null>(null);
   const providersRef = useRef(providers);
@@ -435,6 +535,7 @@ function AppShell() {
   const timelineOpenRef = useRef(timelineOpen);
   const handoffIntentRef = useRef<TimelineHandoffIntent | undefined>(undefined);
   const handoffClaimRef = useRef<string | undefined>(undefined);
+  const mediaImportRef = useRef<MediaImportState | undefined>(undefined);
 
   const activeBoard = useMemo(() => boards.find((board) => board.id === activeBoardId) ?? boards[0], [activeBoardId, boards]);
   const selectedNode = useMemo(() => nodes.find((node) => node.id === selectedNodeId), [nodes, selectedNodeId]);
@@ -455,8 +556,10 @@ function AppShell() {
 
   useEffect(() => { tokenRef.current = token; }, [token]);
   useEffect(() => { activeBoardIdRef.current = activeBoardId; }, [activeBoardId]);
+  useEffect(() => { selectedNodeIdRef.current = selectedNodeId; }, [selectedNodeId]);
   useEffect(() => { dirtyRef.current = dirty; }, [dirty]);
   useEffect(() => { boardsRef.current = boards; }, [boards]);
+  useEffect(() => { localAssetsRef.current = localAssets; }, [localAssets]);
   useEffect(() => { providersRef.current = providers; }, [providers]);
   useEffect(() => { providerDraftIdRef.current = providerDraftId; }, [providerDraftId]);
   useEffect(() => { nodesRef.current = nodes; }, [nodes]);
@@ -464,6 +567,7 @@ function AppShell() {
   useEffect(() => { runsRef.current = runs; }, [runs]);
   useEffect(() => { timelineOpenRef.current = timelineOpen; }, [timelineOpen]);
   useEffect(() => { handoffIntentRef.current = handoffIntent; }, [handoffIntent]);
+  useEffect(() => { mediaImportRef.current = mediaImport; }, [mediaImport]);
 
   const notify = useCallback((message: string, tone: 'info' | 'error' | 'success' = 'info') => {
     setToast({ message, tone });
@@ -488,7 +592,7 @@ function AppShell() {
   }, []);
 
   const paintBoard = useCallback((board: Board, options: { resetSelection?: boolean; restoreViewport?: boolean } = {}) => {
-    const nextNodes = boardToFlowNodes(board);
+    const nextNodes = boardToFlowNodes(board, localAssetsRef.current);
     const nextEdges = boardToFlowEdges(board);
     nodesRef.current = nextNodes;
     edgesRef.current = nextEdges;
@@ -507,6 +611,8 @@ function AppShell() {
       setToken(session.token);
       tokenRef.current = session.token;
       const state = await requestJson<AppState>('/api/state', {}, session.token);
+      localAssetsRef.current = state.localAssets ?? [];
+      setLocalAssets(state.localAssets ?? []);
       if (state.boards?.length) {
         setBoards(state.boards);
         const nextBoard = state.boards.find((board) => board.id === activeBoardIdRef.current) ?? state.boards[0];
@@ -544,6 +650,14 @@ function AppShell() {
       if (state.runs) setRuns(state.runs);
       if (state.exports) setExports(state.exports);
       if (state.settings) setSettings(state.settings);
+      if (state.localAssets && JSON.stringify(state.localAssets) !== JSON.stringify(localAssetsRef.current)) {
+        localAssetsRef.current = state.localAssets;
+        setLocalAssets(state.localAssets);
+        const assetsById = new Map(state.localAssets.map((asset) => [asset.id, asset]));
+        setNodes((current) => current.map((node) => node.data.assetId && assetsById.has(node.data.assetId)
+          ? { ...node, data: { ...node.data, previewUrl: artifactUrl(assetsById.get(node.data.assetId)?.artifact) } }
+          : node));
+      }
       if (state.providers && !providersDirty && JSON.stringify(state.providers) !== JSON.stringify(providersRef.current)) {
         providerEditVersionRef.current += 1;
         setProviders(state.providers);
@@ -615,6 +729,8 @@ function AppShell() {
         setProviders(state.providers);
       }
       if (state.settings) setSettings(state.settings);
+      localAssetsRef.current = state.localAssets ?? [];
+      setLocalAssets(state.localAssets ?? []);
       setProvidersDirty(false);
       paintBoard(remoteBoard);
       editVersionRef.current += 1;
@@ -1017,7 +1133,7 @@ function AppShell() {
         revision: activeBoard?.revision ?? parsed.revision,
       };
       setBoards((current) => current.map((board) => board.id === activeBoardIdRef.current ? imported : board));
-      const importedNodes = boardToFlowNodes(imported);
+      const importedNodes = boardToFlowNodes(imported, localAssetsRef.current);
       const importedEdges = boardToFlowEdges(imported);
       nodesRef.current = importedNodes;
       edgesRef.current = importedEdges;
@@ -1031,6 +1147,129 @@ function AppShell() {
       notify(`匯入失敗：${errorMessage(error)}`, 'error');
     }
   }, [activeBoard, notify]);
+
+  const setMediaImportState = useCallback((operationId: string, patch: Partial<MediaImportState> | undefined) => {
+    setMediaImport((current) => {
+      if (!current || current.operationId !== operationId) return current;
+      if (!patch) return undefined;
+      const next = { ...current, ...patch };
+      mediaImportRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const uploadMediaImport = useCallback(async (request: MediaImportState) => {
+    const boardId = request.boardId;
+    const boardAtStart = boardsRef.current.find((candidate) => candidate.id === boardId);
+    if (!boardAtStart || apiState !== 'ready' || !tokenRef.current) {
+      setMediaImportState(request.operationId, { status: 'failed', error: '服務尚未連線，素材已保留；請稍後重試。' });
+      notify('服務尚未連線，素材已保留；請稍後重試。', 'error');
+      return;
+    }
+    const selectedNodeAtStart = selectedNodeIdRef.current;
+    const saveEditVersion = editVersionRef.current;
+    setMediaImportState(request.operationId, { status: 'saving', error: undefined });
+    let board = boardAtStart;
+    try {
+      if (dirtyRef.current) {
+        const saved = await saveBoard();
+        if (!saved) {
+          setMediaImportState(request.operationId, { status: 'failed', error: '畫布尚未成功保存，素材已保留；請先處理保存或衝突。' });
+          return;
+        }
+        board = saved;
+        boardsRef.current = boardsRef.current.map((candidate) => candidate.id === saved.id ? saved : candidate);
+      }
+      const boardStillCurrent = boardsRef.current.find((candidate) => candidate.id === boardId)?.revision === board.revision;
+      if (activeBoardIdRef.current !== boardId || editVersionRef.current !== saveEditVersion || !boardStillCurrent) {
+        setMediaImportState(request.operationId, { status: 'failed', error: '保存期間畫布有新的編輯，素材已保留；請再次重試。' });
+        notify('保存期間畫布有新的編輯，素材已保留；請再次重試。', 'error');
+        return;
+      }
+      setMediaImportState(request.operationId, { status: 'uploading', error: undefined });
+      const query = new URLSearchParams({
+        expectedRevision: String(board.revision),
+        operationId: request.operationId,
+        kind: request.kind,
+        name: request.file.name,
+      });
+      const result = await requestJson<ImportAssetResult>(`/api/boards/${encodeURIComponent(boardId)}/imports?${query.toString()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': request.file.type },
+        body: request.file,
+      });
+      const responseBoardIsCurrent = activeBoardIdRef.current === boardId
+        && editVersionRef.current === saveEditVersion
+        && boardsRef.current.find((candidate) => candidate.id === boardId)?.revision === board.revision;
+      localAssetsRef.current = [
+        ...localAssetsRef.current.filter((asset) => asset.id !== result.asset.id),
+        result.asset,
+      ];
+      setLocalAssets(localAssetsRef.current);
+      if (!responseBoardIsCurrent) {
+        setMediaImportState(request.operationId, undefined);
+        setMediaImportNotice('素材已匯入，但本機已有較新的編輯；已保留目前畫布，請處理遠端 revision。');
+        notify('素材已匯入；本機較新的編輯仍保留，請處理遠端 revision。', 'info');
+        return;
+      }
+      const nextBoards = boardsRef.current.map((candidate) => candidate.id === result.board.id ? result.board : candidate);
+      boardsRef.current = nextBoards;
+      setBoards(nextBoards);
+      paintBoard(result.board, { resetSelection: false, restoreViewport: false });
+      dirtyRef.current = false;
+      setDirty(false);
+      setConflict(undefined);
+      conflictNoticeRef.current = undefined;
+      if (result.nodePresent && selectedNodeIdRef.current === selectedNodeAtStart && result.board.nodes.some((node) => node.id === result.asset.nodeId)) {
+        setSelectedNodeId(result.asset.nodeId);
+        setPanel('inspector');
+        setPanelOpen(false);
+      }
+      if (result.nodePresent) {
+        setMediaImportNotice(`已匯入 ${result.asset.name}；來源節點已加入目前畫布。`);
+        notify('素材已匯入並加入畫布。', 'success');
+      } else {
+        setMediaImportNotice('素材已保存，但來源節點已封存；未重新建立節點。');
+        notify('素材已保存，但來源節點已封存；未重新建立節點。', 'info');
+      }
+      setMediaImportState(request.operationId, undefined);
+    } catch (error) {
+      const message = `素材匯入失敗：${errorMessage(error)}；檔案與 operation ID 已保留，可重試。`;
+      setMediaImportState(request.operationId, { status: 'failed', error: message });
+      notify(message, 'error');
+    }
+  }, [apiState, notify, paintBoard, requestJson, saveBoard, setMediaImportState]);
+
+  const importMedia = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    const kind = mediaKindForFile(file);
+    const board = boardsRef.current.find((candidate) => candidate.id === activeBoardIdRef.current);
+    if (!MEDIA_IMPORT_TYPES.has(file.type) || !kind) {
+      notify('只支援 PNG、JPEG、WebP、MP4 或 WebM 素材。', 'error');
+      return;
+    }
+    if (file.size > MAX_MEDIA_IMPORT_BYTES) {
+      notify('素材不可超過 64 MiB。', 'error');
+      return;
+    }
+    if (!board) {
+      notify('找不到目前畫布；素材未上傳。', 'error');
+      return;
+    }
+    const request: MediaImportState = { file, kind, operationId: makeOperationId(), status: 'saving', boardId: board.id };
+    mediaImportRef.current = request;
+    setMediaImport(request);
+    setMediaImportNotice(undefined);
+    void uploadMediaImport(request);
+  }, [notify, uploadMediaImport]);
+
+  const retryMediaImport = useCallback(() => {
+    const request = mediaImportRef.current;
+    if (!request || request.status === 'saving' || request.status === 'uploading') return;
+    void uploadMediaImport({ ...request, status: 'saving', error: undefined });
+  }, [uploadMediaImport]);
 
   const validateBoard = useCallback(async (nodeId?: string) => {
     const board = boardsRef.current.find((candidate) => candidate.id === activeBoardIdRef.current);
@@ -1073,7 +1312,21 @@ function AppShell() {
           notify('遠端生成已由伺服器停用。請先在伺服器設定中開啟。', 'error');
           return;
         }
-        setConfirmRun({ nodeId, operationId, plan: nextPlan });
+        const remoteImageNodes = remoteGenerations
+          .map((generation) => nodesRef.current.find((candidate) => candidate.id === generation.nodeId))
+          .filter((candidate): candidate is FlowNode => Boolean(candidate?.data.kind === 'image'));
+        const requestedImageCount = remoteImageNodes.reduce((total, imageNode) => {
+          const value = imageNode.data.params?.n;
+          const count = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : 1;
+          return total + (Number.isInteger(count) && count >= 1 && count <= 4 ? count : 1);
+        }, 0);
+        const localImageReference = localImageReferenceInfo(
+          nodesRef.current,
+          edgesRef.current,
+          remoteGenerations.map((generation) => generation.nodeId),
+          localAssetsRef.current,
+        );
+        setConfirmRun({ nodeId, operationId, plan: nextPlan, requestedImageCount, localImageReference });
         return;
       }
     }
@@ -1450,7 +1703,7 @@ function AppShell() {
             <div className="brand-name">Relay Canvas</div>
             <div className="brand-kicker">IDEAS, CONNECTED.</div>
           </div>
-          <span className="version-tag">v0.6.0</span>
+          <span className="version-tag">v0.7.0</span>
         </div>
         <div className="board-switcher">
           <Layers3 size={15} />
@@ -1516,10 +1769,13 @@ function AppShell() {
               <button className="toolbar-button" data-testid="timeline-open" onClick={openTimeline}><Scissors size={14} />Timeline</button>
               <button className="toolbar-button" data-testid="compare-open" onClick={openCompare}><GitCompareArrows size={14} />Compare</button>
               <button className="toolbar-button" aria-label="export-board" onClick={exportBoard}><Download size={14} />Export</button>
-              <button className="toolbar-button" aria-label="import-board" onClick={() => fileInputRef.current?.click()}><Upload size={14} />Import</button>
-              <input ref={fileInputRef} type="file" accept="application/json,.json" onChange={(event) => void importBoard(event)} hidden />
+              <button className="toolbar-button" aria-label="import-board" onClick={() => { fileInputModeRef.current = 'board'; if (fileInputRef.current) { fileInputRef.current.accept = BOARD_IMPORT_ACCEPT; fileInputRef.current.click(); } }}><Upload size={14} />Import</button>
+              <button className="toolbar-button media-import-button" data-testid="import-media" aria-label="import-media" onClick={() => { fileInputModeRef.current = 'media'; if (fileInputRef.current) { fileInputRef.current.accept = MEDIA_IMPORT_ACCEPT; fileInputRef.current.click(); } }} disabled={Boolean(mediaImport && (mediaImport.status === 'saving' || mediaImport.status === 'uploading')) || navigationPending}><ImagePlus size={14} />Import media</button>
+              <input ref={fileInputRef} id="import-media-input" data-testid="import-media-input" aria-label="import-media-input" type="file" accept={MEDIA_IMPORT_ACCEPT} onChange={(event) => { const mode = fileInputModeRef.current; const file = event.currentTarget.files?.[0]; const isBoardFile = file?.type === 'application/json' || file?.name.toLocaleLowerCase().endsWith('.json'); if (mode === 'media' || !isBoardFile) void importMedia(event); else void importBoard(event); fileInputModeRef.current = 'board'; event.currentTarget.accept = BOARD_IMPORT_ACCEPT; }} hidden />
             </div>
           </div>
+          {mediaImport && <div className={`media-import-status is-${mediaImport.status}`} role={mediaImport.status === 'failed' ? 'alert' : 'status'}><div><strong>{mediaImport.status === 'saving' ? '正在保存畫布' : mediaImport.status === 'uploading' ? '正在匯入素材' : '素材匯入失敗'}</strong><span>{mediaImport.file.name} · {formatBytes(mediaImport.file.size)} · {mediaImport.kind.toUpperCase()}</span>{mediaImport.error && <small>{mediaImport.error}</small>}</div>{mediaImport.status === 'failed' && <button className="secondary-button" data-testid="import-media-retry" aria-label="import-media-retry" onClick={retryMediaImport}><RefreshCw size={13} />重試</button>}</div>}
+          {mediaImportNotice && <div className="media-import-notice" role="status"><Info size={14} />{mediaImportNotice}<button aria-label="dismiss-import-media-notice" onClick={() => setMediaImportNotice(undefined)}><X size={13} /></button></div>}
           {conflict && <div className="conflict-banner" role="alert"><AlertCircle size={15} /><div><strong>畫布有新的遠端 revision</strong><span>本機 rev {conflict.localRevision} · server rev {conflict.remoteRevision}；你的編輯仍保留。</span></div><button className="conflict-reload" aria-label="reload-board" onClick={() => void reloadCurrentBoard()}><RefreshCw size={13} />載入最新版本</button></div>}
           <div className="canvas-wrap">
             <ReactFlow<FlowNode, FlowEdge>
@@ -1545,7 +1801,7 @@ function AppShell() {
             </ReactFlow>
             <div className="canvas-watermark"><span className="watermark-pulse" />{apiState === 'ready' ? 'Connected to local runtime' : 'Demo canvas · local preview'}</div>
           </div>
-          {selectedNode && !panelOpen && panel === 'inspector' && <div className={`floating-composer${selectedNode.data.previewUrl || selectedNode.data.assetUrl ? ' has-media-preview' : ''}`} aria-label="floating-composer"><button className="floating-composer-close" aria-label="close-floating-composer" onClick={() => setSelectedNodeId(undefined)}><X size={14} /></button><InspectorPanel node={selectedNode} providers={providers} selectedResult={selectedResult} runId={latestRun?.id} assetSaveStates={assetSaveStates} onSaveAsset={saveAsset} onChange={updateSelectedNode} onDelete={deleteSelectedNode} onOpenProviders={() => { const id = selectedNode.data.providerId ?? 'demo'; providerDraftIdRef.current = id; setProviderDraftId(id); setPanel('providers'); setPanelOpen(true); }} /></div>}
+          {selectedNode && !panelOpen && panel === 'inspector' && <div className={`floating-composer${selectedNode.data.previewUrl || selectedNode.data.assetUrl ? ' has-media-preview' : ''}`} aria-label="floating-composer"><button className="floating-composer-close" aria-label="close-floating-composer" onClick={() => setSelectedNodeId(undefined)}><X size={14} /></button><InspectorPanel node={selectedNode} providers={providers} localAssets={localAssets} selectedResult={selectedResult} runId={latestRun?.id} assetSaveStates={assetSaveStates} onSaveAsset={saveAsset} onChange={updateSelectedNode} onDelete={deleteSelectedNode} onOpenProviders={() => { const id = selectedNode.data.providerId ?? 'demo'; providerDraftIdRef.current = id; setProviderDraftId(id); setPanel('providers'); setPanelOpen(true); }} /></div>}
           {plan && <div className={`validation-toast ${plan.errors.length ? 'has-errors' : ''}`}><span>{plan.errors.length ? <AlertCircle size={14} /> : <Check size={14} />}</span><div><strong>{plan.errors.length ? 'Validation needs attention' : 'Ready to run'}</strong><small>{plan.errors.length ? plan.errors[0] : `${plan.order.length} node${plan.order.length === 1 ? '' : 's'} in execution order`}</small></div><button aria-label="close-validation" onClick={() => setPlan(undefined)}><X size={14} /></button></div>}
         </main>
 
@@ -1555,7 +1811,7 @@ function AppShell() {
             <button className={panel === 'inspector' ? 'is-active' : ''} onClick={() => setPanel('inspector')}><PanelRight size={15} />Inspector</button>
             <button className={panel === 'history' ? 'is-active' : ''} onClick={() => setPanel('history')}><Clock3 size={15} />History{runs.length > 0 && <span className="tab-count">{runs.length}</span>}</button>
           </div>
-          {panel === 'inspector' && <InspectorPanel node={selectedNode} providers={providers} selectedResult={selectedResult} runId={latestRun?.id} assetSaveStates={assetSaveStates} onSaveAsset={saveAsset} onChange={updateSelectedNode} onDelete={deleteSelectedNode} onOpenProviders={() => { const id = selectedNode?.data.providerId ?? 'demo'; providerDraftIdRef.current = id; setProviderDraftId(id); setPanel('providers'); setPanelOpen(true); }} />}
+          {panel === 'inspector' && <InspectorPanel node={selectedNode} providers={providers} localAssets={localAssets} selectedResult={selectedResult} runId={latestRun?.id} assetSaveStates={assetSaveStates} onSaveAsset={saveAsset} onChange={updateSelectedNode} onDelete={deleteSelectedNode} onOpenProviders={() => { const id = selectedNode?.data.providerId ?? 'demo'; providerDraftIdRef.current = id; setProviderDraftId(id); setPanel('providers'); setPanelOpen(true); }} />}
           {panel === 'history' && <HistoryPanel runs={runs.filter((run) => run.boardId === activeBoardId)} activeRunId={activeRun?.id} currentRevision={activeBoard?.revision} onSelect={(run) => { if (run.revision !== activeBoard?.revision) { notify('這筆執行來自較舊 revision，保留在 history，不覆蓋目前畫布。', 'info'); return; } setNodes((current) => current.map((node) => { const result = run.results[node.id]; const artifact = assetForResult(result); return result ? { ...node, data: { ...node.data, runStatus: result.status, runError: result.error, previewUrl: artifactUrl(artifact) } } : node; })); }} />}
           {panel === 'providers' && <ProvidersPanel providers={providers} selectedId={providerDraftId} settings={settings} apiReady={apiState === 'ready'} dirty={providersDirty} saving={providersSaving} diagnostics={providerDiagnostics} diagnosticsLoading={diagnosticsLoading} models={providerModels[providerDraftId] ?? []} modelsLoading={modelsLoading} relayFlowBusy={providersSaving || diagnosticsLoading || modelsLoading || runBusy} relayFlowCapacity={nodes.length + 2 <= 100 && edges.length + 1 <= 200} onDiagnostics={() => void refreshProviderDiagnostics()} onQueryModels={() => void queryProviderModels()} onSelect={(id) => { providerDraftIdRef.current = id; setProviderDraftId(id); }} onChange={updateProviderDraft} onAdd={addProvider} onAddRelayFlow={addRelayFlow} onSave={() => void saveProviders()} />}
           {panel === 'help' && <HelpPanel />}
@@ -1669,7 +1925,7 @@ function AssetPreview({ asset, saveState, onSave, onClose, onOpenBoard }: { asse
   return <div className="asset-preview-scrim" role="presentation" onClick={onClose}><div className="asset-preview-dialog" role="dialog" aria-modal="true" aria-label="asset-preview" onClick={(event) => event.stopPropagation()}><button className="asset-preview-close" aria-label="close-asset-preview" onClick={onClose}><X size={16} /></button><div className="asset-preview-media">{asset.kind === 'image' ? <img src={asset.url} alt={asset.nodeId} referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <video src={asset.url} controls autoPlay muted playsInline crossOrigin="anonymous" />}</div><div className="asset-preview-caption"><div><span className="home-eyebrow">{asset.artifact.demo ? 'DEMO OUTPUT' : 'OUTPUT'}</span><h2>{asset.boardName}</h2><p>{asset.nodeId} · {new Date(asset.startedAt).toLocaleString('zh-TW')}</p><span className={`asset-local-status ${saveState?.status === 'failed' ? 'is-failed' : saved ? 'is-saved' : ''}`}>{saveState?.status === 'failed' ? saveState.message ?? '保存失敗' : saved ? '已保存本機' : '僅遠端引用'}</span></div><div className="asset-preview-actions"><button className="asset-save-button" aria-label={`save-asset-${asset.id}`} disabled={saved || saveState?.status === 'saving'} onClick={onSave}>{saveState?.status === 'saving' ? <LoaderCircle className="spin" size={13} /> : saveState?.status === 'failed' ? <RefreshCw size={13} /> : <Save size={13} />}{assetSaveLabel(asset, saveState)}</button>{saved && <a className="asset-download-button" aria-label={`download-asset-${asset.id}`} href={asset.url} download={assetDownloadName(asset)}><Download size={13} />下載</a>}<button className="light-button" onClick={onOpenBoard}>開啟專案 <ArrowRight size={14} /></button></div></div></div></div>;
 }
 
-function InspectorPanel({ node, providers, selectedResult, runId, assetSaveStates, onSaveAsset, onChange, onDelete, onOpenProviders }: { node?: FlowNode; providers: Provider[]; selectedResult?: NodeResult; runId?: string; assetSaveStates: Record<string, AssetSaveState>; onSaveAsset: (runId: string, nodeId: string, artifactIndex: number) => void; onChange: (patch: Partial<CanvasData>) => void; onDelete: () => void; onOpenProviders: () => void }) {
+function InspectorPanel({ node, providers, localAssets, selectedResult, runId, assetSaveStates, onSaveAsset, onChange, onDelete, onOpenProviders }: { node?: FlowNode; providers: Provider[]; localAssets: LocalAsset[]; selectedResult?: NodeResult; runId?: string; assetSaveStates: Record<string, AssetSaveState>; onSaveAsset: (runId: string, nodeId: string, artifactIndex: number) => void; onChange: (patch: Partial<CanvasData>) => void; onDelete: () => void; onOpenProviders: () => void }) {
   if (!node) {
     return <div className="empty-panel"><div className="empty-icon"><Maximize2 size={20} /></div><h2>Select a node</h2><p>從畫布選一個節點，開始編輯提示詞、模型與輸出設定。</p><div className="empty-hint"><Link2 size={14} />拖曳節點右側連接點建立資料流</div></div>;
   }
@@ -1677,6 +1933,7 @@ function InspectorPanel({ node, providers, selectedResult, runId, assetSaveState
   const Icon = meta.icon;
   const provider = providers.find((candidate) => candidate.id === node.data.providerId);
   const isGenerator = node.data.kind === 'image' || node.data.kind === 'video';
+  const localAsset = node.data.assetId ? localAssets.find((asset) => asset.id === node.data.assetId) : undefined;
   const handleProviderChange = (providerId: string) => {
     const nextProvider = providers.find((candidate) => candidate.id === providerId);
     const model = node.data.kind === 'video' ? nextProvider?.videoModel : nextProvider?.imageModel;
@@ -1696,18 +1953,26 @@ function InspectorPanel({ node, providers, selectedResult, runId, assetSaveState
       <div className="node-identity"><span className="identity-icon" style={{ color: meta.color }}><Icon size={17} /></span><div><strong>{node.data.label}</strong><span>{node.id}</span></div><span className={`identity-status ${statusClass(selectedResult?.status ?? node.data.runStatus)}`}>{statusLabel(selectedResult?.status ?? node.data.runStatus)}</span></div>
       <Field label="Label"><input value={node.data.label} onChange={(event) => onChange({ label: event.target.value })} /></Field>
       {(node.data.kind === 'prompt' || node.data.kind === 'note' || isGenerator) && <Field label={node.data.kind === 'note' ? 'Direction' : 'Prompt'} hint={node.data.kind === 'prompt' ? '上游文字會在執行時接到下游提示詞前。' : undefined}><textarea aria-label="prompt-editor" value={node.data.prompt ?? ''} onChange={(event) => onChange({ prompt: event.target.value })} rows={node.data.kind === 'note' ? 8 : 7} placeholder="寫下畫面、動作或方向…" /></Field>}
-      {node.data.kind === 'asset' && <><Field label="Asset URL" hint="使用受允許的 media origin；瀏覽器不會帶 cookies。"><input value={node.data.assetUrl ?? ''} onChange={(event) => onChange({ assetUrl: event.target.value })} placeholder="https://…" /></Field><Field label="Asset kind"><select value={node.data.assetKind ?? 'image'} onChange={(event) => onChange({ assetKind: event.target.value as 'image' | 'video' })}><option value="image">Image</option><option value="video">Video</option></select></Field></>}
+      {node.data.kind === 'asset' && (node.data.assetId ? <LocalAssetSource node={node} asset={localAsset} /> : <><Field label="Asset URL" hint="使用受允許的 media origin；瀏覽器不會帶 cookies。"><input value={node.data.assetUrl ?? ''} onChange={(event) => onChange({ assetUrl: event.target.value })} placeholder="https://…" /></Field><Field label="Asset kind"><select value={node.data.assetKind ?? 'image'} onChange={(event) => onChange({ assetKind: event.target.value as 'image' | 'video' })}><option value="image">Image</option><option value="video">Video</option></select></Field></>)}
       {isGenerator && <>
         <div className="section-divider"><span>GENERATION</span></div>
         <Field label="Provider"><div className="select-with-action"><select value={node.data.providerId ?? 'demo'} onChange={(event) => handleProviderChange(event.target.value)}><option value="">Select provider</option>{providers.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}{candidate.protocol === 'demo' ? ' · DEMO' : ''}</option>)}</select><button className="mini-icon-button" onClick={onOpenProviders} aria-label="provider-settings" title="編輯供應商"><Settings2 size={14} /></button></div></Field>
         <Field label="Model" hint={provider?.protocol === 'demo' ? '離線 Demo，不消耗 AI 額度。' : provider?.protocol === 'videos' ? 'Videos JSON relay contract；不預填官方 Sora，請手動輸入模型。' : provider?.protocol === 'relay' ? 'Relay 宣告 image + video；固定路徑 contract，尚未 live 驗證。' : '自訂模型／協定驗證，未做 live 驗證。'}><input aria-label="node-model" value={node.data.model ?? ''} onChange={(event) => handleModelChange(event.target.value)} placeholder={provider?.protocol === 'videos' || provider?.protocol === 'relay' ? 'relay model' : 'model-name'} /></Field>
         {node.data.kind === 'video' && <Field label="Reference field" hint={provider?.protocol === 'relay' ? 'Relay video 固定送出 input_reference.image_url。' : undefined}><input value={node.data.referenceField ?? 'image_url'} readOnly={provider?.protocol === 'relay'} onChange={(event) => onChange({ referenceField: event.target.value })} /></Field>}
-        <div className="params-box"><div className="params-heading"><span>PARAMETERS</span><SlidersHorizontal size={13} /></div>{(provider?.protocol === 'videos' || provider?.protocol === 'relay') && node.data.kind === 'video' ? <VideoParams params={node.data.params} onChange={(params) => onChange({ params })} /> : <div className="params-grid"><ParamField label="Aspect" value={String(node.data.params?.aspect_ratio ?? '16:9')} onChange={(value) => onChange({ params: { ...(node.data.params ?? {}), aspect_ratio: value } })} /><ParamField label="Quality" value={String(node.data.params?.quality ?? 'standard')} onChange={(value) => onChange({ params: { ...(node.data.params ?? {}), quality: value } })} /></div>}</div>
+        <div className="params-box"><div className="params-heading"><span>PARAMETERS</span><SlidersHorizontal size={13} /></div>{(provider?.protocol === 'videos' || provider?.protocol === 'relay') && node.data.kind === 'video' ? <VideoParams params={node.data.params} onChange={(params) => onChange({ params })} /> : <>{node.data.kind === 'image' && (provider?.protocol === 'openai' || provider?.protocol === 'relay') && <ImageParams params={node.data.params} onChange={(params) => onChange({ params })} />}<div className="params-grid"><ParamField label="Aspect" value={String(node.data.params?.aspect_ratio ?? '16:9')} onChange={(value) => onChange({ params: { ...(node.data.params ?? {}), aspect_ratio: value } })} /><ParamField label="Quality" value={String(node.data.params?.quality ?? 'standard')} onChange={(value) => onChange({ params: { ...(node.data.params ?? {}), quality: value } })} /></div></>}</div>
       </>}
       {selectedResult && <ResultBlock result={selectedResult} runId={runId} nodeId={node.id} saveState={runId ? assetSaveStates[`${runId}:${node.id}:0`] : undefined} onSave={runId ? () => onSaveAsset(runId, node.id, 0) : undefined} />}
       <div className="inspector-footer"><span><Info size={12} /> Changes autosave when connected</span></div>
     </div>
   );
+}
+
+function LocalAssetSource({ node, asset }: { node: FlowNode; asset?: LocalAsset }) {
+  const artifact = asset?.artifact;
+  const url = artifactUrl(artifact);
+  const kind = artifact?.kind ?? node.data.assetKind ?? 'image';
+  const name = asset?.name ?? '已封存素材';
+  return <div className="local-asset-source" data-testid="local-asset-source"><div className="local-asset-source-heading"><div><span className="field-label">Imported source</span><strong>{name}</strong><small>{kind.toUpperCase()} · {formatBytes(artifact?.bytes)}</small></div><span className="local-asset-private">PRIVATE</span></div>{url && <div className="local-asset-media">{kind === 'image' ? <img src={url} alt={name} referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <video src={url} controls muted playsInline crossOrigin="anonymous" />}</div>}{url ? <div className="local-asset-actions"><a href={url} target="_blank" rel="noreferrer" data-testid="local-asset-preview" aria-label="local-asset-preview"><Maximize2 size={13} />私有預覽</a><a href={url} download={name} data-testid="local-asset-download" aria-label="local-asset-download"><Download size={13} />下載原檔</a></div> : <div className="local-asset-archived"><AlertCircle size={14} /><span>來源節點已封存；沒有可用的私有預覽，未重新建立節點。</span></div>}<div className="local-asset-id"><span>ASSET ID</span><code>{node.data.assetId ?? 'unknown'}</code></div></div>;
 }
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
@@ -1716,6 +1981,20 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 
 function ParamField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
   return <label className="param-field"><span>{label}</span><input value={value} onChange={(event) => onChange(event.target.value)} /></label>;
+}
+
+function ImageParams({ params, onChange }: { params?: Record<string, unknown>; onChange: (params: Record<string, unknown>) => void }) {
+  const rawCount = typeof params?.n === 'number' ? params.n : typeof params?.n === 'string' ? Number(params.n) : 1;
+  const count = Number.isInteger(rawCount) && rawCount >= 1 && rawCount <= 4 ? rawCount : 1;
+  const responseFormat = params?.response_format === 'url' || params?.response_format === 'b64_json' ? params.response_format : '';
+  const update = (key: 'n' | 'response_format', value: string) => {
+    const next = { ...(params ?? {}) };
+    if (key === 'n') next.n = Number(value);
+    else if (value) next.response_format = value;
+    else delete next.response_format;
+    onChange(next);
+  };
+  return <div className="params-grid image-params"><label className="param-field"><span>Image count</span><select data-testid="image-count" aria-label="image-count" value={String(count)} onChange={(event) => update('n', event.target.value)}><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></label><label className="param-field"><span>Response format</span><select data-testid="image-response-format" aria-label="image-response-format" value={responseFormat} onChange={(event) => update('response_format', event.target.value)}><option value="">Default</option><option value="url">url</option><option value="b64_json">b64_json</option></select></label></div>;
 }
 
 function VideoParams({ params, onChange }: { params?: Record<string, unknown>; onChange: (params: Record<string, unknown>) => void }) {
@@ -1776,10 +2055,10 @@ function HelpRow({ number, title, copy }: { number: string; title: string; copy:
   return <div className="help-row"><span>{number}</span><div><strong>{title}</strong><p>{copy}</p></div><ArrowRight size={14} /></div>;
 }
 
-function RunConfirmDialog({ confirm, providers, onCancel, onConfirm }: { confirm: { nodeId?: string; operationId: string; plan: ExecutionPlan }; providers: Provider[]; onCancel: () => void; onConfirm: () => void }) {
+function RunConfirmDialog({ confirm, providers, onCancel, onConfirm }: { confirm: RunConfirmState; providers: Provider[]; onCancel: () => void; onConfirm: () => void }) {
   const remote = confirm.plan.generations.filter((generation) => providers.find((provider) => provider.id === generation.providerId)?.protocol !== 'demo');
   const remoteModels = [...new Set(remote.map((generation) => `${providers.find((provider) => provider.id === generation.providerId)?.name ?? generation.providerId} · ${generation.model}`))];
-  return <div className="dialog-scrim" role="presentation"><div className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-run-title"><div className="dialog-icon"><Activity size={21} /></div><div className="panel-eyebrow">EXTERNAL ACTION</div><h2 id="confirm-run-title">Run remote generation?</h2><p>這次執行會呼叫外部 provider，可能產生費用。確認前請檢查 provider、model 與節點數。</p><div className="confirm-summary"><div><span>PROVIDERS</span><strong>{[...new Set(remote.map((generation) => providers.find((provider) => provider.id === generation.providerId)?.name ?? generation.providerId))].join(', ')}</strong></div><div><span>GENERATIONS</span><strong>{remote.length}</strong></div><div><span>MODELS</span><strong>{remoteModels.join(', ')}</strong></div><div><span>MODE</span><strong>{confirm.nodeId ? 'Selected + ancestors' : 'Entire board'}</strong></div></div><div className="dialog-warning"><AlertCircle size={14} />未知 POST 結果不會自動重送；取消只停止本機輪詢。</div><div className="dialog-actions"><button className="ghost-button" onClick={onCancel}>Back</button><button className="primary-button" onClick={onConfirm}><Play size={14} fill="currentColor" />Confirm run</button></div></div></div>;
+  return <div className="dialog-scrim" role="presentation"><div className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-run-title"><div className="dialog-icon"><Activity size={21} /></div><div className="panel-eyebrow">EXTERNAL ACTION</div><h2 id="confirm-run-title">Run remote generation?</h2><p>這次執行會呼叫外部 provider，可能產生費用。確認前請檢查 provider、model 與節點數。</p><div className="confirm-summary"><div><span>PROVIDERS</span><strong>{[...new Set(remote.map((generation) => providers.find((provider) => provider.id === generation.providerId)?.name ?? generation.providerId))].join(', ')}</strong></div><div><span>GENERATIONS</span><strong>{remote.length}</strong></div><div><span>IMAGE REQUESTS</span><strong data-testid="requested-image-quantity" aria-label="requested-image-quantity">{confirm.requestedImageCount}</strong></div><div><span>MODELS</span><strong>{remoteModels.join(', ')}</strong></div><div><span>MODE</span><strong>{confirm.nodeId ? 'Selected + ancestors' : 'Entire board'}</strong></div></div>{confirm.localImageReference.count > 0 && <div className="local-reference-disclosure" data-testid="local-reference-disclosure" role="note"><ImageIcon size={14} /><div><strong>本機圖片會在確認後傳給上游</strong><span>確認後，會將這次使用的本機圖片傳送至所選中轉站。</span>{confirm.localImageReference.oversized && <small>有本機圖片超過 4 MiB，無法用於遠端生成；請先縮小圖片。</small>}</div></div>}<div className="dialog-warning"><AlertCircle size={14} />未知 POST 結果不會自動重送；取消只停止本機輪詢。</div><div className="dialog-actions"><button className="ghost-button" onClick={onCancel}>Back</button><button className="primary-button" onClick={onConfirm} disabled={confirm.localImageReference.oversized}><Play size={14} fill="currentColor" />Confirm run</button></div></div></div>;
 }
 
 export default function App() {

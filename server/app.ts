@@ -9,9 +9,47 @@ import { AppError } from './graph.js';
 export function createApp(service: CanvasService, origin: string, token = randomBytes(32).toString('hex'), dev = false) {
   const app = express();
   app.disable('x-powered-by');
+  app.use((req, res, next) => {
+    if (req.method === 'POST' && /^\/api\/boards\/[^/]+\/imports$/.test(req.path)) res.setHeader('Connection', 'close');
+    next();
+  });
   app.use(createBoundary({ origin, token, dev, policy: service.policy }));
+  app.post('/api/boards/:id/imports', async (req, res, next) => {
+    const closeUnreadConnection = () => {
+      if (!req.complete) {
+        res.setHeader('Connection', 'close');
+        res.once('finish', () => req.socket.destroy());
+      }
+    };
+    try {
+      const keys = Object.keys(req.query);
+      if (keys.length !== 4 || !['expectedRevision', 'operationId', 'kind', 'name'].every(key => keys.includes(key))) throw new AppError('INVALID_INPUT', '匯入參數無效。', 400);
+      const expected = req.query.expectedRevision, operationId = req.query.operationId, kind = req.query.kind, name = req.query.name;
+      if (typeof expected !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(expected) || Number(expected) > Number.MAX_SAFE_INTEGER || typeof operationId !== 'string' || typeof kind !== 'string' || typeof name !== 'string') throw new AppError('INVALID_INPUT', '匯入參數無效。', 400);
+      const rawLengths = req.rawHeaders.filter((_value, index) => index % 2 === 0 && req.rawHeaders[index].toLowerCase() === 'content-length');
+      const lengthValue = req.headers['content-length'];
+      if (rawLengths.length !== 1 || typeof lengthValue !== 'string' || !/^[1-9][0-9]*$/.test(lengthValue)) throw new AppError('INVALID_INPUT', 'Content-Length 無效。', 400);
+      const declaredBytes = Number(lengthValue);
+      if (!Number.isSafeInteger(declaredBytes) || declaredBytes > 64 * 1024 * 1024 || req.headers['transfer-encoding'] !== undefined) throw new AppError('INVALID_INPUT', '匯入長度或傳輸編碼無效。', 400);
+      const encoding = req.headers['content-encoding'];
+      if (encoding !== undefined && encoding !== 'identity') throw new AppError('INVALID_INPUT', '不支援壓縮的匯入內容。', 400);
+      const mimeType = req.headers['content-type'];
+      if (typeof mimeType !== 'string' || !['image/png', 'image/jpeg', 'image/webp', 'video/mp4', 'video/webm'].includes(mimeType)) throw new AppError('INVALID_INPUT', 'Content-Type 無效。', 400);
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      req.once('aborted', abort);
+      const responseClosed = () => { if (!res.writableEnded) abort(); };
+      res.once('close', responseClosed);
+      try {
+        const result = await service.importAsset(String(req.params.id), { expectedRevision: Number(expected), operationId, kind: kind as 'image' | 'video', name }, mimeType, declaredBytes, req, controller.signal);
+        res.status(201).json(result);
+      } finally { req.off('aborted', abort); res.off('close', responseClosed); }
+    } catch (error) {
+      closeUnreadConnection(); next(error);
+    }
+  });
   app.use(express.json({ limit: '6mb', strict: true }));
-  app.get('/healthz', (_req, res) => { res.json({ ok: true, version: '0.6.0' }); });
+  app.get('/healthz', (_req, res) => { res.json({ ok: true, version: '0.7.0' }); });
   app.get('/api/session', (_req, res) => {
     res.setHeader('Set-Cookie', `relay_canvas_media=${token}; HttpOnly; SameSite=Strict; Path=/api/media`);
     res.json({ token });

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0 - 2026-10-23
+
+- OpenAI-compatible／relay 圖片契約支援 `n` 1–4 與 `response_format` `url`／`b64_json`；OpenAI、fal、Replicate 的圖片多輸出依回應順序保留，數量 1–100、格式與總 Base64 6 MiB 限制均在原子驗證後才會保存。
+- 新增已驗證的本機 PNG／JPEG／WebP／MP4／WebM 匯入，單檔最多 64 MiB、工作區保留最多 200 個本機資產與 512 MiB 配額；匯入會建立實際 asset node，不會偽造 AI run 或呼叫 provider。
+- 本機圖片在明確外部確認後，才可用最多 4 MiB 的一次性傳輸資料作為遠端參考；私有媒體網址不會送往中轉站，傳輸用編碼內容不會保存到 run、Compare 或錯誤資料。重試沿用同一檔案與 operationId，registry／歷史保留本機檔案，不提供 v0.7 刪除或 GC。
+- Gallery、Compare 與 Timeline 共用真實資產來源身份；MP4／WebM 可與生成影片混用，沿用既有裁切與排序契約，最後透過已驗證的 FFmpeg 路徑匯出實際 MP4。
+- 首次 v0.7 workspace 改寫前保留 byte-exact `workspace.pre-v0.7.json`；降版請使用另外還原的工作區副本。同一 board 的 asset registry 是唯一權威，跨 board 或不完整的本機引用會被拒絕。
+
+本版 provider 與本機媒體契約以 fixture／合約驗證為界，不代表付費 live generation、所有 relay 或任何特定模型已完成驗證。協定參考：[New API plugin usage](https://docs.newapi.ai/en/docs/plugins/usage)。
+
 ## 0.6.0 - 2026-10-23
 
 - 新增明確的 `relay` 複合協定：同一個保存的 profile 以固定 `/images/generations` 與 `/videos`、`/videos/{id}` 路徑支援圖片與影片；這是受限的雙協定中轉契約，不是任意 relay 相容性。
