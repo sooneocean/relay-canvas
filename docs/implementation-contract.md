@@ -1,5 +1,7 @@
 # Implementation contract v1
 
+Historical implementation brief for v0.1.0. Its UI section (including the lime accent and v0.1.0 header) records the original release requirements; the current v0.2.0 interface is specified in [the creator experience design](design-v0.2.md). The HTTP, graph, security, and MCP boundaries remain applicable.
+
 Shared types live in src/shared/types.ts; relative TS imports use .js suffix. Node 22 ESM, strict TS.
 
 ## HTTP (all /api except session require token)
