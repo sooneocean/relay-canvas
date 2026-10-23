@@ -6,7 +6,7 @@ import { providerDiagnostics, providerModels, type ProviderTransport } from './p
 import { MediaStore } from './media.js';
 import { EditorRuntime } from './editor.js';
 import { readPolicy, validateBaseUrl, validateMediaUrl } from './security.js';
-import { parseBoard, parseExportInput, parseOperations, parseProviders, parseRunInput, parseTimelineInput } from '../src/shared/schema.js';
+import { parseArtifact, parseBoard, parseExportInput, parseOperations, parseProviders, parseRunInput, parseTimelineInput } from '../src/shared/schema.js';
 import type {
   Artifact, ArtifactInfo, Board, CanonicalArtifact, CanonicalRun, ClipSource, ExportJob, GenerationOutput,
   GenerationRequest, Provider, Run, RunComparison, RunComparisonField, StoredExportJob, Timeline,
@@ -234,7 +234,7 @@ export class CanvasService {
     return { boardId, left, right, differences };
   }
   async saveArtifact(runId: string, nodeId: string, index: number, signal?: AbortSignal): Promise<Artifact> {
-    if (!Number.isSafeInteger(index) || index < 0) throw new AppError('INVALID_INPUT', '素材索引無效。', 400);
+    if (!Number.isSafeInteger(index) || index < 0 || index > 99) throw new AppError('INVALID_INPUT', '素材索引無效。', 400);
     const key = `${runId}\u0000${nodeId}\u0000${index}`;
     const existing = this.artifactSaves.get(key);
     if (existing) return await existing;
@@ -252,13 +252,25 @@ export class CanvasService {
       }
       return source;
     };
-    readSource();
+    const initialSource = readSource();
+    const canonical = { kind: initialSource.kind, url: initialSource.url } as const;
+    const readCanonicalSource = (): Artifact => {
+      const source = readSource();
+      if (source.kind !== canonical.kind || source.url !== canonical.url) {
+        throw new AppError('REVISION_CONFLICT', '素材狀態已改變。', 409);
+      }
+      return source;
+    };
     const operation = (async () => {
-      try { return await this.media.save(readSource, artifact => {
+      try { return await this.media.save(readCanonicalSource, artifact => {
         this.store.transaction(data => {
           const current = data.runs.find(candidate => candidate.id === runId);
           const currentResult = current?.results[nodeId];
-          if (!current || current.status !== 'succeeded' || !currentResult || currentResult.status !== 'succeeded' || !currentResult.artifacts[index]) {
+          const currentSource = currentResult?.artifacts[index];
+          if (
+            !current || current.status !== 'succeeded' || !currentResult || currentResult.status !== 'succeeded' ||
+            !currentSource || currentSource.kind !== canonical.kind || currentSource.url !== canonical.url
+          ) {
             throw new AppError('REVISION_CONFLICT', '素材狀態已改變。', 409);
           }
           currentResult.artifacts[index] = artifact;
@@ -284,6 +296,41 @@ export class CanvasService {
     throw new AppError('NOT_FOUND', '找不到素材。', 404);
   }
   private updateRun(id: string, change: (run: Run) => void) { return this.store.transaction(data => { const run = data.runs.find(r => r.id === id)!; change(run); return run; }); }
+  private validateGenerationArtifacts(provider: Provider, kind: 'image' | 'video', output: unknown): Artifact[] {
+    const invalid = (): never => { throw new AppError('INVALID_OUTPUT', '供應商未回傳預期的媒體。'); };
+    if (!output || typeof output !== 'object' || !Object.prototype.hasOwnProperty.call(output, 'artifacts')) return invalid();
+    const artifacts = (output as { artifacts: unknown }).artifacts;
+    if (!Array.isArray(artifacts) || artifacts.length < 1 || artifacts.length > 100) return invalid();
+    const allowDemo = provider.protocol === 'demo';
+    const normalized: Artifact[] = [];
+    const allowedFields = new Set(['kind', 'url', 'mimeType', 'demo']);
+    for (let index = 0; index < artifacts.length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(artifacts, index)) return invalid();
+      const candidate = artifacts[index];
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return invalid();
+      const prototype = Object.getPrototypeOf(candidate);
+      if (prototype !== Object.prototype && prototype !== null) return invalid();
+      const keys = Reflect.ownKeys(candidate);
+      if (keys.some(key => typeof key !== 'string' || !allowedFields.has(key))) return invalid();
+      if (!Object.prototype.hasOwnProperty.call(candidate, 'kind') || !Object.prototype.hasOwnProperty.call(candidate, 'url')) return invalid();
+      const value = candidate as Record<string, unknown>;
+      if (value.kind !== kind || typeof value.url !== 'string') return invalid();
+      const url = value.url;
+      const hasMimeType = Object.prototype.hasOwnProperty.call(value, 'mimeType');
+      const hasDemo = Object.prototype.hasOwnProperty.call(value, 'demo');
+      if ((hasMimeType && typeof value.mimeType !== 'string') || (hasDemo && typeof value.demo !== 'boolean')) return invalid();
+      if (!allowDemo && value.demo === true) return invalid();
+      try {
+        const artifact: Artifact = { kind, url: validateMediaUrl(url, this.policy, { allowDemo }) };
+        if (hasMimeType) artifact.mimeType = value.mimeType as string;
+        if (hasDemo) artifact.demo = value.demo as boolean;
+        normalized.push(parseArtifact(artifact));
+      } catch {
+        invalid();
+      }
+    }
+    return normalized;
+  }
   start(input: unknown): Run {
     const request = parseRunInput(input), data = this.store.read();
     const existing = data.runs.find(r => r.operationId === request.operationId);
@@ -346,8 +393,8 @@ export class CanvasService {
         submitting = provider.protocol !== 'demo';
         const result = await this.generator(provider, { kind: node.data.kind, model: modelFor(node, provider), prompt, params: node.data.params ?? {}, referenceUrl, referenceField: node.data.referenceField ?? recommendedReferenceField(modelFor(node, provider)), signal, onSubmitted: remoteId => { this.updateRun(initial.id, r => { r.results[id].remoteId = remoteId; if (r.status !== 'cancelled') r.results[id].status = 'running'; }); } });
         if (signal.aborted) return;
-        if (!result.artifacts.length || result.artifacts[0].kind !== node.data.kind) throw new AppError('INVALID_OUTPUT', '供應商未回傳預期的媒體。');
-        this.updateRun(initial.id, r => { r.results[id] = { ...r.results[id], status: 'succeeded', artifacts: result.artifacts, remoteId: result.remoteId ?? r.results[id].remoteId }; });
+        const artifacts = this.validateGenerationArtifacts(provider, node.data.kind, result);
+        this.updateRun(initial.id, r => { r.results[id] = { ...r.results[id], status: 'succeeded', artifacts, remoteId: result.remoteId ?? r.results[id].remoteId }; });
       } catch {
         if (signal.aborted) return;
         const status = submitting ? 'needs_review' : 'failed';

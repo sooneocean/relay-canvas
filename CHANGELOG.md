@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0 - 2026-10-23
+
+- 新增明確的 `relay` 複合協定：同一個保存的 profile 以固定 `/images/generations` 與 `/videos`、`/videos/{id}` 路徑支援圖片與影片；這是受限的雙協定中轉契約，不是任意 relay 相容性。
+- Provider 設定可保存獨立的 image model 與 video model；保存後可用「新增圖→影流程」一次加入相連的圖片／影片節點，保留既有畫布並由使用者自行編輯與執行。
+- Compare 可保存並下載選中的圖片或影片精確版本；保存失敗可針對同一 `{runId,nodeId,artifactIndex}` 重試，不會重新生成或改用另一個輸出。
+- 選中的已保存影片可交給 Timeline，完成加入、裁切、排列、保存與本機 MP4 匯出；版本、Compare、Timeline 與本機下載維持可追溯的來源身份。
+- Provider 輸出在成功提交與下游使用前驗證完整 artifact 陣列、種類與媒體 allowlist；保存工作以 canonical source identity 與 CAS 重驗，避免來源漂移覆寫新版本。
+
+本版仍保留 OpenAI-compatible 為 image-only、Videos JSON 為 video-only；`relay` 只是固定 image/video 路徑的明確組合，不代表任意所有 relay 協定相容性。fixture 與契約文件不等於付費 provider live generation 驗證。
+
 ## 0.5.0 - 2026-10-23
 
 - 時間軸新增可搜尋的視覺素材瀏覽器，每頁最多 9 張卡片，可依節點、提示詞、模型、日期及執行版本尋找影片。

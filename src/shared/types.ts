@@ -1,6 +1,6 @@
 export type NodeKind = 'prompt' | 'image' | 'video' | 'asset' | 'note';
 export type MediaKind = 'image' | 'video';
-export type Protocol = 'demo' | 'openai' | 'videos' | 'fal' | 'replicate';
+export type Protocol = 'demo' | 'openai' | 'videos' | 'relay' | 'fal' | 'replicate';
 export type ProviderCapability = 'image' | 'video';
 export interface CanvasData extends Record<string, unknown> {
   kind: NodeKind;

@@ -272,7 +272,66 @@ function artifactUrl(artifact?: Artifact): string | undefined {
 }
 
 type AssetSaveState = { status: 'saving' | 'saved' | 'failed'; message?: string };
-type ProviderTemplate = 'openai' | 'newapi' | 'videos' | 'fal' | 'replicate';
+type ProviderTemplate = 'openai' | 'newapi' | 'videos' | 'relay' | 'fal' | 'replicate';
+
+export type RelayFlowAppend = {
+  nodes: FlowNode[];
+  edges: FlowEdge[];
+  imageNodeId: string;
+  videoNodeId: string;
+};
+
+export function buildRelayFlow(
+  nodes: FlowNode[],
+  edges: FlowEdge[],
+  provider: Provider,
+  idFactory: (prefix: string) => string = makeId,
+): RelayFlowAppend | undefined {
+  if (provider.protocol !== 'relay' || !provider.imageModel.trim() || !provider.videoModel.trim()) return undefined;
+  if (nodes.length + 2 > 100 || edges.length + 1 > 200) return undefined;
+
+  const imageNodeId = idFactory('image');
+  const videoNodeId = idFactory('video');
+  const edgeId = idFactory('edge');
+  const existingIds = new Set([...nodes.map((node) => node.id), ...edges.map((edge) => edge.id)]);
+  if (
+    !imageNodeId || !videoNodeId || !edgeId ||
+    new Set([imageNodeId, videoNodeId, edgeId]).size !== 3 ||
+    imageNodeId === videoNodeId || existingIds.has(imageNodeId) || existingIds.has(videoNodeId) || existingIds.has(edgeId)
+  ) return undefined;
+
+  const row = Math.floor(nodes.length / 3);
+  const column = nodes.length % 3;
+  const imageNode: FlowNode = {
+    id: imageNodeId,
+    type: 'canvas',
+    position: { x: 240 + column * 300, y: 140 + row * 210 },
+    data: {
+      kind: 'image',
+      label: `${String(nodes.length + 1).padStart(2, '0')} / Relay image`,
+      providerId: provider.id,
+      model: provider.imageModel,
+      prompt: '編輯圖片提示詞。',
+      params: {},
+    },
+  };
+  const videoNode: FlowNode = {
+    id: videoNodeId,
+    type: 'canvas',
+    position: { x: imageNode.position.x + 380, y: imageNode.position.y },
+    data: {
+      kind: 'video',
+      label: `${String(nodes.length + 2).padStart(2, '0')} / Relay video`,
+      providerId: provider.id,
+      model: provider.videoModel,
+      prompt: '編輯影片提示詞。',
+      params: {},
+      referenceField: 'image_url',
+    },
+  };
+  const edge: FlowEdge = { id: edgeId, source: imageNodeId, target: videoNodeId, type: 'smoothstep', animated: false };
+  return { nodes: [...nodes, imageNode, videoNode], edges: [...edges, edge], imageNodeId, videoNodeId };
+}
 
 function createStarterNode(kind: CanvasData['kind']): FlowNode {
   const meta = nodeKindMeta[kind];
@@ -362,6 +421,9 @@ function AppShell() {
   const providerDraftIdRef = useRef(providerDraftId);
   const providerEditVersionRef = useRef(0);
   const providerSaveInFlightRef = useRef<Promise<void> | null>(null);
+  const nodesRef = useRef(nodes);
+  const edgesRef = useRef(edges);
+  const assetSaveInFlightRef = useRef<Map<string, Promise<Artifact | undefined>>>(new Map());
   const statePollInFlightRef = useRef(false);
   const conflictNoticeRef = useRef<string | undefined>(undefined);
   const autosaveTimer = useRef<number | undefined>(undefined);
@@ -397,6 +459,8 @@ function AppShell() {
   useEffect(() => { boardsRef.current = boards; }, [boards]);
   useEffect(() => { providersRef.current = providers; }, [providers]);
   useEffect(() => { providerDraftIdRef.current = providerDraftId; }, [providerDraftId]);
+  useEffect(() => { nodesRef.current = nodes; }, [nodes]);
+  useEffect(() => { edgesRef.current = edges; }, [edges]);
   useEffect(() => { runsRef.current = runs; }, [runs]);
   useEffect(() => { timelineOpenRef.current = timelineOpen; }, [timelineOpen]);
   useEffect(() => { handoffIntentRef.current = handoffIntent; }, [handoffIntent]);
@@ -424,8 +488,12 @@ function AppShell() {
   }, []);
 
   const paintBoard = useCallback((board: Board, options: { resetSelection?: boolean; restoreViewport?: boolean } = {}) => {
-    setNodes(boardToFlowNodes(board));
-    setEdges(boardToFlowEdges(board));
+    const nextNodes = boardToFlowNodes(board);
+    const nextEdges = boardToFlowEdges(board);
+    nodesRef.current = nextNodes;
+    edgesRef.current = nextEdges;
+    setNodes(nextNodes);
+    setEdges(nextEdges);
     if (options.resetSelection ?? true) setSelectedNodeId(undefined);
     setPlan(undefined);
     if (options.restoreViewport ?? true) reactFlowRef.current.setViewport(board.viewport, { duration: 0 });
@@ -587,6 +655,8 @@ function AppShell() {
   }, []);
 
   const updateBoardState = useCallback((nextNodes: FlowNode[], nextEdges: FlowEdge[], markDirty = true) => {
+    nodesRef.current = nextNodes;
+    edgesRef.current = nextEdges;
     setBoards((current) => current.map((board) => board.id === activeBoardIdRef.current ? {
       ...board,
       nodes: flowNodesToBoard(nextNodes),
@@ -654,6 +724,41 @@ function AppShell() {
     setSelectedNodeId(node.id);
     setPanel('inspector');
   }, [edges, nodes, updateBoardState]);
+
+  const addRelayFlow = useCallback(() => {
+    const provider = providersRef.current.find((candidate) => candidate.id === providerDraftIdRef.current);
+    if (!provider || provider.protocol !== 'relay') {
+      notify('請先選擇 Image + Video JSON 中轉站 provider。', 'error');
+      return;
+    }
+    if (providersDirty || providersSaving || diagnosticsLoading || modelsLoading || runBusy || apiState !== 'ready') {
+      notify('Relay flow 需要已保存且目前沒有忙碌中的 provider 或執行工作。', 'error');
+      return;
+    }
+    const liveNodes = nodesRef.current;
+    const liveEdges = edgesRef.current;
+    if (liveNodes.length + 2 > 100 || liveEdges.length + 1 > 200) {
+      notify('目前畫布容量不足，無法原子新增圖片與影片節點。', 'error');
+      return;
+    }
+    const appended = buildRelayFlow(liveNodes, liveEdges, provider);
+    if (!appended) {
+      notify('Relay flow 設定不完整或容量已變更，未新增任何節點。', 'error');
+      return;
+    }
+    nodesRef.current = appended.nodes;
+    edgesRef.current = appended.edges;
+    setNodes(appended.nodes);
+    setEdges(appended.edges);
+    updateBoardState(appended.nodes, appended.edges);
+    setSelectedNodeId(appended.imageNodeId);
+    setPanel('inspector');
+    setPanelOpen(false);
+    window.requestAnimationFrame(() => {
+      void reactFlowRef.current.fitView({ nodes: [{ id: appended.imageNodeId }, { id: appended.videoNodeId }], padding: 0.28, duration: 260 });
+    });
+    notify('已新增圖→影流程；請編輯提示詞後再執行。', 'success');
+  }, [apiState, diagnosticsLoading, modelsLoading, notify, providersDirty, providersSaving, reactFlowRef, runBusy, updateBoardState]);
 
   const deleteSelectedNode = useCallback(() => {
     if (!selectedNodeId) return;
@@ -912,8 +1017,12 @@ function AppShell() {
         revision: activeBoard?.revision ?? parsed.revision,
       };
       setBoards((current) => current.map((board) => board.id === activeBoardIdRef.current ? imported : board));
-      setNodes(boardToFlowNodes(imported));
-      setEdges(boardToFlowEdges(imported));
+      const importedNodes = boardToFlowNodes(imported);
+      const importedEdges = boardToFlowEdges(imported);
+      nodesRef.current = importedNodes;
+      edgesRef.current = importedEdges;
+      setNodes(importedNodes);
+      setEdges(importedEdges);
       editVersionRef.current += 1;
       dirtyRef.current = true;
       setDirty(true);
@@ -1036,48 +1145,97 @@ function AppShell() {
 
   const saveAsset = useCallback(async (runId: string, nodeId: string, artifactIndex: number): Promise<Artifact | undefined> => {
     const key = `${runId}:${nodeId}:${artifactIndex}`;
-    const currentState = assetSaveStates[key];
-    if (currentState?.status === 'saving') return undefined;
-    const run = runs.find((candidate) => candidate.id === runId);
-    const artifact = run?.results[nodeId]?.artifacts?.[artifactIndex];
-    if (!artifact) {
-      setAssetSaveStates((current) => ({ ...current, [key]: { status: 'failed', message: '找不到這份素材。' } }));
+    const existing = assetSaveInFlightRef.current.get(key);
+    if (existing) return existing;
+    const localSaved = (artifact: Artifact | undefined): artifact is Artifact => Boolean(
+      artifact?.localUrl && /^\/api\/media\/[a-f0-9]{64}$/.test(artifact.localUrl),
+    );
+    const readCurrent = () => {
+      const run = runsRef.current.find((candidate) => candidate.id === runId);
+      const result = run?.results[nodeId];
+      return { run, result, artifact: result?.artifacts?.[artifactIndex] };
+    };
+    const initial = readCurrent();
+    if (!initial.run || initial.run.status !== 'succeeded' || !initial.result || initial.result.status !== 'succeeded' || !initial.artifact) {
+      setAssetSaveStates((current) => ({ ...current, [key]: { status: 'failed', message: '這份素材目前不是可保存的成功結果。' } }));
       return undefined;
     }
-    if (artifact.localUrl || artifact.localId) {
+    const canonical = { kind: initial.artifact.kind, url: initial.artifact.url };
+    if (localSaved(initial.artifact)) {
       setAssetSaveStates((current) => ({ ...current, [key]: { status: 'saved' } }));
-      return artifact;
+      return initial.artifact;
     }
     if (apiState !== 'ready' || !tokenRef.current) {
       setAssetSaveStates((current) => ({ ...current, [key]: { status: 'failed', message: '服務尚未連線，請重試。' } }));
       notify('素材保存失敗，請確認服務連線後重試。', 'error');
       return undefined;
     }
-    setAssetSaveStates((current) => ({ ...current, [key]: { status: 'saving' } }));
-    try {
-      const response = await requestJson<Artifact | { artifact: Artifact }>(`/api/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(nodeId)}/${artifactIndex}/save`, { method: 'POST', body: '{}' });
-      const savedArtifact = 'artifact' in response ? response.artifact : response;
-      setRuns((current) => current.map((candidate) => {
-        if (candidate.id !== runId) return candidate;
-        const result = candidate.results[nodeId];
-        if (!result) return candidate;
-        return {
-          ...candidate,
-          results: {
-            ...candidate.results,
-            [nodeId]: { ...result, artifacts: result.artifacts.map((item, index) => index === artifactIndex ? savedArtifact : item) },
-          },
-        };
-      }));
-      setAssetSaveStates((current) => ({ ...current, [key]: { status: 'saved' } }));
-      notify('素材已保存到本機。', 'success');
-      return savedArtifact;
-    } catch {
-      setAssetSaveStates((current) => ({ ...current, [key]: { status: 'failed', message: '保存失敗，請重試。' } }));
-      notify('素材保存失敗，請重試。', 'error');
-      return undefined;
-    }
-  }, [apiState, assetSaveStates, notify, requestJson, runs]);
+
+    const operation = (async (): Promise<Artifact | undefined> => {
+      setAssetSaveStates((current) => ({ ...current, [key]: { status: 'saving' } }));
+      const clearStaleState = () => {
+        setAssetSaveStates((current) => {
+          if (!current[key] || current[key].status !== 'saving') return current;
+          const next = { ...current };
+          delete next[key];
+          return next;
+        });
+      };
+      const sourceStillCurrent = () => {
+        const latest = readCurrent();
+        return Boolean(
+          latest.run?.status === 'succeeded' && latest.result?.status === 'succeeded' && latest.artifact &&
+          latest.artifact.kind === canonical.kind && latest.artifact.url === canonical.url,
+        );
+      };
+      try {
+        const response = await requestJson<Artifact | { artifact: Artifact }>(`/api/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(nodeId)}/${artifactIndex}/save`, { method: 'POST', body: '{}' });
+        const savedArtifact = 'artifact' in response ? response.artifact : response;
+        if (
+          !savedArtifact || savedArtifact.kind !== canonical.kind || savedArtifact.url !== canonical.url ||
+          !localSaved(savedArtifact) || typeof savedArtifact.mimeType !== 'string'
+        ) {
+          throw new Error('保存回讀不符合素材識別。');
+        }
+        if (!sourceStillCurrent()) {
+          clearStaleState();
+          return undefined;
+        }
+        const nextRuns = runsRef.current.map((candidate) => {
+          if (candidate.id !== runId) return candidate;
+          const result = candidate.results[nodeId];
+          if (!result) return candidate;
+          return {
+            ...candidate,
+            results: {
+              ...candidate.results,
+              [nodeId]: { ...result, artifacts: result.artifacts.map((item, index) => index === artifactIndex ? savedArtifact : item) },
+            },
+          };
+        });
+        runsRef.current = nextRuns;
+        setRuns(nextRuns);
+        setAssetSaveStates((current) => ({ ...current, [key]: { status: 'saved' } }));
+        notify('素材已保存到本機。', 'success');
+        return savedArtifact;
+      } catch (error) {
+        if (!sourceStillCurrent()) {
+          clearStaleState();
+          return undefined;
+        }
+        const status = (error as { status?: number }).status;
+        const message = status === 409 ? '來源素材已變更，請重新選擇。' : '保存失敗，請重試。';
+        setAssetSaveStates((current) => ({ ...current, [key]: { status: 'failed', message } }));
+        notify(message, 'error');
+        return undefined;
+      }
+    })();
+    assetSaveInFlightRef.current.set(key, operation);
+    void operation.finally(() => {
+      if (assetSaveInFlightRef.current.get(key) === operation) assetSaveInFlightRef.current.delete(key);
+    }).catch(() => undefined);
+    return operation;
+  }, [apiState, notify, requestJson]);
 
   const updateProviderDraft = useCallback((patch: Partial<Provider>) => {
     const draftId = providerDraftIdRef.current;
@@ -1111,6 +1269,7 @@ function AppShell() {
       openai: { name: 'OpenAI compatible', protocol: 'openai', baseUrl: 'https://api.openai.com/v1', imageModel: 'gpt-image-1', videoModel: '' },
       newapi: { name: 'New API / One API', protocol: 'openai', baseUrl: '', imageModel: 'gpt-image-1', videoModel: '' },
       videos: { name: 'Videos JSON relay', protocol: 'videos', baseUrl: '', imageModel: '', videoModel: '' },
+      relay: { name: 'Image + Video JSON 中轉站', protocol: 'relay', baseUrl: '', imageModel: '', videoModel: '' },
       fal: { name: 'fal.ai', protocol: 'fal', baseUrl: 'https://queue.fal.run', imageModel: 'fal-ai/flux/schnell', videoModel: 'fal-ai/kling-video/v3/standard/image-to-video' },
       replicate: { name: 'Replicate', protocol: 'replicate', baseUrl: 'https://api.replicate.com/v1', imageModel: 'black-forest-labs/flux-schnell', videoModel: 'minimax/video-01' },
     };
@@ -1205,7 +1364,7 @@ function AppShell() {
       notify('Demo 模型清單為固定離線清單。', 'info');
       return;
     }
-    if (provider.protocol !== 'openai' && provider.protocol !== 'videos') {
+    if (provider.protocol !== 'openai' && provider.protocol !== 'videos' && provider.protocol !== 'relay') {
       notify('此協定未提供安全模型查詢，請手動輸入模型。', 'info');
       return;
     }
@@ -1291,7 +1450,7 @@ function AppShell() {
             <div className="brand-name">Relay Canvas</div>
             <div className="brand-kicker">IDEAS, CONNECTED.</div>
           </div>
-          <span className="version-tag">v0.5.0</span>
+          <span className="version-tag">v0.6.0</span>
         </div>
         <div className="board-switcher">
           <Layers3 size={15} />
@@ -1398,7 +1557,7 @@ function AppShell() {
           </div>
           {panel === 'inspector' && <InspectorPanel node={selectedNode} providers={providers} selectedResult={selectedResult} runId={latestRun?.id} assetSaveStates={assetSaveStates} onSaveAsset={saveAsset} onChange={updateSelectedNode} onDelete={deleteSelectedNode} onOpenProviders={() => { const id = selectedNode?.data.providerId ?? 'demo'; providerDraftIdRef.current = id; setProviderDraftId(id); setPanel('providers'); setPanelOpen(true); }} />}
           {panel === 'history' && <HistoryPanel runs={runs.filter((run) => run.boardId === activeBoardId)} activeRunId={activeRun?.id} currentRevision={activeBoard?.revision} onSelect={(run) => { if (run.revision !== activeBoard?.revision) { notify('這筆執行來自較舊 revision，保留在 history，不覆蓋目前畫布。', 'info'); return; } setNodes((current) => current.map((node) => { const result = run.results[node.id]; const artifact = assetForResult(result); return result ? { ...node, data: { ...node.data, runStatus: result.status, runError: result.error, previewUrl: artifactUrl(artifact) } } : node; })); }} />}
-          {panel === 'providers' && <ProvidersPanel providers={providers} selectedId={providerDraftId} settings={settings} apiReady={apiState === 'ready'} dirty={providersDirty} saving={providersSaving} diagnostics={providerDiagnostics} diagnosticsLoading={diagnosticsLoading} models={providerModels[providerDraftId] ?? []} modelsLoading={modelsLoading} onDiagnostics={() => void refreshProviderDiagnostics()} onQueryModels={() => void queryProviderModels()} onSelect={(id) => { providerDraftIdRef.current = id; setProviderDraftId(id); }} onChange={updateProviderDraft} onAdd={addProvider} onSave={() => void saveProviders()} />}
+          {panel === 'providers' && <ProvidersPanel providers={providers} selectedId={providerDraftId} settings={settings} apiReady={apiState === 'ready'} dirty={providersDirty} saving={providersSaving} diagnostics={providerDiagnostics} diagnosticsLoading={diagnosticsLoading} models={providerModels[providerDraftId] ?? []} modelsLoading={modelsLoading} relayFlowBusy={providersSaving || diagnosticsLoading || modelsLoading || runBusy} relayFlowCapacity={nodes.length + 2 <= 100 && edges.length + 1 <= 200} onDiagnostics={() => void refreshProviderDiagnostics()} onQueryModels={() => void queryProviderModels()} onSelect={(id) => { providerDraftIdRef.current = id; setProviderDraftId(id); }} onChange={updateProviderDraft} onAdd={addProvider} onAddRelayFlow={addRelayFlow} onSave={() => void saveProviders()} />}
           {panel === 'help' && <HelpPanel />}
         </aside>}
       </div>
@@ -1411,7 +1570,7 @@ function AppShell() {
       {toast && <div className={`toast toast-${toast.tone}`} role="status"><span className="toast-icon">{toast.tone === 'success' ? <Check size={15} /> : toast.tone === 'error' ? <AlertCircle size={15} /> : <Info size={15} />}</span>{toast.message}<button onClick={() => setToast(undefined)} aria-label="close-message"><X size={14} /></button></div>}
 
       {timelineOpen && activeBoard && <TimelineEditor board={activeBoard} runs={runs} exports={exports} requestJson={requestJson as UiRequest} onSaveArtifact={saveAsset as SaveArtifact} onExportJob={(job) => setExports((current) => [job, ...current.filter((candidate) => candidate.id !== job.id)])} handoffIntent={handoffIntent} onHandoffConsumed={clearHandoffIntent} onClose={() => { setTimelineOpen(false); clearHandoffIntent(); }} />}
-      {compareOpen && activeBoard && <RunCompare boardId={activeBoard.id} runs={runs} requestJson={requestJson as UiRequest} onUseInTimeline={handoffToTimeline} onClose={() => { setCompareOpen(false); clearHandoffIntent(); }} />}
+      {compareOpen && activeBoard && <RunCompare boardId={activeBoard.id} runs={runs} requestJson={requestJson as UiRequest} assetSaveStates={assetSaveStates} onSaveAsset={saveAsset} onUseInTimeline={handoffToTimeline} onClose={() => { setCompareOpen(false); clearHandoffIntent(); }} />}
       {confirmRun && <RunConfirmDialog confirm={confirmRun} providers={providers} onCancel={() => setConfirmRun(undefined)} onConfirm={() => void startRun(confirmRun.nodeId, true, confirmRun.operationId)} />}
     </div>
   );
@@ -1525,11 +1684,11 @@ function InspectorPanel({ node, providers, selectedResult, runId, assetSaveState
       providerId,
       model,
       ...(node.data.kind === 'video' ? { referenceField: recommendedReferenceField(model ?? '') } : {}),
-      ...(nextProvider?.protocol === 'videos' ? { params: {} } : {}),
+      ...((nextProvider?.protocol === 'videos' || nextProvider?.protocol === 'relay') ? { params: {} } : {}),
     });
   };
   const handleModelChange = (model: string) => {
-    onChange(node.data.kind === 'video' ? { model, referenceField: recommendedReferenceField(model) } : { model });
+    onChange(node.data.kind === 'video' ? { model, referenceField: provider?.protocol === 'relay' ? 'image_url' : recommendedReferenceField(model) } : { model });
   };
   return (
     <div className="inspector-content">
@@ -1541,9 +1700,9 @@ function InspectorPanel({ node, providers, selectedResult, runId, assetSaveState
       {isGenerator && <>
         <div className="section-divider"><span>GENERATION</span></div>
         <Field label="Provider"><div className="select-with-action"><select value={node.data.providerId ?? 'demo'} onChange={(event) => handleProviderChange(event.target.value)}><option value="">Select provider</option>{providers.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}{candidate.protocol === 'demo' ? ' · DEMO' : ''}</option>)}</select><button className="mini-icon-button" onClick={onOpenProviders} aria-label="provider-settings" title="編輯供應商"><Settings2 size={14} /></button></div></Field>
-        <Field label="Model" hint={provider?.protocol === 'demo' ? '離線 Demo，不消耗 AI 額度。' : provider?.protocol === 'videos' ? 'Videos JSON relay contract；不預填官方 Sora，請手動輸入模型。' : '自訂模型／協定驗證，未做 live 驗證。'}><input aria-label="node-model" value={node.data.model ?? ''} onChange={(event) => handleModelChange(event.target.value)} placeholder={provider?.protocol === 'videos' ? 'relay model' : 'model-name'} /></Field>
-        {node.data.kind === 'video' && <Field label="Reference field"><input value={node.data.referenceField ?? 'image_url'} onChange={(event) => onChange({ referenceField: event.target.value })} /></Field>}
-        <div className="params-box"><div className="params-heading"><span>PARAMETERS</span><SlidersHorizontal size={13} /></div>{provider?.protocol === 'videos' && node.data.kind === 'video' ? <VideoParams params={node.data.params} onChange={(params) => onChange({ params })} /> : <div className="params-grid"><ParamField label="Aspect" value={String(node.data.params?.aspect_ratio ?? '16:9')} onChange={(value) => onChange({ params: { ...(node.data.params ?? {}), aspect_ratio: value } })} /><ParamField label="Quality" value={String(node.data.params?.quality ?? 'standard')} onChange={(value) => onChange({ params: { ...(node.data.params ?? {}), quality: value } })} /></div>}</div>
+        <Field label="Model" hint={provider?.protocol === 'demo' ? '離線 Demo，不消耗 AI 額度。' : provider?.protocol === 'videos' ? 'Videos JSON relay contract；不預填官方 Sora，請手動輸入模型。' : provider?.protocol === 'relay' ? 'Relay 宣告 image + video；固定路徑 contract，尚未 live 驗證。' : '自訂模型／協定驗證，未做 live 驗證。'}><input aria-label="node-model" value={node.data.model ?? ''} onChange={(event) => handleModelChange(event.target.value)} placeholder={provider?.protocol === 'videos' || provider?.protocol === 'relay' ? 'relay model' : 'model-name'} /></Field>
+        {node.data.kind === 'video' && <Field label="Reference field" hint={provider?.protocol === 'relay' ? 'Relay video 固定送出 input_reference.image_url。' : undefined}><input value={node.data.referenceField ?? 'image_url'} readOnly={provider?.protocol === 'relay'} onChange={(event) => onChange({ referenceField: event.target.value })} /></Field>}
+        <div className="params-box"><div className="params-heading"><span>PARAMETERS</span><SlidersHorizontal size={13} /></div>{(provider?.protocol === 'videos' || provider?.protocol === 'relay') && node.data.kind === 'video' ? <VideoParams params={node.data.params} onChange={(params) => onChange({ params })} /> : <div className="params-grid"><ParamField label="Aspect" value={String(node.data.params?.aspect_ratio ?? '16:9')} onChange={(value) => onChange({ params: { ...(node.data.params ?? {}), aspect_ratio: value } })} /><ParamField label="Quality" value={String(node.data.params?.quality ?? 'standard')} onChange={(value) => onChange({ params: { ...(node.data.params ?? {}), quality: value } })} /></div>}</div>
       </>}
       {selectedResult && <ResultBlock result={selectedResult} runId={runId} nodeId={node.id} saveState={runId ? assetSaveStates[`${runId}:${node.id}:0`] : undefined} onSave={runId ? () => onSaveAsset(runId, node.id, 0) : undefined} />}
       <div className="inspector-footer"><span><Info size={12} /> Changes autosave when connected</span></div>
@@ -1584,14 +1743,16 @@ function HistoryPanel({ runs, activeRunId, currentRevision, onSelect }: { runs: 
   return <div className="history-content"><div className="panel-heading"><div><span className="panel-eyebrow">EXECUTION LOG</span><h2>Run history</h2></div><span className="history-count">{runs.length.toString().padStart(2, '0')}</span></div>{runs.length === 0 ? <div className="empty-panel compact"><div className="empty-icon"><Clock3 size={19} /></div><h2>No runs yet</h2><p>執行節點後，這裡會保留狀態與產物。</p></div> : <div className="run-list">{runs.map((run) => <button key={run.id} className={`run-card ${run.id === activeRunId ? 'is-active' : ''} ${run.revision !== currentRevision ? 'is-stale' : ''}`} onClick={() => onSelect(run)}><div className="run-card-top"><span className={`run-status-mark ${statusClass(run.status)}`} /> <strong>Canvas execution</strong><span className={`run-status-label ${statusClass(run.status)}`}>{statusLabel(run.status)}</span></div><div className="run-card-meta"><span>{new Date(run.startedAt).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' })}</span><span>{run.order.length} nodes</span><span>rev {run.revision}{run.revision !== currentRevision ? ' · archived' : ''}</span></div></button>)}</div>}</div>;
 }
 
-function ProvidersPanel({ providers, selectedId, settings, apiReady, dirty, saving, diagnostics, diagnosticsLoading, models, modelsLoading, onDiagnostics, onQueryModels, onSelect, onChange, onAdd, onSave }: { providers: Provider[]; selectedId: string; settings: AppState['settings']; apiReady: boolean; dirty: boolean; saving: boolean; diagnostics: Record<string, ProviderDiagnostic>; diagnosticsLoading: boolean; models: string[]; modelsLoading: boolean; onDiagnostics: () => void; onQueryModels: () => void; onSelect: (id: string) => void; onChange: (patch: Partial<Provider>) => void; onAdd: (template: ProviderTemplate) => void; onSave: () => void }) {
+function ProvidersPanel({ providers, selectedId, settings, apiReady, dirty, saving, diagnostics, diagnosticsLoading, models, modelsLoading, relayFlowBusy, relayFlowCapacity, onDiagnostics, onQueryModels, onSelect, onChange, onAdd, onAddRelayFlow, onSave }: { providers: Provider[]; selectedId: string; settings: AppState['settings']; apiReady: boolean; dirty: boolean; saving: boolean; diagnostics: Record<string, ProviderDiagnostic>; diagnosticsLoading: boolean; models: string[]; modelsLoading: boolean; relayFlowBusy: boolean; relayFlowCapacity: boolean; onDiagnostics: () => void; onQueryModels: () => void; onSelect: (id: string) => void; onChange: (patch: Partial<Provider>) => void; onAdd: (template: ProviderTemplate) => void; onAddRelayFlow: () => void; onSave: () => void }) {
   const selected = providers.find((provider) => provider.id === selectedId) ?? providers[0];
   const [template, setTemplate] = useState<ProviderTemplate>('openai');
   const diagnostic = diagnostics[selected?.id ?? ''];
   if (!selected) return null;
   const imageModelChoice = models.includes(selected.imageModel) ? selected.imageModel : '';
   const videoModelChoice = models.includes(selected.videoModel) ? selected.videoModel : '';
-  return <div className="providers-content"><div className="panel-heading"><div><span className="panel-eyebrow">RUNTIME CONFIG</span><h2>Providers</h2></div><div className="provider-heading-actions"><select className="provider-template-select" aria-label="provider-template" value={template} onChange={(event) => setTemplate(event.target.value as ProviderTemplate)}><option value="openai">OpenAI 圖片</option><option value="newapi">NewAPI 圖片</option><option value="videos">Videos JSON 中轉站</option><option value="fal">fal</option><option value="replicate">Replicate</option></select><button className="icon-button" aria-label="add-provider" onClick={() => onAdd(template)} title="新增供應商" disabled={!apiReady}><Plus size={15} /></button><button className="primary-button compact-button" aria-label="provider-save" onClick={onSave} disabled={!apiReady || !dirty || saving}>{saving ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}{saving ? '保存中' : 'Save'}</button></div></div><div className="provider-list">{providers.map((provider) => <button key={provider.id} className={`provider-row ${provider.id === selected.id ? 'is-selected' : ''}`} onClick={() => onSelect(provider.id)}><span className="provider-orb" data-protocol={provider.protocol}>{provider.protocol === 'demo' ? <Sparkles size={14} /> : <Zap size={14} />}</span><span><strong>{provider.name}</strong><small>{provider.protocol === 'demo' ? 'Offline preview' : provider.protocol.toUpperCase()}</small></span><ChevronDown className="provider-chevron" size={14} /></button>)}</div><div className="provider-detail"><Field label="Provider ID"><input aria-label="provider-id" value={selected.id} readOnly /></Field><Field label="Display name"><input aria-label="provider-name" value={selected.name} onChange={(event) => onChange({ name: event.target.value })} /></Field><Field label="Protocol"><select aria-label="provider-protocol" value={selected.protocol} onChange={(event) => onChange({ protocol: event.target.value as Provider['protocol'] })}><option value="demo">Demo</option><option value="openai">OpenAI compatible / NewAPI</option><option value="videos">Videos JSON relay</option><option value="fal">fal.ai</option><option value="replicate">Replicate</option></select></Field><Field label="Base URL" hint="只允許伺服器設定的 exact HTTPS origin。"><input aria-label="provider-base-url" value={selected.baseUrl} onChange={(event) => onChange({ baseUrl: event.target.value })} placeholder="https://api.example.com/v1" /></Field><Field label="Key env name" hint="只填環境變數名稱，不要填入金鑰值。"><input aria-label="provider-key-env" value={selected.keyEnv} onChange={(event) => onChange({ keyEnv: event.target.value })} placeholder="RELAY_KEY_PROVIDER" /></Field><Field label="Image model"><input aria-label="provider-image-model" value={selected.imageModel} onChange={(event) => onChange({ imageModel: event.target.value })} />{models.length > 0 && <select aria-label="provider-image-model-options" value={imageModelChoice} onChange={(event) => event.target.value && onChange({ imageModel: event.target.value })}><option value="">選擇查詢模型（可保留手動輸入）</option>{models.map((model) => <option key={`image-${model}`} value={model}>{model}</option>)}</select>}</Field><Field label="Video model" hint={selected.protocol === 'videos' ? 'Videos JSON relay 只在你指定 model 時送出。' : undefined}><input aria-label="provider-video-model" value={selected.videoModel} onChange={(event) => onChange({ videoModel: event.target.value })} placeholder={selected.protocol === 'videos' ? 'relay model（手動）' : 'Not supported'} />{models.length > 0 && <select aria-label="provider-video-model-options" value={videoModelChoice} onChange={(event) => event.target.value && onChange({ videoModel: event.target.value })}><option value="">選擇查詢模型（可保留手動輸入）</option>{models.map((model) => <option key={`video-${model}`} value={model}>{model}</option>)}</select>}</Field><div className="provider-actions"><button className="secondary-button" aria-label="provider-diagnostics" onClick={onDiagnostics} disabled={!apiReady || dirty || diagnosticsLoading}>{diagnosticsLoading ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}診斷</button><button className="secondary-button" aria-label="query-models" onClick={onQueryModels} disabled={!apiReady || dirty || modelsLoading}>{modelsLoading ? <LoaderCircle className="spin" size={13} /> : <Search size={13} />}查詢模型</button></div>{diagnostic && <div className="provider-diagnostics" role="status"><div className="diagnostic-chips"><span className={diagnostic.credentialConfigured ? 'is-ok' : ''}>KEY {diagnostic.credentialConfigured ? '已設' : '未設'}</span><span className={diagnostic.configurationValid ? 'is-ok' : 'is-bad'}>ORIGIN {diagnostic.configurationValid ? '允許' : '阻擋'}</span><span className={diagnostic.remoteEnabled ? 'is-ok' : ''}>REMOTE {diagnostic.remoteEnabled ? 'READY' : 'OFF'}</span><span>CAP {diagnostic.capabilities.join(', ') || 'none'}</span></div><small>{diagnostic.codes.length ? `codes: ${diagnostic.codes.join(', ')}` : 'codes: none'} · KEY 已設僅代表環境變數存在，不代表 live valid</small></div>}<div className="key-env"><LockKeyhole size={13} /><span>Runtime reads the secret from server env</span><code>{selected.keyEnv || 'No key required'}</code></div></div><div className="remote-banner"><div className="remote-banner-icon"><Activity size={15} /></div><div><strong>{settings.remoteEnabled ? 'Remote generation enabled' : 'Remote generation disabled'}</strong><p>{settings.remoteEnabled ? '每次外部生成仍需在執行前確認。' : 'Demo 可離線執行；遠端 provider 目前由伺服器停用。'}</p></div></div></div>;
+  const relayFlowReady = apiReady && selected.protocol === 'relay' && !dirty && !relayFlowBusy && relayFlowCapacity && Boolean(selected.imageModel.trim()) && Boolean(selected.videoModel.trim());
+  const relayFlowReason = !apiReady ? '服務尚未連線' : selected.protocol !== 'relay' ? '請選擇 relay provider' : dirty ? '先保存 provider 設定' : relayFlowBusy ? 'provider 或執行工作忙碌中' : !relayFlowCapacity ? '畫布容量不足' : !selected.imageModel.trim() || !selected.videoModel.trim() ? '需要圖片與影片模型' : undefined;
+  return <div className="providers-content"><div className="panel-heading"><div><span className="panel-eyebrow">RUNTIME CONFIG</span><h2>Providers</h2></div><div className="provider-heading-actions"><select className="provider-template-select" aria-label="provider-template" value={template} onChange={(event) => setTemplate(event.target.value as ProviderTemplate)}><option value="openai">OpenAI 圖片</option><option value="newapi">NewAPI 圖片</option><option value="videos">Videos JSON 中轉站</option><option value="relay">Image + Video JSON 中轉站</option><option value="fal">fal</option><option value="replicate">Replicate</option></select><button className="icon-button" aria-label="add-provider" onClick={() => onAdd(template)} title="新增供應商" disabled={!apiReady}><Plus size={15} /></button><button className="primary-button compact-button" aria-label="provider-save" onClick={onSave} disabled={!apiReady || !dirty || saving}>{saving ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}{saving ? '保存中' : 'Save'}</button></div></div><div className="provider-list">{providers.map((provider) => <button key={provider.id} className={`provider-row ${provider.id === selected.id ? 'is-selected' : ''}`} onClick={() => onSelect(provider.id)}><span className="provider-orb" data-protocol={provider.protocol}>{provider.protocol === 'demo' ? <Sparkles size={14} /> : <Zap size={14} />}</span><span><strong>{provider.name}</strong><small>{provider.protocol === 'demo' ? 'Offline preview' : provider.protocol.toUpperCase()}</small></span><ChevronDown className="provider-chevron" size={14} /></button>)}</div><div className="provider-detail"><Field label="Provider ID"><input aria-label="provider-id" value={selected.id} readOnly /></Field><Field label="Display name"><input aria-label="provider-name" value={selected.name} onChange={(event) => onChange({ name: event.target.value })} /></Field><Field label="Protocol"><select aria-label="provider-protocol" value={selected.protocol} onChange={(event) => onChange({ protocol: event.target.value as Provider['protocol'] })}><option value="demo">Demo</option><option value="openai">OpenAI compatible / NewAPI</option><option value="videos">Videos JSON relay</option><option value="relay">Image + Video JSON 中轉站</option><option value="fal">fal.ai</option><option value="replicate">Replicate</option></select></Field>{selected.protocol === 'relay' && <div className="provider-contract-hint" role="note"><strong>固定 relay contract</strong><span>圖片走 /images/generations，影片走 /videos；宣告 image + video 能力，模型查詢與 live provider 仍需實際驗證。</span></div>}<Field label="Base URL" hint="只允許伺服器設定的 exact HTTPS origin。"><input aria-label="provider-base-url" value={selected.baseUrl} onChange={(event) => onChange({ baseUrl: event.target.value })} placeholder="https://api.example.com/v1" /></Field><Field label="Key env name" hint="只填環境變數名稱，不要填入金鑰值。"><input aria-label="provider-key-env" value={selected.keyEnv} onChange={(event) => onChange({ keyEnv: event.target.value })} placeholder="RELAY_KEY_PROVIDER" /></Field><Field label="Image model"><input aria-label="provider-image-model" value={selected.imageModel} onChange={(event) => onChange({ imageModel: event.target.value })} />{models.length > 0 && <select aria-label="provider-image-model-options" value={imageModelChoice} onChange={(event) => event.target.value && onChange({ imageModel: event.target.value })}><option value="">選擇查詢模型（可保留手動輸入）</option>{models.map((model) => <option key={`image-${model}`} value={model}>{model}</option>)}</select>}</Field><Field label="Video model" hint={selected.protocol === 'videos' || selected.protocol === 'relay' ? `${selected.protocol === 'relay' ? 'Relay' : 'Videos JSON relay'} 只在你指定 model 時送出。` : undefined}><input aria-label="provider-video-model" value={selected.videoModel} onChange={(event) => onChange({ videoModel: event.target.value })} placeholder={selected.protocol === 'videos' || selected.protocol === 'relay' ? 'relay model（手動）' : 'Not supported'} />{models.length > 0 && <select aria-label="provider-video-model-options" value={videoModelChoice} onChange={(event) => event.target.value && onChange({ videoModel: event.target.value })}><option value="">選擇查詢模型（可保留手動輸入）</option>{models.map((model) => <option key={`video-${model}`} value={model}>{model}</option>)}</select>}</Field><div className="provider-actions"><button className="secondary-button" aria-label="provider-diagnostics" onClick={onDiagnostics} disabled={!apiReady || dirty || diagnosticsLoading}>{diagnosticsLoading ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}診斷</button><button className="secondary-button" aria-label="query-models" onClick={onQueryModels} disabled={!apiReady || dirty || modelsLoading}>{modelsLoading ? <LoaderCircle className="spin" size={13} /> : <Search size={13} />}查詢模型</button></div><button type="button" className="relay-flow-add-button" data-testid="relay-flow-add" aria-label="新增圖→影流程" title={relayFlowReason} onClick={onAddRelayFlow} disabled={!relayFlowReady}><ImagePlus size={14} /><span>新增圖→影流程</span></button>{diagnostic && <div className="provider-diagnostics" role="status"><div className="diagnostic-chips"><span className={diagnostic.credentialConfigured ? 'is-ok' : ''}>KEY {diagnostic.credentialConfigured ? '已設' : '未設'}</span><span className={diagnostic.configurationValid ? 'is-ok' : 'is-bad'}>ORIGIN {diagnostic.configurationValid ? '允許' : '阻擋'}</span><span className={diagnostic.remoteEnabled ? 'is-ok' : ''}>REMOTE {diagnostic.remoteEnabled ? 'READY' : 'OFF'}</span><span>CAP {diagnostic.capabilities.join(', ') || 'none'}</span></div><small>{diagnostic.codes.length ? `codes: ${diagnostic.codes.join(', ')}` : 'codes: none'} · KEY 已設僅代表環境變數存在，不代表 live valid</small></div>}<div className="key-env"><LockKeyhole size={13} /><span>Runtime reads the secret from server env</span><code>{selected.keyEnv || 'No key required'}</code></div></div><div className="remote-banner"><div className="remote-banner-icon"><Activity size={15} /></div><div><strong>{settings.remoteEnabled ? 'Remote generation enabled' : 'Remote generation disabled'}</strong><p>{settings.remoteEnabled ? '每次外部生成仍需在執行前確認。' : 'Demo 可離線執行；遠端 provider 目前由伺服器停用。'}</p></div></div></div>;
 }
 
 function HelpPanel() {

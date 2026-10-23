@@ -75,12 +75,28 @@
       "result": "Searchable nine-card pages with exact source selection, persistent selected summary, local thumbnails, explicit playable preview and accessible seek, preserving drafts when preview or catalogs fail",
       "evidence": ["scripts/source-browser-smoke.ts: 15 sources, search/page/refresh/keyboard, actual-media seek, zero implicit mutation traffic, real index1 backend Add and one/all-source disappearance", "scripts/thumbnail-lifetime-smoke.ts: actual component source change, unmount, unreadable fallback and recovery", "docs/source-browser-review.md: repaired root Chrome155 complete smoke and fresh independent Chromium156 CONFIRMED, check, 68/68 core tests, build and complete original/editor/17-tool journey"],
       "limits": "One selected source and one preview; remote playback depends on a valid link and browser codec support; no paid-provider live generation or LibTV parity claim"
+    },
+    {
+      "round": 10,
+      "milestone": "v0.6.0",
+      "problem": "A custom relay required separate profiles and manual wiring before a creator could generate a connected image-to-video version",
+      "result": "Explicit dual-capability relay profile with model discovery and an atomic connected image/video flow, preserving explicit fee confirmation and original upstream references",
+      "evidence": ["tests/v06-relay.test.ts: fixed routes, capability and legacy restrictions, durable remote ID, all-output validation and reload", "scripts/relay-ui-boundaries-smoke.ts: actual helper capacity and immutable append boundaries", "scripts/relay-flow-smoke.ts: UI setup, cancelled confirmation and two real adapter/service versions", "docs/v0.6-review-record.md: security READY and fresh Chromium156 CONFIRMED"],
+      "limits": "Fixed JSON contract only; operator-configured paid relay live compatibility remains unverified; no arbitrary path/header/mapping"
+    },
+    {
+      "round": 11,
+      "milestone": "v0.6.0",
+      "problem": "Selecting a generated version in Compare required leaving the comparison to save and download its exact output before editing",
+      "result": "Per-output Compare save/download/retry with canonical authority and async identity fences, carrying exact video selection into saved timeline edits and local MP4 delivery",
+      "evidence": ["scripts/relay-ui-boundaries-smoke.ts: actual Compare index1, double click, drift and late response guards", "tests/v06-relay.test.ts: queued and durable-save CAS races without stale metadata or new orphan", "scripts/relay-flow-smoke.ts: image/video download hashes, handoff, trims/order, both MP4 formats and reload/CDN-unavailable local playback", "docs/v0.6-review-record.md: root Chrome155 and fresh independent Chromium156 complete journeys"],
+      "limits": "Same-board successful exact outputs only; timeline retains one track, 12 clips and 180 seconds total; system FFmpeg/ffprobe required"
     }
   ],
   "pendingRounds": [],
-  "currentMilestone": "v0.5.0",
+  "currentMilestone": "v0.6.0",
   "milestoneStatus": "acceptance-verified",
   "verifiedOn": "2026-10-23",
-  "nextCandidates": ["creator-acceptance-with-operator-configured-relays", "broader-media-source-compatibility"],
+  "nextCandidates": ["operator-configured-paid-relay-acceptance", "broader-media-source-compatibility"],
   "goalComplete": false
 }

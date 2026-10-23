@@ -16,7 +16,7 @@ npm start
 
 ### 使用 GitHub Release 發行包
 
-下載並解壓縮 `relay-canvas-0.5.0.tar.gz` 後，在解壓縮目錄執行：
+下載並解壓縮 `relay-canvas-0.6.0.tar.gz` 後，在解壓縮目錄執行：
 
 ```bash
 npm ci --omit=dev
@@ -36,8 +36,8 @@ npm start
 - 創作首頁、可搜尋專案卡與圖片／影片快速建立。
 - 成功執行素材庫，支援篩選、預覽、返回來源節點及本機保存／下載。
 - 影片時間軸：排列／複製／裁切成功影片，連續預覽，匯出橫式或直式 H.264／AAC MP4。
-- 生成版本 A/B 比較：並排提示詞、模型、參數與產物，同步影片播放與定位。
-- 自訂中轉站模板、設定診斷與模型查詢；受限 Videos JSON 中轉站影片協定。
+- 生成版本 A/B 比較：並排提示詞、模型、參數與產物，同步影片播放與定位，可保存／下載精確輸出並帶入時間軸。
+- 自訂中轉站模板、設定診斷與模型查詢；同一 Image + Video JSON profile 可建立連接好的圖→影流程，使用固定、受限的 API 契約。
 - 中性深灰 React Flow 畫布與浮動工具列：prompt、image、video、asset 與 note 節點。
 - DAG 驗證、revision optimistic concurrency、原子本機保存與執行歷史。
 - 內建 Demo 圖片與影片，適合離線試用與自動化驗證。
@@ -76,7 +76,7 @@ npm run package:release
 npm run smoke:package
 ```
 
-封裝腳本會以明確白名單產生 `release/relay-canvas-0.5.0.tar.gz` 與 SHA-256 檔，排除 `.relay-canvas`、`.env`、secrets 與 `node_modules`。CI 與發布邊界請看 [CHANGELOG](CHANGELOG.md) 及 [研究紀錄](docs/research.md)。
+封裝腳本會以明確白名單產生 `release/relay-canvas-0.6.0.tar.gz` 與 SHA-256 檔，排除 `.relay-canvas`、`.env`、secrets 與 `node_modules`。CI 與發布邊界請看 [CHANGELOG](CHANGELOG.md) 及 [研究紀錄](docs/research.md)。
 
 ## Roadmap
 

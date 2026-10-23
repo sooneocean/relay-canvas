@@ -24,6 +24,21 @@ Demo 不做外連。它產生固定程式生成的 SVG data URL 或本機 `/demo
 
 未保存的修改須先保存才能診斷或查詢；失敗時可修改設定並再次嘗試。模型查詢不會暗中執行生成。實際生成仍需逐次費用確認。
 
+## Image + Video JSON 中轉站（`relay`）
+
+`relay` 是一個明確的複合 profile：同一個 HTTPS base URL、exact provider origin 與 `RELAY_KEY_*` 環境變數，分別設定 `imageModel` 和 `videoModel`。它只重用本產品已定義的兩個固定契約：圖片使用 `POST {base}/images/generations`，影片使用 `POST {base}/videos`，再以 `GET {base}/videos/{id}` 輪詢。它不接受任意 endpoint、header、腳本、欄位映射或模型路徑。
+
+OpenAI-compatible 仍是 image-only；Videos JSON 仍是 video-only。`relay` 不把這兩者改成官方 OpenAI Videos，也不宣稱任意中轉站、所有 relay API 或任意模型都相容。image 與 video model 必須分開填寫，並依各自固定契約驗證輸入；圖轉影固定使用 `input_reference.image_url` 傳送同一 run 的上游圖片 URL。
+
+設定流程如下：
+
+1. 在 Providers 新增並保存 `Image + Video JSON 中轉站` profile，填入 exact HTTPS base URL、image model、video model，以及變數名稱（例如 `RELAY_KEY_RELAY`）。
+2. 在 server `.env` 設定對應的 `RELAY_KEY_*` 實際金鑰，將 base URL 的 exact origin 加入 `RELAY_PROVIDER_ORIGINS`，將輸出 CDN 加入 `RELAY_MEDIA_ORIGINS`，並在確認可能產生費用後設定 `RELAY_ENABLE_REMOTE=true`。
+3. 重新啟動 server，保存 profile 後使用診斷與固定 `GET {base}/models` 查詢（若該 profile 提供此契約），確認模型欄位；查詢不會觸發生成。
+4. 在已保存的 relay profile 按「新增圖→影流程」，讓畫布加入一組相連的 image／video 節點。這個動作只建立可編輯的流程，不會自動生成；使用者仍需編輯 prompt、保存畫布、驗證，並在每次 remote run 前確認費用。
+
+未保存的 profile、缺少任一模型或畫布容量不足時，新增流程動作會停用；server 仍會在 click 時重新檢查節點與 edge 容量。沒有 live provider 驗證時，診斷只能表示設定與固定契約狀態，不能表示金鑰有效、模型可用、價格或輸出品質。
+
 ## Videos JSON 中轉站
 
 這是供中轉站實作的明確 JSON 相容契約，並非 OpenAI 官方影片服務可用性宣告。官方文件已標示 OpenAI Videos/Sora API 於 2026-09-24 停用；模板不預填官方 Sora 模型。來源：[官方歷史 Videos 文件](https://developers.openai.com/api/reference/resources/videos/methods/create)。

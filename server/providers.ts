@@ -1,5 +1,6 @@
 import type { GenerationOutput, GenerationRequest, MediaKind, Provider, ProviderDiagnostic, ProviderModels } from '../src/shared/types.js';
 import { isSafeReferenceField, parseGenerationParams, parseProviders, parseVideosParams } from '../src/shared/schema.js';
+import { providerCapabilities, providerSupportsKind } from '../src/shared/provider-capabilities.js';
 import {
   readPolicy,
   safeJsonRequest,
@@ -110,12 +111,11 @@ function inspectGeneration(
   }
   if (provider.protocol === 'demo') return { provider, policy };
   if (!policy.remoteEnabled) fail('Remote generation is disabled');
-  if (provider.protocol === 'openai' && request.kind !== 'image') fail('Provider capability is not supported');
-  if (provider.protocol === 'videos') {
-    if (request.kind !== 'video') fail('Provider capability is not supported');
+  if (!providerSupportsKind(provider.protocol, request.kind)) fail('Provider capability is not supported');
+  if (provider.protocol === 'videos' || (provider.protocol === 'relay' && request.kind === 'video')) {
     try { parseVideosParams(request.params); } catch { fail('Invalid provider configuration'); }
   }
-  if (provider.protocol === 'openai' && Object.prototype.hasOwnProperty.call(request.params, 'output_format')) {
+  if ((provider.protocol === 'openai' || (provider.protocol === 'relay' && request.kind === 'image')) && Object.prototype.hasOwnProperty.call(request.params, 'output_format')) {
     const format = request.params.output_format;
     if (format !== 'png' && format !== 'jpeg' && format !== 'webp') fail('Invalid provider configuration');
   }
@@ -157,9 +157,7 @@ export function providerDiagnostics(
   env: NodeJS.ProcessEnv = process.env,
 ): ProviderDiagnostic[] {
   return providerValues.map((provider) => {
-    const capabilities = provider.protocol === 'openai' ? ['image'] as const
-      : provider.protocol === 'videos' ? ['video'] as const
-      : ['image', 'video'] as const;
+    const capabilities = providerCapabilities(provider.protocol);
     const codes: string[] = [];
     let configurationValid = true;
     const credentialConfigured = configuredSecret(env, provider.keyEnv);
@@ -176,7 +174,7 @@ export function providerDiagnostics(
       configurationValid,
       remoteEnabled: policy.remoteEnabled,
       credentialConfigured,
-      capabilities: [...capabilities],
+      capabilities,
       codes,
     };
   });
@@ -190,7 +188,7 @@ export async function providerModels(
   try {
     const provider = parseProviders([providerValue])[0];
     if (provider.protocol === 'demo') return { models: ['demo-image', 'demo-video'] };
-    if (provider.protocol !== 'openai' && provider.protocol !== 'videos') fail('Provider model discovery is not supported');
+    if (provider.protocol !== 'openai' && provider.protocol !== 'videos' && provider.protocol !== 'relay') fail('Provider model discovery is not supported');
     const policy = options.policy ?? readPolicy(options.env);
     if (!policy.remoteEnabled) fail('Remote generation is disabled');
     const base = validateBaseUrl(provider.baseUrl, policy);
@@ -434,7 +432,7 @@ export async function generate(
     ) fail('Invalid generation request');
     if (request.signal.aborted) fail('Generation aborted');
     if (provider.protocol === 'demo') return demo(request, policy);
-    if (request.referenceUrl) validateMediaUrl(request.referenceUrl, policy, { allowDemo: true });
+    if (request.referenceUrl) validateMediaUrl(request.referenceUrl, policy);
     const base = inspected.base!;
     const key = inspected.key!;
     const transport = options.transport ?? safeJsonRequest;
@@ -447,6 +445,11 @@ export async function generate(
 
     if (provider.protocol === 'openai') return await openAi(provider, request, base, key, transport, policy);
     if (provider.protocol === 'videos') return await videos(request, base, key, transport, policy, pollIntervalMs, maxPolls);
+    if (provider.protocol === 'relay') {
+      return request.kind === 'image'
+        ? await openAi(provider, request, base, key, transport, policy)
+        : await videos(request, base, key, transport, policy, pollIntervalMs, maxPolls);
+    }
     if (provider.protocol === 'fal') return await fal(provider, request, base, key, transport, policy, pollIntervalMs, maxPolls);
     if (provider.protocol === 'replicate') return await replicate(provider, request, base, key, transport, policy, pollIntervalMs, maxPolls);
     fail('Provider protocol is not supported');

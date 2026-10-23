@@ -2,10 +2,12 @@ import {
   AlertCircle,
   Check,
   ChevronDown,
+  Download,
   LoaderCircle,
   Pause,
   Play,
   RefreshCw,
+  Save,
   X,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -17,6 +19,8 @@ type RunCompareProps = {
   boardId: string;
   runs: Run[];
   requestJson: UiRequest;
+  assetSaveStates: Record<string, { status: 'saving' | 'saved' | 'failed'; message?: string }>;
+  onSaveAsset: (runId: string, nodeId: string, artifactIndex: number) => Promise<Artifact | undefined>;
   onClose: () => void;
   onUseInTimeline?: (intent: TimelineHandoffIntent) => Promise<boolean> | boolean;
 };
@@ -52,11 +56,56 @@ function durationKey(side: Side, runId: string, nodeId: string, artifactIndex: n
   return `${side}\u0000${runId}\u0000${nodeId}\u0000${artifactIndex}\u0000${canonicalUrl}`;
 }
 
-function exactArtifact(runs: Run[], runId: string, nodeId: string, index: number, canonical?: { kind: Artifact['kind']; url: string }): Artifact | undefined {
-  const run = runs.find((candidate) => candidate.id === runId);
+function assetKey(runId: string, nodeId: string, artifactIndex: number): string {
+  return `${runId}:${nodeId}:${artifactIndex}`;
+}
+
+function exactArtifact(runs: Run[], boardId: string, runId: string, nodeId: string, index: number, canonical?: { kind: Artifact['kind']; url: string }): Artifact | undefined {
+  const run = runs.find((candidate) => candidate.id === runId && candidate.boardId === boardId);
   const artifact = run?.results[nodeId]?.artifacts[index];
   if (!artifact || !canonical || artifact.kind !== canonical.kind || artifact.url !== canonical.url) return undefined;
   return artifact;
+}
+
+type CompareArtifactEligibility = { ok: true; artifact: Artifact } | { ok: false; reason: string };
+
+function compareArtifactEligibility(
+  runs: Run[],
+  boardId: string,
+  runId: string,
+  nodeId: string,
+  artifactIndex: number,
+  canonical: { kind: Artifact['kind']; url: string },
+): CompareArtifactEligibility {
+  if (!Number.isInteger(artifactIndex) || artifactIndex < 0 || artifactIndex > 99) return { ok: false, reason: '輸出索引無效，請重新選擇。' };
+  if ((canonical.kind !== 'image' && canonical.kind !== 'video') || !canonical.url) return { ok: false, reason: '比較輸出缺少有效的 canonical 媒體識別。' };
+  const run = runs.find((candidate) => candidate.id === runId);
+  if (!run) return { ok: false, reason: '來源 run 已不存在，請重新選擇。' };
+  if (run.boardId !== boardId) return { ok: false, reason: '來源不屬於目前畫布，無法保存。' };
+  if (run.status !== 'succeeded') return { ok: false, reason: `來源 run 狀態為${statusLabel(run.status)}，完成後才能保存。` };
+  const result = run.results[nodeId];
+  if (!result) return { ok: false, reason: '這個 node 的結果已不存在，請重新選擇。' };
+  if (result.status !== 'succeeded') return { ok: false, reason: `這個 node 結果狀態為${statusLabel(result.status)}，不能保存。` };
+  const artifact = result.artifacts[artifactIndex];
+  if (!artifact) return { ok: false, reason: '這個輸出已不存在，請重新選擇。' };
+  if (artifact.kind !== canonical.kind || artifact.url !== canonical.url) return { ok: false, reason: '來源內容已變更，請重新選擇。' };
+  return { ok: true, artifact };
+}
+
+function savedLocalUrl(artifact?: Artifact): string | undefined {
+  return artifact?.localUrl && /^\/api\/media\/[a-f0-9]{64}$/.test(artifact.localUrl) ? artifact.localUrl : undefined;
+}
+
+function extensionForMime(artifact?: Artifact): string | undefined {
+  if (!artifact?.mimeType) return undefined;
+  return ({
+    'image/png': 'png',
+    'image/jpeg': 'jpg',
+    'image/webp': 'webp',
+    'image/svg+xml': 'svg',
+    'video/mp4': 'mp4',
+    'video/webm': 'webm',
+  } as Record<string, string>)[artifact.mimeType.toLowerCase()];
 }
 
 function outputIdentity(runs: Run[], runId: string, nodeId: string): string {
@@ -92,8 +141,10 @@ function Output({
   mediaIdentity,
   startedAt,
   durationByArtifact,
+  assetSaveStates,
   pendingHandoff,
   boardId,
+  onSaveAsset,
   onUseInTimeline,
   onVideo,
   onDuration,
@@ -110,8 +161,10 @@ function Output({
   mediaIdentity: string;
   startedAt?: string;
   durationByArtifact: Record<string, number>;
+  assetSaveStates: Record<string, { status: 'saving' | 'saved' | 'failed'; message?: string }>;
   pendingHandoff: boolean;
   boardId: string;
+  onSaveAsset: (runId: string, nodeId: string, artifactIndex: number) => Promise<Artifact | undefined>;
   onUseInTimeline?: (intent: TimelineHandoffIntent) => Promise<boolean> | boolean;
   onVideo: (side: Side, video: VideoRef, identity: string) => void;
   onDuration: DurationHandler;
@@ -121,26 +174,42 @@ function Output({
   onEnded: MediaHandler;
 }) {
   if (!result) return <div className="compare-missing"><AlertCircle size={16} /><span>此 run 沒有這個 node 的結果。</span></div>;
-  if (result.status !== 'succeeded') return <div className="compare-missing"><AlertCircle size={16} /><span>結果狀態：{statusLabel(result.status)}{result.error ? ` · ${result.error}` : ''}</span></div>;
-  if (!result.artifacts.length) return <div className="compare-missing"><AlertCircle size={16} /><span>此 node 沒有輸出 artifact。</span></div>;
+  if (result.status !== 'succeeded') return <div className="compare-missing"><AlertCircle size={16} /><span>結果狀態：{statusLabel(result.status)}{result.error ? ` · ${result.error}` : ''}；不能保存或下載。</span></div>;
+  if (!result.artifacts.length) return <div className="compare-missing"><AlertCircle size={16} /><span>此 node 沒有輸出 artifact；不能保存或下載。</span></div>;
   return <div className="compare-output-list">{result.artifacts.map((canonical, index) => {
-    const current = exactArtifact(currentRuns, runId, nodeId, index, canonical);
-    const url = current?.localUrl ?? canonical.url;
+    const current = exactArtifact(currentRuns, boardId, runId, nodeId, index, canonical);
+    const saveEligibility = compareArtifactEligibility(currentRuns, boardId, runId, nodeId, index, canonical);
+    const url = savedLocalUrl(current) ?? canonical.url;
+    const localUrl = saveEligibility.ok ? savedLocalUrl(saveEligibility.artifact) : undefined;
+    const extension = saveEligibility.ok ? extensionForMime(saveEligibility.artifact) : undefined;
+    const saveState = assetSaveStates[assetKey(runId, nodeId, index)];
+    const hasSavedLocal = Boolean(localUrl);
     const label = `${side === 'left' ? 'A' : 'B'} output ${index + 1}`;
     const intentBase: TimelineHandoffIntent = { token: '', originBoardId: boardId, source: { runId, nodeId, artifactIndex: index }, canonical: { kind: canonical.kind, url: canonical.url } };
-    const eligibility = validateTimelineHandoff(intentBase, boardId, currentRuns);
+    const timelineEligibility = validateTimelineHandoff(intentBase, boardId, currentRuns);
     const duration = durationByArtifact[durationKey(side, runId, nodeId, index, canonical.url)];
     const durationLabel = duration !== undefined && Number.isFinite(duration) && duration > 0 ? `${duration.toFixed(2)}s` : '時長未知';
     const useInTimeline = () => {
-      if (!eligibility.ok || !onUseInTimeline || pendingHandoff) return;
+      if (!timelineEligibility.ok || !onUseInTimeline || pendingHandoff) return;
       const intent = { ...intentBase, token: makeToken() };
       void Promise.resolve(onUseInTimeline(intent)).catch(() => false);
+    };
+    const saveOutput = () => {
+      if (!saveEligibility.ok || hasSavedLocal || saveState?.status === 'saving') return;
+      void onSaveAsset(runId, nodeId, index).catch(() => undefined);
     };
     return <div className="compare-output" key={`${canonical.kind}-${index}`}>
       <div className="compare-output-label"><strong>{canonical.demo ? 'DEMO' : canonical.kind.toUpperCase()} · output {index + 1}</strong><small>{nodeId} · {startedAt ? formatTime(startedAt) : '執行時間未知'}</small><small>{durationLabel}</small></div>
       {canonical.kind === 'image' ? <img src={url} alt={label} referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <video ref={(element) => { if (index === 0) onVideo(side, element, mediaIdentity); }} src={url} playsInline preload="metadata" aria-label={label} onLoadedMetadata={(event) => { if (Number.isFinite(event.currentTarget.duration)) onDuration(side, index, event.currentTarget, event.currentTarget.duration, mediaIdentity); }} onTimeUpdate={(event) => { if (index === 0) onTimeUpdate(side, event.currentTarget, mediaIdentity); }} onPlay={(event) => { if (index === 0) onPlay(side, event.currentTarget, mediaIdentity); }} onPause={(event) => { if (index === 0) onPause(side, event.currentTarget, mediaIdentity); }} onEnded={(event) => { if (index === 0) onEnded(side, event.currentTarget, mediaIdentity); }} onError={() => undefined} />}
-      {current?.localUrl && <small className="compare-local-badge"><Check size={11} />本機保存</small>}
-      <div className="compare-output-handoff"><button type="button" data-testid={`compare-timeline-${side}-${index}`} className="secondary-button" disabled={!eligibility.ok || pendingHandoff || !onUseInTimeline} onClick={useInTimeline}>在時間軸使用</button>{!eligibility.ok && <small role="status">{eligibility.reason}</small>}</div>
+      {localUrl && <small className="compare-local-badge"><Check size={11} />本機保存</small>}
+      <div className="compare-output-actions">
+        <button type="button" data-testid={`compare-save-${side}-${index}`} aria-label={`保存比較輸出 ${side} ${index}`} className="asset-save-button" disabled={!saveEligibility.ok || hasSavedLocal || saveState?.status === 'saving'} onClick={saveOutput}>{saveState?.status === 'saving' ? <LoaderCircle className="spin" size={13} /> : saveState?.status === 'failed' ? <RefreshCw size={13} /> : hasSavedLocal ? <Check size={13} /> : <Save size={13} />}{saveState?.status === 'saving' ? '保存中' : saveState?.status === 'failed' ? '重試保存' : hasSavedLocal ? '已保存本機' : '保存本機'}</button>
+        {localUrl && extension && <a className="asset-download-button" data-testid={`compare-download-${side}-${index}`} aria-label={`下載比較輸出 ${side} ${index}`} href={localUrl} download={`relay-${side}-${index}.${extension}`}><Download size={13} />下載</a>}
+        <button type="button" data-testid={`compare-timeline-${side}-${index}`} className="secondary-button" disabled={!timelineEligibility.ok || pendingHandoff || !onUseInTimeline} onClick={useInTimeline}>在時間軸使用</button>
+      </div>
+      {!saveEligibility.ok && <small className="compare-save-reason" role="status">{saveEligibility.reason}</small>}
+      {saveState?.status === 'failed' && <small className="compare-save-reason" role="status">{saveState.message ?? '保存失敗，請重試。'}</small>}
+      {!timelineEligibility.ok && <small className="compare-save-reason" role="status">{timelineEligibility.reason}</small>}
     </div>;
   })}</div>;
 }
@@ -152,7 +221,7 @@ function RunMeta({ run, nodeId, result }: { run: Run; nodeId: string; result?: C
   return <div className="compare-meta-grid"><div><span>STATUS</span><strong>{statusLabel(result?.status ?? run.status)}</strong></div><div><span>RUN STARTED</span><strong>{formatTime(run.startedAt)}</strong></div><div><span>CANVAS REV</span><strong>{run.revision}</strong></div><div><span>PROVIDER</span><strong>{providerId}</strong></div><div><span>MODEL</span><strong>{model}</strong></div><div className="compare-meta-wide"><span>PROMPT</span><p>{node?.data.prompt || '—'}</p></div><div className="compare-meta-wide"><span>PARAMS</span><pre>{paramsText(node?.data.params)}</pre></div></div>;
 }
 
-export default function RunCompare({ boardId, runs, requestJson, onClose, onUseInTimeline }: RunCompareProps) {
+export default function RunCompare({ boardId, runs, requestJson, assetSaveStates, onSaveAsset, onClose, onUseInTimeline }: RunCompareProps) {
   const dialogRef = useModalFocus<HTMLElement>();
   const boardRuns = useMemo(() => runs.filter((run) => run.boardId === boardId), [boardId, runs]);
   const [leftId, setLeftId] = useState('');
@@ -401,12 +470,12 @@ export default function RunCompare({ boardId, runs, requestJson, onClose, onUseI
   }, [onUseInTimeline, pendingHandoff]);
 
   return <div className="dialog-scrim compare-scrim" role="presentation"><section ref={dialogRef} className="compare-dialog" data-testid="compare-dialog" role="dialog" aria-modal="true" aria-labelledby="compare-title">
-    <header className="compare-dialog-head"><div><span className="panel-eyebrow">READ ONLY / v0.5.0</span><h2 id="compare-title">Compare generation runs</h2><p>只讀查看同一 board 的 immutable run；不會重畫 canvas 或觸發 generation。</p></div><button className="icon-button" data-modal-close data-testid="compare-close" aria-label="關閉版本比較" onClick={onClose}><X size={17} /></button></header>
+    <header className="compare-dialog-head"><div><span className="panel-eyebrow">VERSIONS / v0.6.0</span><h2 id="compare-title">Compare generation runs</h2><p>比較同一畫布的生成版本，保存選中的素材，再送入時間軸剪輯。</p></div><button className="icon-button" data-modal-close data-testid="compare-close" aria-label="關閉版本比較" onClick={onClose}><X size={17} /></button></header>
     <div className="compare-selectors"><label><span>Run A</span><select data-testid="compare-left-run" aria-label="選擇 Run A" value={leftId} onChange={(event) => setLeftId(event.target.value)}><option value="">選擇 terminal run</option>{boardRuns.map((run) => <option key={run.id} value={run.id} disabled={!terminalStatuses.has(run.status)}>{run.id.slice(0, 12)} · rev {run.revision} · {statusLabel(run.status)}{terminalStatuses.has(run.status) ? '' : ' · active'}</option>)}</select></label><ChevronDown size={15} className="compare-selector-arrow" /><label><span>Run B</span><select data-testid="compare-right-run" aria-label="選擇 Run B" value={rightId} onChange={(event) => setRightId(event.target.value)}><option value="">選擇 terminal run</option>{boardRuns.map((run) => <option key={run.id} value={run.id} disabled={!terminalStatuses.has(run.status) || run.id === leftId}>{run.id.slice(0, 12)} · rev {run.revision} · {statusLabel(run.status)}{terminalStatuses.has(run.status) ? '' : ' · active'}</option>)}</select></label><label><span>Node</span><select data-testid="compare-node" aria-label="選擇比較節點" value={nodeId} onChange={(event) => setNodeId(event.target.value)} disabled={!nodeIds.length}><option value="">選擇 node</option>{nodeIds.map((id) => <option key={id} value={id}>{id}</option>)}</select></label></div>
     {loading ? <div className="compare-state"><LoaderCircle className="spin" size={22} /><strong>讀取 comparison…</strong></div> : error ? <div className="compare-state is-error" role="alert"><AlertCircle size={19} /><strong>無法比較這兩筆 run</strong><p>{error}</p><button className="secondary-button" onClick={() => void fetchComparison()}><RefreshCw size={14} />重試</button></div> : !comparison || !leftRun || !rightRun ? <div className="compare-state"><AlertCircle size={20} /><strong>請選擇兩筆不同的 terminal run</strong><p>pending / submitting / running 會被保留在清單中，但 API 會拒絕 active comparison。</p></div> : <>
       <div className="compare-summary"><span>A · rev {leftRun.revision} · {statusLabel(leftRun.status)} · {formatTime(leftRun.startedAt)}</span><span>↔</span><span>B · rev {rightRun.revision} · {statusLabel(rightRun.status)} · {formatTime(rightRun.startedAt)}</span></div>
       <div className="compare-differences" data-testid="compare-differences"><span className="panel-eyebrow">DIFFERENCES</span>{comparison.differences.length ? comparison.differences.map((difference) => <button className={difference.nodeId === nodeId ? 'is-active' : ''} key={difference.nodeId} onClick={() => setNodeId(difference.nodeId)}><strong>{difference.nodeId}</strong><span>{difference.fields.join(' · ')}</span></button>) : <p><Check size={13} />這兩筆 run 沒有可見差異。</p>}</div>
-      <div className="compare-columns"><article className="compare-side compare-side-a"><div className="compare-side-heading"><span className="compare-run-letter">A</span><div><strong>{leftRun.id.slice(0, 12)}</strong><small>{statusLabel(leftRun.status)} · revision {leftRun.revision}</small></div></div><RunMeta run={leftRun} nodeId={nodeId} result={leftResult} /><Output boardId={boardId} runId={leftRun.id} nodeId={nodeId} result={leftResult} currentRuns={runs} side="left" mediaIdentity={mediaIdentity} startedAt={leftRun.startedAt} durationByArtifact={durationByArtifact} pendingHandoff={pendingHandoff} onUseInTimeline={requestHandoff} onVideo={setVideo} onDuration={setDuration} onTimeUpdate={handleTimeUpdate} onPlay={handlePlay} onPause={handlePause} onEnded={handleEnded} /></article><article className="compare-side compare-side-b"><div className="compare-side-heading"><span className="compare-run-letter">B</span><div><strong>{rightRun.id.slice(0, 12)}</strong><small>{statusLabel(rightRun.status)} · revision {rightRun.revision}</small></div></div><RunMeta run={rightRun} nodeId={nodeId} result={rightResult} /><Output boardId={boardId} runId={rightRun.id} nodeId={nodeId} result={rightResult} currentRuns={runs} side="right" mediaIdentity={mediaIdentity} startedAt={rightRun.startedAt} durationByArtifact={durationByArtifact} pendingHandoff={pendingHandoff} onUseInTimeline={requestHandoff} onVideo={setVideo} onDuration={setDuration} onTimeUpdate={handleTimeUpdate} onPlay={handlePlay} onPause={handlePause} onEnded={handleEnded} /></article></div>
+      <div className="compare-columns"><article className="compare-side compare-side-a"><div className="compare-side-heading"><span className="compare-run-letter">A</span><div><strong>{leftRun.id.slice(0, 12)}</strong><small>{statusLabel(leftRun.status)} · revision {leftRun.revision}</small></div></div><RunMeta run={leftRun} nodeId={nodeId} result={leftResult} /><Output boardId={boardId} runId={leftRun.id} nodeId={nodeId} result={leftResult} currentRuns={runs} side="left" mediaIdentity={mediaIdentity} startedAt={leftRun.startedAt} durationByArtifact={durationByArtifact} assetSaveStates={assetSaveStates} pendingHandoff={pendingHandoff} onSaveAsset={onSaveAsset} onUseInTimeline={requestHandoff} onVideo={setVideo} onDuration={setDuration} onTimeUpdate={handleTimeUpdate} onPlay={handlePlay} onPause={handlePause} onEnded={handleEnded} /></article><article className="compare-side compare-side-b"><div className="compare-side-heading"><span className="compare-run-letter">B</span><div><strong>{rightRun.id.slice(0, 12)}</strong><small>{statusLabel(rightRun.status)} · revision {rightRun.revision}</small></div></div><RunMeta run={rightRun} nodeId={nodeId} result={rightResult} /><Output boardId={boardId} runId={rightRun.id} nodeId={nodeId} result={rightResult} currentRuns={runs} side="right" mediaIdentity={mediaIdentity} startedAt={rightRun.startedAt} durationByArtifact={durationByArtifact} assetSaveStates={assetSaveStates} pendingHandoff={pendingHandoff} onSaveAsset={onSaveAsset} onUseInTimeline={requestHandoff} onVideo={setVideo} onDuration={setDuration} onTimeUpdate={handleTimeUpdate} onPlay={handlePlay} onPause={handlePause} onEnded={handleEnded} /></article></div>
       <div className="compare-video-controls"><button className="primary-button" data-testid="compare-play" onClick={togglePlay}><span>{playing ? <Pause size={14} /> : <Play size={14} fill="currentColor" />}</span>{playing ? 'Pause videos' : 'Play videos'}</button><input data-testid="compare-scrub" aria-label="比較影片播放位置" type="range" min="0" max={Math.max(durations.left, durations.right, 0.01)} step="0.01" value={Math.min(currentTime, Math.max(durations.left, durations.right, 0.01))} onChange={(event) => seek(Number(event.target.value))} /><span>{currentTime.toFixed(2)}s</span>{durations.left !== durations.right && (durations.left || durations.right) > 0 && <small>不同長度：A {durations.left.toFixed(2)}s / B {durations.right.toFixed(2)}s</small>}</div>
       <div className="compare-dialog-foot"><span>prompt、provider/model、params 與 outputs 皆依選定 run/node exact identity 顯示。</span><button className="ghost-button" onClick={onClose}>Close</button></div>
     </>}

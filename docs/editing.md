@@ -29,13 +29,17 @@
 
 搜尋、分頁、選取與預覽均不會保存素材、讀取伺服器影片資訊、加入片段、匯出或呼叫生成。只有明確按「加入」或「保存並加入」才執行原有的保存與資訊讀取流程；遠端來源能否播放仍取決於連結有效性與瀏覽器支援。
 
-## A/B 比較
+## A/B 比較、保存與下載
 
 選擇同一畫布兩個已結束執行版本，再選節點，並排看完整提示詞、模型、provider、參數、狀態和對應產物。兩側影片可一起播放、暫停與定位，長度不同時各自限制在來源範圍。缺少節點或產物會明確顯示，不會代換成另一個版本。
 
-比較是唯讀操作。尚在執行的 run 不可進入比較；新增本機保存資訊不會改變 canonical 生成比較內容。畫面可優先使用目前該版本已保存的本機檔案，因此來源網址過期後仍可預覽。
+載入與瀏覽比較不會改寫生成內容。尚在執行的 run 不可進入比較；明確保存素材新增的本機資訊不會改變 canonical 生成比較內容。畫面可優先使用目前該版本已保存的本機檔案，因此來源網址過期後仍可預覽。
+
+圖片與影片的每個成功輸出都可在 Compare 內按「保存」保存當下精確版本，再按「下載」取得同一個本機來源。保存與錯誤狀態以 `{runId,nodeId,artifactIndex}` 鎖定；切換 A/B、切換節點、關閉視窗或載入另一個 board 時，延遲回應不能套到另一個輸出。保存失敗保留選取與草稿，提供同一身份的重試，不重新生成。下載只使用目前已保存且 canonical kind／URL 完全相符的本機檔案，副檔名依實際 MIME 判定，不轉送 provider credentials。
 
 每個成功影片輸出可按「在時間軸使用」，將選中的版本、節點與該輸出帶入時間軸。這一步只選取來源；按「加入」或「保存並加入」才會讀取影片資訊、保存素材或加入片段。來源會顯示執行時間、節點和輸出序號；比較畫面已讀到影片 metadata 時也會顯示時長，否則標示未知。
+
+實際工作順序是：在 Compare 選定 image 或 video 版本 → 對 video 按「在時間軸使用」→ 明確保存並加入 → 在 Timeline 調整裁切與順序 → 保存 timeline → 匯出橫式或直式 MP4 → 從本機下載。圖片可以保存與下載，但不能加入 Timeline。每一步都保留來源的 run、node 與 artifact index，避免用顯示上的 fallback URL 代替使用者選取的版本。
 
 歷史版本或已從目前畫布刪除的節點仍可使用，但執行與節點結果必須成功，且目前素材必須與比較中選到的內容一致。來源消失或改變時會保留原選擇並說明無法使用，不會代換另一段影片。手動改選優先於後續重新整理；關閉後重開不會重放舊選擇。時間軸與比較一次只開啟一個，避免蓋掉尚未保存的剪輯。
 
@@ -44,6 +48,12 @@
 MCP 的 `save_artifact`、`get_artifact_info` 使用 `{runId,nodeId,artifactIndex}`；index 為 0..99 整數。取得來源後以 `read_timeline` 讀取 revision，`update_timeline` 只傳 clip identity／來源 identity／入出點與 format，再以 `export_timeline` 提交。未知的提交結果重用同一 operationId 查回原匯出；不要換 id 盲目重送。`get_export`／`cancel_export` 使用 exportId；`compare_runs` 使用 boardId、left 和 right runId。
 
 所有新 API 維持 session token／exact Origin／Host 邊界：timeline GET／PUT 位於 `/api/boards/:id/timeline`，export POST 位於 `/api/boards/:id/exports`，狀態／取消為 `/api/exports/:id` 與 `/api/exports/:id/cancel`。比較為 `/api/boards/:id/compare?left=...&right=...`，來源資訊為 `/api/runs/:runId/artifacts/:nodeId/:index/info`。呼叫端不能傳入任意檔案路徑、下載網址、FFmpeg 參數或 credential。
+
+## 輸出驗證與保存可靠性
+
+Provider 回傳成功前必須有 1 至 100 個 artifacts，並逐一驗證每個 artifact 的 kind 與媒體 URL allowlist；任一項錯誤就整批失敗，不會保存部分結果，也不會讓下游節點開始。remote artifact 不能藉由 `demo` 標記取得 Demo 本機路徑權限。這些規則同時保護 Compare、保存與後續影片參考。
+
+保存本機素材時，server 只接受 identity，不接受呼叫端自帶 URL。請求開始、排隊工作開始與 durable commit 會重新比對 canonical kind、URL、run 與結果狀態；來源在保存期間改變就回傳 conflict，保留新來源與既有已引用檔案，不覆寫成舊版本。這讓 Compare 的延遲保存與 Timeline 的明確加入可以安全重試，而不會因回應順序造成版本倒退。
 
 ## 升級與限制
 

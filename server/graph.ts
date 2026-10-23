@@ -1,4 +1,5 @@
 import type { Board, CanvasNode, ExecutionPlan, Provider } from '../src/shared/types.js';
+import { providerSupportsKind } from '../src/shared/provider-capabilities.js';
 
 export class AppError extends Error {
   constructor(public code: string, message: string, public status = 400) { super(message); }
@@ -51,12 +52,12 @@ export function plan(board: Board, providers: Provider[], selected?: string): Ex
   for (const id of result.order) {
     const node = board.nodes.find(n => n.id === id)!;
     if (node.data.kind === 'asset' && !node.data.assetUrl) result.errors.push(`${node.data.label}：請加入素材 URL。`);
-    if (!['image', 'video'].includes(node.data.kind)) continue;
+    if (node.data.kind !== 'image' && node.data.kind !== 'video') continue;
     const provider = providers.find(p => p.id === node.data.providerId);
     if (!provider) { result.errors.push(`${node.data.label}：請選擇供應商。`); continue; }
     const model = modelFor(node, provider);
     if (!model) result.errors.push(`${node.data.label}：請設定模型。`);
-    if (node.data.kind === 'video' && provider.protocol === 'openai') result.errors.push(`${provider.name} 首版僅支援圖片。`);
+    if (!providerSupportsKind(provider.protocol, node.data.kind)) result.errors.push(`${provider.name} 不支援${node.data.kind === 'image' ? '圖片' : '影片'}生成。`);
     if (provider.protocol !== 'demo' && !provider.baseUrl) result.errors.push(`${provider.name}：請設定 Base URL。`);
     const inputText = board.edges.some(e => e.target === id && board.nodes.find(n => n.id === e.source)?.data.kind === 'prompt');
     if (!node.data.prompt?.trim() && !inputText) result.errors.push(`${node.data.label}：缺少提示詞。`);

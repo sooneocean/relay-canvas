@@ -1,6 +1,6 @@
 {
   "name": "relay-canvas",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A local-first React Flow image and video canvas with a Codex MCP control surface.",
   "private": true,
   "type": "module",
@@ -14,7 +14,7 @@
     "build": "vite build && tsc -p tsconfig.server.json",
     "test": "tsx --test tests/*.test.ts",
     "test:release": "node --test scripts/release-gate.test.mjs",
-    "smoke": "tsx scripts/smoke.ts && tsx scripts/editor-smoke.ts",
+    "smoke": "tsx scripts/smoke.ts && tsx scripts/editor-smoke.ts && tsx scripts/relay-flow-smoke.ts",
     "package:release": "node scripts/package-release.mjs",
     "smoke:package": "node scripts/package-smoke.mjs"
   },

@@ -170,7 +170,7 @@ const boardSchema = z.object({
 const providerSchema = z.object({
   id: idSchema,
   name: shortText,
-  protocol: z.enum(['demo', 'openai', 'videos', 'fal', 'replicate']),
+  protocol: z.enum(['demo', 'openai', 'videos', 'relay', 'fal', 'replicate']),
   baseUrl: z.string().max(4096),
   keyEnv: z.union([z.literal(''), z.string().max(74).regex(KEY_ENV)]),
   imageModel: modelSchema,
