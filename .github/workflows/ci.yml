@@ -18,12 +18,77 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Use the primary Ubuntu archive mirror
+        run: |
+          sudo python3 - <<'PY'
+          import os
+          import re
+          import stat
+
+          paths = (
+              "/etc/apt/sources.list",
+              "/etc/apt/sources.list.d/ubuntu.sources",
+              "/etc/apt/apt-mirrors.txt",
+              "/etc/apt/apt-security-mirrors.txt",
+          )
+          pattern = re.compile(
+              r"(?<!\S)https?://azure\.archive\.ubuntu\.com/ubuntu(/?)(?=\s|$)"
+          )
+          replacement = r"https://archive.ubuntu.com/ubuntu\1"
+
+          def rewrite_file(path, expected_uid=0):
+              initial = os.lstat(path)
+              if (
+                  not stat.S_ISREG(initial.st_mode)
+                  or initial.st_uid != expected_uid
+              ):
+                  raise RuntimeError(f"refusing unexpected apt source file: {path}")
+
+              flags = os.O_RDWR | os.O_NOFOLLOW
+              fd = os.open(path, flags)
+              try:
+                  metadata = os.fstat(fd)
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or metadata.st_uid != expected_uid
+                      or metadata.st_dev != initial.st_dev
+                      or metadata.st_ino != initial.st_ino
+                  ):
+                      raise RuntimeError(f"refusing unexpected apt source file: {path}")
+
+                  with os.fdopen(fd, "r+", encoding="utf-8", newline="") as source:
+                      fd = -1
+                      original = source.read()
+                      rewritten, count = pattern.subn(replacement, original)
+                      if count:
+                          source.seek(0)
+                          source.write(rewritten)
+                          source.truncate()
+                          source.flush()
+                          os.fsync(source.fileno())
+                      return count
+              finally:
+                  if fd >= 0:
+                      os.close(fd)
+
+          changed_tokens = 0
+          for path in paths:
+              if not os.path.lexists(path):
+                  continue
+              changed_tokens += rewrite_file(path)
+
+          print(f"Ubuntu archive mirror tokens rewritten: {changed_tokens}")
+          PY
+      - name: Install FFmpeg system dependency
+        timeout-minutes: 6
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: npm run check
       - run: npm test
       - run: npm run test:release
       - run: npm run build
-      - run: npx playwright install --with-deps chromium
+      - name: Install Playwright Chromium and system dependencies
+        timeout-minutes: 6
+        run: npx playwright install --with-deps chromium
       - run: npm run smoke
       - run: npm run package:release
       - run: npm run smoke:package
