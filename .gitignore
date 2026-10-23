@@ -10,5 +10,6 @@ release/
 test-results/
 playwright-report/
 .playwright-cli/
+.worktrees/
 *.log
 .DS_Store
