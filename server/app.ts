@@ -1,6 +1,6 @@
 import express, { type ErrorRequestHandler } from 'express';
 import path from 'node:path';
-import { createReadStream } from 'node:fs';
+import { createReadStream, read } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { createBoundary, validateBaseUrl, validateMediaUrl } from './security.js';
 import { CanvasService } from './service.js';
@@ -93,14 +93,32 @@ export function createApp(service: CanvasService, origin: string, token = random
     }
     res.setHeader('Content-Length', String(end - start + 1));
     if (req.method === 'HEAD') { service.media.releaseFile(located.fd); res.end(); return; }
-    const stream = createReadStream(located.file, { fd: located.fd, autoClose: false, start, end });
-    let released = false;
-    const release = () => { if (!released) { released = true; service.media.releaseFile(located.fd); } };
-    const cleanup = () => { stream.destroy(); release(); };
+    let ownsLease = true;
+    const releaseLease = () => {
+      if (!ownsLease) return;
+      ownsLease = false;
+      service.media.releaseFile(located.fd);
+    };
+    let stream: ReturnType<typeof createReadStream>;
+    try {
+      stream = createReadStream(located.file, {
+        fd: located.fd,
+        autoClose: true,
+        start,
+        end,
+        fs: {
+          read,
+          close: (_fd, callback) => { releaseLease(); callback(null); },
+        },
+      });
+    } catch (error) {
+      releaseLease();
+      throw error;
+    }
+    const cleanup = () => { stream.destroy(); };
     res.once('close', cleanup);
-    stream.once('end', release);
-    stream.once('close', () => { res.off('close', cleanup); release(); });
-    stream.on('error', () => { release(); res.destroy(); }).pipe(res);
+    stream.once('close', () => { res.off('close', cleanup); });
+    stream.on('error', () => { res.destroy(); }).pipe(res);
   };
   app.head('/api/media/:localId', sendMedia);
   app.get('/api/media/:localId', sendMedia);

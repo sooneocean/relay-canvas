@@ -30,6 +30,6 @@ First deliver v0.4's requested editing/comparison/export journey and release it 
 
 ## Observed next creator friction
 
-A read-only v0.4 code walkthrough found that choosing a good version in Compare did not carry its exact artifact selection into Timeline. RC-HANDOFF-01 now implements this explicit selection flow, verified on Chrome155 and independently on Chromium156 with real historical index1 Add/read-back. The eighth round is recorded in the ledger; it is an unreleased change after the published v0.4.0. See [acceptance evidence](compare-handoff-review.md).
+A read-only v0.4 code walkthrough found that choosing a good version in Compare did not carry its exact artifact selection into Timeline. RC-HANDOFF-01 implements this explicit selection flow, verified locally on Chrome155 and independently on Chromium156 with real historical index1 Add/read-back. Ubuntu integration exposed a media stream FD ownership defect and reopened acceptance; the eighth candidate is in the ledger's pending rounds until repaired integration passes. Completed count remains 7. See [acceptance evidence](compare-handoff-review.md).
 
 `src/ui/TimelineEditor.tsx` still uses a dense dropdown with node, output ordinal, time and shortened run ID, and adds one selected source at a time. The next unimplemented candidate is a browsable, searchable source list with previews for efficient multi-version selection. It is not a completed round or an inferred competitor feature.

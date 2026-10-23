@@ -59,7 +59,9 @@
       "result": "Byte-exact pre-v0.4 workspace backup, capped additive persisted schemas, independent timeline CAS and dirty/focus/navigation guards",
       "evidence": ["tests/v04.test.ts: exact v0.3 bytes preserved and failed durable creation starts zero workers", "scripts/editor-smoke.ts: concurrent edit/save, 409 conflict, controlled 500, deliberate reload, modal focus and persistence"],
       "limits": "Upgrade still requires a full workspace/media backup; downgrade uses a separate restored copy"
-    },
+    }
+  ],
+  "pendingRounds": [
     {
       "round": 8,
       "milestone": "Unreleased after v0.4.0",
@@ -70,7 +72,7 @@
     }
   ],
   "currentMilestone": "post-v0.4.0",
-  "milestoneStatus": "verified-unreleased",
+  "milestoneStatus": "awaiting-repaired-main-ci",
   "verifiedOn": "2026-10-23",
   "nextCandidates": ["recognizable-video-source-browser"],
   "goalComplete": false
