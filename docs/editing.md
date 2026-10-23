@@ -27,6 +27,10 @@
 
 比較是唯讀操作。尚在執行的 run 不可進入比較；新增本機保存資訊不會改變 canonical 生成比較內容。畫面可優先使用目前該版本已保存的本機檔案，因此來源網址過期後仍可預覽。
 
+每個成功影片輸出可按「在時間軸使用」，將選中的版本、節點與該輸出帶入時間軸。這一步只選取來源；按「加入」或「保存並加入」才會讀取影片資訊、保存素材或加入片段。來源會顯示執行時間、節點和輸出序號；比較畫面已讀到影片 metadata 時也會顯示時長，否則標示未知。
+
+歷史版本或已從目前畫布刪除的節點仍可使用，但執行與節點結果必須成功，且目前素材必須與比較中選到的內容一致。來源消失或改變時會保留原選擇並說明無法使用，不會代換另一段影片。手動改選優先於後續重新整理；關閉後重開不會重放舊選擇。時間軸與比較一次只開啟一個，避免蓋掉尚未保存的剪輯。
+
 ## Codex 與 API
 
 MCP 的 `save_artifact`、`get_artifact_info` 使用 `{runId,nodeId,artifactIndex}`；index 為 0..99 整數。取得來源後以 `read_timeline` 讀取 revision，`update_timeline` 只傳 clip identity／來源 identity／入出點與 format，再以 `export_timeline` 提交。未知的提交結果重用同一 operationId 查回原匯出；不要換 id 盲目重送。`get_export`／`cancel_export` 使用 exportId；`compare_runs` 使用 boardId、left 和 right runId。

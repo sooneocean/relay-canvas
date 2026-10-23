@@ -94,7 +94,7 @@ import type {
 import { parseBoard } from '../shared/schema.js';
 import { deriveAssets, deriveProjects, type AssetItem, type ProjectCard } from './catalog.js';
 import RunCompare from './RunCompare.js';
-import TimelineEditor, { type SaveArtifact, type UiRequest } from './TimelineEditor.js';
+import TimelineEditor, { validateTimelineHandoff, type SaveArtifact, type TimelineHandoffIntent, type UiRequest } from './TimelineEditor.js';
 
 type FlowNode = Node<CanvasData & { previewUrl?: string; runStatus?: Status; runError?: string }, 'canvas'>;
 type FlowEdge = Edge;
@@ -407,6 +407,7 @@ function AppShell() {
   const [providersSaving, setProvidersSaving] = useState(false);
   const [timelineOpen, setTimelineOpen] = useState(false);
   const [compareOpen, setCompareOpen] = useState(false);
+  const [handoffIntent, setHandoffIntent] = useState<TimelineHandoffIntent>();
   const [assetSaveStates, setAssetSaveStates] = useState<Record<string, AssetSaveState>>({});
   const [conflict, setConflict] = useState<BoardConflict>();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -427,6 +428,10 @@ function AppShell() {
   const pendingCreateKindRef = useRef<CanvasData['kind'] | undefined>(undefined);
   const pendingNodeIdRef = useRef<string | undefined>(undefined);
   const navigationGuardRef = useRef<Promise<boolean> | null>(null);
+  const runsRef = useRef(runs);
+  const timelineOpenRef = useRef(timelineOpen);
+  const handoffIntentRef = useRef<TimelineHandoffIntent | undefined>(undefined);
+  const handoffClaimRef = useRef<string | undefined>(undefined);
 
   const activeBoard = useMemo(() => boards.find((board) => board.id === activeBoardId) ?? boards[0], [activeBoardId, boards]);
   const selectedNode = useMemo(() => nodes.find((node) => node.id === selectedNodeId), [nodes, selectedNodeId]);
@@ -451,6 +456,9 @@ function AppShell() {
   useEffect(() => { boardsRef.current = boards; }, [boards]);
   useEffect(() => { providersRef.current = providers; }, [providers]);
   useEffect(() => { providerDraftIdRef.current = providerDraftId; }, [providerDraftId]);
+  useEffect(() => { runsRef.current = runs; }, [runs]);
+  useEffect(() => { timelineOpenRef.current = timelineOpen; }, [timelineOpen]);
+  useEffect(() => { handoffIntentRef.current = handoffIntent; }, [handoffIntent]);
 
   const notify = useCallback((message: string, tone: 'info' | 'error' | 'success' = 'info') => {
     setToast({ message, tone });
@@ -806,6 +814,79 @@ function AppShell() {
       if (navigationGuardRef.current === operation) navigationGuardRef.current = null;
     }
   }, [conflict, notify, saveBoard]);
+
+  const clearHandoffIntent = useCallback((token?: string) => {
+    if (token && handoffIntentRef.current?.token !== token) return;
+    handoffIntentRef.current = undefined;
+    setHandoffIntent(undefined);
+  }, []);
+
+  const handoffToTimeline = useCallback(async (intent: TimelineHandoffIntent): Promise<boolean> => {
+    if (timelineOpenRef.current) {
+      notify('時間軸已開啟；請先關閉目前的時間軸，再從 Compare 選擇來源。', 'error');
+      return false;
+    }
+    if (navigationGuardRef.current || handoffClaimRef.current) {
+      notify('目前正在保存或切換畫面，請稍候再選擇來源。', 'info');
+      return false;
+    }
+    if (intent.originBoardId !== activeBoardIdRef.current) {
+      notify('來源不屬於目前畫布，無法交接到時間軸。', 'error');
+      return false;
+    }
+    const clickedValidation = validateTimelineHandoff(intent, activeBoardIdRef.current, runsRef.current);
+    if (!clickedValidation.ok) {
+      notify(`無法使用這份影片：${clickedValidation.reason}`, 'error');
+      return false;
+    }
+
+    handoffClaimRef.current = intent.token;
+    handoffIntentRef.current = intent;
+    setHandoffIntent(intent);
+    let committed = false;
+    try {
+      const guarded = await guardNavigation(() => {
+        if (handoffClaimRef.current !== intent.token || handoffIntentRef.current?.token !== intent.token) return;
+        if (timelineOpenRef.current) {
+          notify('時間軸已開啟；這次來源交接已取消。', 'error');
+          return;
+        }
+        const completedValidation = validateTimelineHandoff(intent, activeBoardIdRef.current, runsRef.current);
+        if (intent.originBoardId !== activeBoardIdRef.current) {
+          notify('來源不屬於目前畫布，無法交接到時間軸。', 'error');
+          return;
+        }
+        if (!completedValidation.ok) notify(`來源在切換期間已無法使用：${completedValidation.reason}`, 'info');
+        committed = true;
+        setCompareOpen(false);
+        setTimelineOpen(true);
+      }, '開啟時間軸');
+      if (!guarded || !committed) {
+        clearHandoffIntent(intent.token);
+        return false;
+      }
+      return true;
+    } finally {
+      if (handoffClaimRef.current === intent.token) handoffClaimRef.current = undefined;
+      if (!committed) clearHandoffIntent(intent.token);
+    }
+  }, [clearHandoffIntent, guardNavigation, notify]);
+
+  const openTimeline = useCallback(() => {
+    if (compareOpen) {
+      notify('Compare 已開啟；請先關閉 Compare，再開啟時間軸。', 'error');
+      return;
+    }
+    setTimelineOpen(true);
+  }, [compareOpen, notify]);
+
+  const openCompare = useCallback(() => {
+    if (timelineOpen) {
+      notify('時間軸已開啟；請先關閉時間軸，再開啟 Compare。', 'error');
+      return;
+    }
+    setCompareOpen(true);
+  }, [notify, timelineOpen]);
 
   const createBoard = useCallback(async (kind?: CanvasData['kind']) => {
     if (!await guardNavigation(() => undefined, '建立新專案')) return;
@@ -1332,8 +1413,8 @@ function AppShell() {
             </div>
             <div className="canvas-toolbar-actions">
               <button className="toolbar-button" onClick={() => void validateBoard(selectedNodeId)}><Check size={14} />Validate</button>
-              <button className="toolbar-button" data-testid="timeline-open" onClick={() => setTimelineOpen(true)}><Scissors size={14} />Timeline</button>
-              <button className="toolbar-button" data-testid="compare-open" onClick={() => setCompareOpen(true)}><GitCompareArrows size={14} />Compare</button>
+              <button className="toolbar-button" data-testid="timeline-open" onClick={openTimeline}><Scissors size={14} />Timeline</button>
+              <button className="toolbar-button" data-testid="compare-open" onClick={openCompare}><GitCompareArrows size={14} />Compare</button>
               <button className="toolbar-button" aria-label="export-board" onClick={exportBoard}><Download size={14} />Export</button>
               <button className="toolbar-button" aria-label="import-board" onClick={() => fileInputRef.current?.click()}><Upload size={14} />Import</button>
               <input ref={fileInputRef} type="file" accept="application/json,.json" onChange={(event) => void importBoard(event)} hidden />
@@ -1388,8 +1469,8 @@ function AppShell() {
 
       {toast && <div className={`toast toast-${toast.tone}`} role="status"><span className="toast-icon">{toast.tone === 'success' ? <Check size={15} /> : toast.tone === 'error' ? <AlertCircle size={15} /> : <Info size={15} />}</span>{toast.message}<button onClick={() => setToast(undefined)} aria-label="close-message"><X size={14} /></button></div>}
 
-      {timelineOpen && activeBoard && <TimelineEditor board={activeBoard} runs={runs} exports={exports} requestJson={requestJson as UiRequest} onSaveArtifact={saveAsset as SaveArtifact} onExportJob={(job) => setExports((current) => [job, ...current.filter((candidate) => candidate.id !== job.id)])} onClose={() => setTimelineOpen(false)} />}
-      {compareOpen && activeBoard && <RunCompare boardId={activeBoard.id} runs={runs} requestJson={requestJson as UiRequest} onClose={() => setCompareOpen(false)} />}
+      {timelineOpen && activeBoard && <TimelineEditor board={activeBoard} runs={runs} exports={exports} requestJson={requestJson as UiRequest} onSaveArtifact={saveAsset as SaveArtifact} onExportJob={(job) => setExports((current) => [job, ...current.filter((candidate) => candidate.id !== job.id)])} handoffIntent={handoffIntent} onHandoffConsumed={clearHandoffIntent} onClose={() => { setTimelineOpen(false); clearHandoffIntent(); }} />}
+      {compareOpen && activeBoard && <RunCompare boardId={activeBoard.id} runs={runs} requestJson={requestJson as UiRequest} onUseInTimeline={handoffToTimeline} onClose={() => { setCompareOpen(false); clearHandoffIntent(); }} />}
       {confirmRun && <RunConfirmDialog confirm={confirmRun} providers={providers} onCancel={() => setConfirmRun(undefined)} onConfirm={() => void startRun(confirmRun.nodeId, true, confirmRun.operationId)} />}
     </div>
   );

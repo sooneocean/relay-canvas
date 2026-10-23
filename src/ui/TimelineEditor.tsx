@@ -33,6 +33,7 @@ import type {
   Artifact,
   ArtifactInfo,
   Board,
+  ClipSource,
   EditorCapabilities,
   ExportJob,
   Run,
@@ -45,6 +46,47 @@ import useModalFocus from './useModalFocus.js';
 export type UiRequest = <T>(path: string, init?: RequestInit) => Promise<T>;
 export type SaveArtifact = (runId: string, nodeId: string, artifactIndex: number) => Promise<Artifact | undefined>;
 
+export type TimelineHandoffIntent = {
+  token: string;
+  originBoardId: string;
+  source: ClipSource;
+  canonical: { kind: Artifact['kind']; url: string };
+};
+
+export type TimelineHandoffValidation =
+  | { ok: true; run: Run; artifact: Artifact }
+  | { ok: false; reason: string };
+
+/**
+ * Compare and Timeline both use the current in-memory run catalog as the
+ * authority.  The comparison response is only the canonical identity that
+ * the user selected; it cannot make an absent or changed live artifact
+ * eligible by itself.
+ */
+export function validateTimelineHandoff(intent: TimelineHandoffIntent, boardId: string, runs: Run[]): TimelineHandoffValidation {
+  if (intent.originBoardId !== boardId) return { ok: false, reason: '這份來源屬於另一張畫布，無法交接。' };
+  const { runId, nodeId, artifactIndex } = intent.source;
+  if (!Number.isInteger(artifactIndex) || artifactIndex < 0 || artifactIndex > 99) {
+    return { ok: false, reason: '輸出索引無效，請重新選擇影片。' };
+  }
+  if (intent.canonical.kind !== 'video' || !intent.canonical.url) {
+    return { ok: false, reason: '這份輸出不是可加入時間軸的影片。' };
+  }
+  const run = runs.find((candidate) => candidate.id === runId && candidate.boardId === boardId);
+  if (!run) return { ok: false, reason: '這份執行結果已不存在，請重新選擇影片。' };
+  if (run.status !== 'succeeded') return { ok: false, reason: '這份執行尚未成功完成，暫時不能加入。' };
+  const result = run.results[nodeId];
+  if (!result) return { ok: false, reason: '這個節點的結果已不存在，請重新選擇影片。' };
+  if (result.status !== 'succeeded') return { ok: false, reason: '這個節點的結果不是成功狀態，暫時不能加入。' };
+  const artifact = result.artifacts[artifactIndex];
+  if (!artifact) return { ok: false, reason: '這個輸出已不存在，請重新選擇影片。' };
+  if (artifact.kind !== 'video') return { ok: false, reason: '這個輸出不是影片，不能加入時間軸。' };
+  if (artifact.kind !== intent.canonical.kind || artifact.url !== intent.canonical.url) {
+    return { ok: false, reason: '來源內容已變更，請重新選擇影片。' };
+  }
+  return { ok: true, run, artifact };
+}
+
 type TimelineEditorProps = {
   board: Board;
   runs: Run[];
@@ -53,6 +95,8 @@ type TimelineEditorProps = {
   onSaveArtifact: SaveArtifact;
   onExportJob: (job: ExportJob) => void;
   onClose: () => void;
+  handoffIntent?: TimelineHandoffIntent;
+  onHandoffConsumed?: (token: string) => void;
 };
 
 type VideoSource = {
@@ -61,6 +105,12 @@ type VideoSource = {
   nodeId: string;
   artifactIndex: number;
   artifact: Artifact;
+};
+
+type HandoffSelection = {
+  intent: TimelineHandoffIntent;
+  source?: VideoSource;
+  reason?: string;
 };
 
 type RequestError = Error & { status?: number };
@@ -122,7 +172,18 @@ function artifactUrl(artifact: Artifact): string {
 }
 
 function sourceLabel(source: VideoSource): string {
-  return `${source.nodeId} · ${source.run.id.slice(0, 8)}${source.artifact.demo ? ' · Demo' : ''}`;
+  const startedAt = new Date(source.run.startedAt);
+  const time = Number.isFinite(startedAt.getTime()) ? startedAt.toLocaleString('zh-TW') : source.run.startedAt;
+  return `${source.nodeId} · output ${source.artifactIndex + 1} · ${time} · ${source.run.id.slice(0, 8)}${source.artifact.demo ? ' · Demo' : ''}`;
+}
+
+function liveVideoSource(runs: Run[], boardId: string, source: ClipSource): VideoSource | undefined {
+  const run = runs.find((candidate) => candidate.id === source.runId && candidate.boardId === boardId && candidate.status === 'succeeded');
+  const result = run?.results[source.nodeId];
+  const artifact = result?.status === 'succeeded' ? result.artifacts[source.artifactIndex] : undefined;
+  return run && result?.status === 'succeeded' && artifact?.kind === 'video'
+    ? { id: `${source.runId}:${source.nodeId}:${source.artifactIndex}`, run, nodeId: source.nodeId, artifactIndex: source.artifactIndex, artifact }
+    : undefined;
 }
 
 function statusLabel(status: ExportJob['status']): string {
@@ -206,7 +267,7 @@ function ClipCard({
   );
 }
 
-export default function TimelineEditor({ board, runs, exports, requestJson, onSaveArtifact, onExportJob, onClose }: TimelineEditorProps) {
+export default function TimelineEditor({ board, runs, exports, requestJson, onSaveArtifact, onExportJob, onClose, handoffIntent, onHandoffConsumed }: TimelineEditorProps) {
   const dialogRef = useModalFocus<HTMLElement>();
   const [timeline, setTimeline] = useState<Timeline>();
   const [loading, setLoading] = useState(true);
@@ -220,6 +281,7 @@ export default function TimelineEditor({ board, runs, exports, requestJson, onSa
   const [sourceSaving, setSourceSaving] = useState<string>();
   const [sourceError, setSourceError] = useState('');
   const [selectedSourceId, setSelectedSourceId] = useState('');
+  const [handoffSelection, setHandoffSelection] = useState<HandoffSelection>();
   const [playhead, setPlayhead] = useState(0);
   const [seekIntent, setSeekIntent] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -245,6 +307,9 @@ export default function TimelineEditor({ board, runs, exports, requestJson, onSa
   const exportSubmitRef = useRef<Promise<void> | undefined>(undefined);
   const mountedRef = useRef(false);
   const trimDragRef = useRef<TimelineTrimDrag | undefined>(undefined);
+  const runsRef = useRef(runs);
+  const selectionModeRef = useRef<'auto' | 'manual' | 'handoff'>('auto');
+  const consumedHandoffTokensRef = useRef<Set<string>>(new Set());
 
   const boardRuns = useMemo(() => runs.filter((run) => run.boardId === board.id), [board.id, runs]);
   const sources = useMemo<VideoSource[]>(() => boardRuns.flatMap((run) => {
@@ -257,12 +322,49 @@ export default function TimelineEditor({ board, runs, exports, requestJson, onSa
   const totalDuration = useMemo(() => timeline?.clips.reduce((sum, clip) => sum + Math.max(0, clip.outSeconds - clip.inSeconds), 0) ?? 0, [timeline]);
   const currentClip = timeline?.clips[activeClipIndex];
   const boardExports = useMemo(() => exports.filter((job) => job.boardId === board.id), [board.id, exports]);
-  const selectedSource = sources.find((source) => source.id === selectedSourceId);
+  const handoffSourceId = handoffSelection ? `${handoffSelection.intent.source.runId}:${handoffSelection.intent.source.nodeId}:${handoffSelection.intent.source.artifactIndex}` : '';
+  const selectedSource = handoffSelection && !handoffSelection.source && selectedSourceId === handoffSourceId
+    ? undefined
+    : sources.find((source) => source.id === selectedSourceId);
+  const displayedSources = handoffSelection && !handoffSelection.source
+    ? sources.filter((source) => source.id !== handoffSourceId)
+    : sources;
 
   useEffect(() => { timelineRef.current = timeline; }, [timeline]);
   useEffect(() => { dirtyRef.current = dirty; }, [dirty]);
   useEffect(() => { playingRef.current = playing; }, [playing]);
+  useEffect(() => { runsRef.current = runs; }, [runs]);
   useEffect(() => {
+    if (!handoffIntent || consumedHandoffTokensRef.current.has(handoffIntent.token)) return;
+    consumedHandoffTokensRef.current.add(handoffIntent.token);
+    if (selectionModeRef.current === 'manual') {
+      onHandoffConsumed?.(handoffIntent.token);
+      return;
+    }
+    selectionModeRef.current = 'handoff';
+    const validation = validateTimelineHandoff(handoffIntent, board.id, runsRef.current);
+    const source = validation.ok
+      ? sources.find((candidate) => candidate.id === `${handoffIntent.source.runId}:${handoffIntent.source.nodeId}:${handoffIntent.source.artifactIndex}`)
+      : undefined;
+    setHandoffSelection({ intent: handoffIntent, source, reason: validation.ok && source ? undefined : validation.ok ? '來源仍在載入，請稍候或手動選擇。' : validation.reason });
+    setSelectedSourceId(source?.id ?? `${handoffIntent.source.runId}:${handoffIntent.source.nodeId}:${handoffIntent.source.artifactIndex}`);
+    onHandoffConsumed?.(handoffIntent.token);
+  }, [board.id, handoffIntent, onHandoffConsumed, sources]);
+  useEffect(() => {
+    if (selectionModeRef.current !== 'handoff' || !handoffSelection) return;
+    const validation = validateTimelineHandoff(handoffSelection.intent, board.id, runs);
+    const source = validation.ok
+      ? sources.find((candidate) => candidate.id === `${handoffSelection.intent.source.runId}:${handoffSelection.intent.source.nodeId}:${handoffSelection.intent.source.artifactIndex}`)
+      : undefined;
+    const reason = validation.ok && source ? undefined : validation.ok ? '來源仍在載入，請稍候或手動選擇。' : validation.reason;
+    setHandoffSelection((current) => {
+      if (!current || current.intent.token !== handoffSelection.intent.token || current.source?.id === source?.id && current.reason === reason) return current;
+      return { ...current, source, reason };
+    });
+    setSelectedSourceId(source?.id ?? `${handoffSelection.intent.source.runId}:${handoffSelection.intent.source.nodeId}:${handoffSelection.intent.source.artifactIndex}`);
+  }, [board.id, handoffSelection, runs, sources]);
+  useEffect(() => {
+    if (selectionModeRef.current !== 'auto') return;
     if (!sources.some((source) => source.id === selectedSourceId)) setSelectedSourceId(sources[0]?.id ?? '');
   }, [selectedSourceId, sources]);
 
@@ -382,6 +484,13 @@ export default function TimelineEditor({ board, runs, exports, requestJson, onSa
     onClose();
   }, [onClose, saveTimeline, saving]);
 
+  const selectSource = useCallback((sourceId: string) => {
+    selectionModeRef.current = 'manual';
+    setHandoffSelection(undefined);
+    setSelectedSourceId(sourceId);
+    setSourceError('');
+  }, []);
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') void closeEditor(); };
     window.addEventListener('keydown', onKey);
@@ -396,24 +505,40 @@ export default function TimelineEditor({ board, runs, exports, requestJson, onSa
       if ((timelineRef.current?.clips.length ?? 0) >= (capabilities?.limits.maxClips ?? 12)) {
         throw new Error(`Timeline 最多 ${capabilities?.limits.maxClips ?? 12} 個片段。`);
       }
-      let artifact = source.artifact;
+      const latestSource = liveVideoSource(runsRef.current, board.id, { runId: source.run.id, nodeId: source.nodeId, artifactIndex: source.artifactIndex });
+      if (!latestSource) throw new Error('來源已不存在或不再是成功影片，請重新選擇。');
+      if (selectionModeRef.current === 'handoff' && handoffSelection) {
+        const validation = validateTimelineHandoff(handoffSelection.intent, board.id, runsRef.current);
+        if (!validation.ok) {
+          setHandoffSelection((current) => current ? { ...current, source: undefined, reason: validation.reason } : current);
+          throw new Error(validation.reason);
+        }
+      }
+      let artifact = latestSource.artifact;
       if (!artifact.localId && !artifact.localUrl) {
-        const saved = await onSaveArtifact(source.run.id, source.nodeId, source.artifactIndex);
+        const saved = await onSaveArtifact(latestSource.run.id, latestSource.nodeId, latestSource.artifactIndex);
         if (!saved) throw new Error('素材保存失敗；請重試後再加入 timeline。');
         artifact = saved;
       }
-      const info = await requestJson<ArtifactInfo | { info: ArtifactInfo }>(`/api/runs/${encodeURIComponent(source.run.id)}/artifacts/${encodeURIComponent(source.nodeId)}/${source.artifactIndex}/info`);
+      const info = await requestJson<ArtifactInfo | { info: ArtifactInfo }>(`/api/runs/${encodeURIComponent(latestSource.run.id)}/artifacts/${encodeURIComponent(latestSource.nodeId)}/${latestSource.artifactIndex}/info`);
       const resolved = 'info' in info ? info.info : info;
+      if (selectionModeRef.current === 'handoff' && handoffSelection) {
+        const validation = validateTimelineHandoff(handoffSelection.intent, board.id, runsRef.current);
+        if (!validation.ok) {
+          setHandoffSelection((current) => current ? { ...current, source: undefined, reason: validation.reason } : current);
+          throw new Error(validation.reason);
+        }
+      }
       edit((current) => {
         const duration = Math.min(resolved.media.duration, capabilities?.limits.maxClipSeconds ?? 60);
-        return { ...current, clips: [...current.clips, { id: makeId('clip'), source: resolved.source, inSeconds: 0, outSeconds: duration, artifact: resolved.artifact ?? artifact, media: resolved.media }] };
+        return { ...current, clips: [...current.clips, { id: makeId('clip'), source: { runId: latestSource.run.id, nodeId: latestSource.nodeId, artifactIndex: latestSource.artifactIndex }, inSeconds: 0, outSeconds: duration, artifact: resolved.artifact ?? artifact, media: resolved.media }] };
       });
     } catch (error) {
       setSourceError(errorText(error));
     } finally {
       setSourceSaving(undefined);
     }
-  }, [capabilities?.limits.maxClipSeconds, capabilities?.limits.maxClips, edit, onSaveArtifact, requestJson]);
+  }, [board.id, capabilities?.limits.maxClipSeconds, capabilities?.limits.maxClips, edit, handoffSelection, onSaveArtifact, requestJson]);
 
   const updateTrim = useCallback((id: string, field: 'inSeconds' | 'outSeconds', value: number) => {
     if (!Number.isFinite(value)) return;
@@ -760,7 +885,15 @@ export default function TimelineEditor({ board, runs, exports, requestJson, onSa
               {sourceError && <p className="timeline-inline-error" role="alert"><AlertCircle size={13} />{sourceError}</p>}
             </section>
             <aside className="timeline-side-panel">
-              <section className="timeline-source-panel"><div className="timeline-section-heading"><div><span className="panel-eyebrow">SOURCES / THIS BOARD</span><h3>成功影片</h3></div><span>{sources.length}</span></div>{sources.length === 0 ? <div className="timeline-empty-copy"><Film size={17} /><p>此 board 尚無成功影片。先完成一次影片執行，再回來加入。</p></div> : <div className="timeline-source-picker"><label className="timeline-source-select-label"><span>選擇影片來源</span><select data-testid="timeline-source" aria-label="選擇 timeline 影片來源" value={selectedSourceId} onChange={(event) => setSelectedSourceId(event.target.value)}><option value="">選擇影片</option>{sources.map((source) => <option key={source.id} value={source.id}>{sourceLabel(source)}</option>)}</select></label>{selectedSource && <div className="timeline-source-selected"><div className="timeline-source-icon"><Film size={15} /></div><div className="timeline-source-copy"><strong>{sourceLabel(selectedSource)}</strong><small>{selectedSource.artifact.localId || selectedSource.artifact.localUrl ? '已保存本機，可加入' : 'Remote-only，加入前會明確保存'}</small></div><button className={selectedSource.artifact.localId || selectedSource.artifact.localUrl ? 'secondary-button' : 'primary-button'} data-testid="timeline-add" disabled={sourceSaving === selectedSource.id || clips.length >= (capabilities?.limits.maxClips ?? 12)} onClick={() => void addSource(selectedSource)}>{sourceSaving === selectedSource.id ? <LoaderCircle className="spin" size={13} /> : selectedSource.artifact.localId || selectedSource.artifact.localUrl ? <Copy size={13} /> : <Save size={13} />}{selectedSource.artifact.localId || selectedSource.artifact.localUrl ? '加入' : '保存並加入'}</button></div>}</div>}</section>
+              <section className="timeline-source-panel">
+                <div className="timeline-section-heading"><div><span className="panel-eyebrow">SOURCES / THIS BOARD</span><h3>成功影片</h3></div><span>{sources.length}</span></div>
+                {handoffSelection && <div className="timeline-handoff-notice" data-testid="timeline-handoff-notice"><span>Compare 已選定來源</span><small>{handoffSelection.intent.source.nodeId} · output {handoffSelection.intent.source.artifactIndex + 1}</small></div>}
+                {sources.length === 0 && !handoffSelection ? <div className="timeline-empty-copy"><Film size={17} /><p>此 board 尚無成功影片。先完成一次影片執行，再回來加入。</p></div> : <div className="timeline-source-picker">
+                  <label className="timeline-source-select-label"><span>選擇影片來源</span><select data-testid="timeline-source" aria-label="選擇 timeline 影片來源" value={selectedSourceId} onChange={(event) => selectSource(event.target.value)}><option value="">選擇影片</option>{handoffSelection && !handoffSelection.source && <option value={handoffSourceId} disabled>{handoffSelection.intent.source.nodeId} · output {handoffSelection.intent.source.artifactIndex + 1} · 無法使用</option>}{displayedSources.map((source) => <option key={source.id} value={source.id}>{sourceLabel(source)}</option>)}</select></label>
+                  {handoffSelection && !handoffSelection.source && <div className="timeline-source-unavailable" data-testid="timeline-source-unavailable" role="alert"><strong>{handoffSelection.intent.source.nodeId} · output {handoffSelection.intent.source.artifactIndex + 1}</strong><span>{handoffSelection.reason ?? '來源目前無法使用，請手動選擇其他影片。'}</span></div>}
+                  {selectedSource && <div className="timeline-source-selected"><div className="timeline-source-icon"><Film size={15} /></div><div className="timeline-source-copy"><strong>{sourceLabel(selectedSource)}</strong><small>{selectedSource.artifact.localId || selectedSource.artifact.localUrl ? '已保存本機，可加入' : 'Remote-only，加入前會明確保存'}</small></div><button className={selectedSource.artifact.localId || selectedSource.artifact.localUrl ? 'secondary-button' : 'primary-button'} data-testid="timeline-add" disabled={sourceSaving === selectedSource.id || clips.length >= (capabilities?.limits.maxClips ?? 12)} onClick={() => void addSource(selectedSource)}>{sourceSaving === selectedSource.id ? <LoaderCircle className="spin" size={13} /> : selectedSource.artifact.localId || selectedSource.artifact.localUrl ? <Copy size={13} /> : <Save size={13} />}{selectedSource.artifact.localId || selectedSource.artifact.localUrl ? '加入' : '保存並加入'}</button></div>}
+                </div>}
+              </section>
               <section className="timeline-export-panel"><div className="timeline-section-heading"><div><span className="panel-eyebrow">POST PRODUCTION</span><h3>Export</h3></div><span className="timeline-export-version">v0.4.0</span></div><p className="timeline-export-copy">Export 會先保存目前 timeline snapshot。之後的編輯不會改變這次輸出。</p>{pendingExport && <div className="timeline-alert is-info" role="status"><AlertCircle size={15} /><div><strong>匯出提交尚未確認</strong><span>{pendingExportCanRetry ? '重試會沿用相同 operation；不會建立重複匯出。' : '目前 draft 已改變；請先明確開始新的 attempt。'}</span></div>{pendingExportCanRetry ? <button className="secondary-button" data-testid="timeline-recover-export" onClick={() => void startExport()}>恢復原提交</button> : <button className="secondary-button" data-testid="timeline-new-export-attempt" onClick={beginNewExportAttempt}>New attempt</button>}</div>}<button className="primary-button timeline-export-button" data-testid="timeline-export" disabled={!clips.length || hasInvalidClip || overLimit || saving || exportSaving || pendingExportBlocked || (capabilities !== undefined && !capabilities.available)} onClick={() => void startExport()}>{exportSaving ? <LoaderCircle className="spin" size={14} /> : <Film size={14} />}{exportSaving ? '提交中' : pendingExportCanRetry ? '恢復原提交' : pendingExportBlocked ? '先處理原提交' : '保存並匯出'}</button>{exportError && <p className="timeline-inline-error" role="alert"><AlertCircle size={13} />{exportError}</p>}{activeExport && <div className={`timeline-export-job is-${activeExport.status}`}><div><strong>{statusLabel(activeExport.status)}</strong><small>snapshot rev {activeExport.timelineRevision} · {new Date(activeExport.startedAt).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' })}</small></div>{activeExport.status === 'pending' || activeExport.status === 'running' ? <button className="secondary-button" data-testid="timeline-cancel-export" onClick={() => void cancelExport(activeExport)}>取消</button> : activeExport.status === 'succeeded' && activeExport.artifact?.localUrl ? <a className="secondary-button" data-testid={`timeline-download-${activeExport.id}`} href={activeExport.artifact.localUrl} download={`relay-${board.name}-timeline.mp4`}><Download size={13} />下載 MP4</a> : <button className="secondary-button" onClick={beginNewExportAttempt}><RefreshCw size={14} />New attempt</button>}{activeExport.status === 'succeeded' && activeExport.artifact?.localUrl && <video className="timeline-export-preview" src={activeExport.artifact.localUrl} controls playsInline preload="metadata" aria-label="匯出 MP4 預覽" />}{activeExport.error && <span className="timeline-job-error">{activeExport.error}</span>}</div>}</section>
               {boardExports.length > 0 && <section className="timeline-export-history"><span className="panel-eyebrow">RECENT EXPORTS</span>{boardExports.slice(0, 4).map((job) => <div className="timeline-export-history-row" key={job.id}><span className={`timeline-export-dot is-${job.status}`} /><span>{statusLabel(job.status)}</span><small>rev {job.timelineRevision} · {new Date(job.startedAt).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' })}</small>{job.status === 'succeeded' && job.artifact?.localUrl && <a href={job.artifact.localUrl} download={`relay-${board.name}-timeline.mp4`} aria-label={`下載 ${job.id}`}><Download size={12} /></a>}</div>)}</section>}
               </aside>

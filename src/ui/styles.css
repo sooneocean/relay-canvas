@@ -399,13 +399,23 @@ button:disabled { cursor: not-allowed; opacity: 0.42; }
 .compare-output-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-top: 14px; }
 .compare-output { position: relative; min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 7px; background: #101010; }
 .compare-output img, .compare-output video { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background: #0d0d0d; }
-.compare-output-label { display: block; padding: 7px 8px 0; font: 9px var(--mono); }
+.compare-output-label { display: grid; gap: 3px; padding: 7px 8px 0; font: 9px var(--mono); }
+.compare-output-label strong { color: #e7eee4; font-weight: 600; }
+.compare-output-label small { color: var(--muted); font: 8px var(--mono); overflow-wrap: anywhere; }
 .compare-local-badge { position: absolute; right: 6px; bottom: 6px; display: flex; align-items: center; gap: 3px; padding: 3px 5px; color: #09100b; background: var(--lime); border-radius: 4px; font-size: 9px; }
+.compare-output-handoff { display: grid; gap: 4px; padding: 8px; }
+.compare-output-handoff .secondary-button { justify-content: center; width: 100%; }
+.compare-output-handoff small { color: #e6aaa2; font-size: 9px; line-height: 1.35; }
 .compare-missing { display: flex; align-items: center; gap: 8px; min-height: 100px; margin-top: 14px; padding: 12px; color: var(--muted); border: 1px dashed rgba(255,139,132,.3); border-radius: 7px; font-size: 11px; }
 .compare-video-controls { display: flex; align-items: center; gap: 10px; margin: 0 28px 14px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 8px; }
 .compare-video-controls small { color: var(--muted); font-size: 10px; white-space: nowrap; }
 .compare-state.is-error { color: #ffd2cd; }
 .compare-dialog-foot > span:first-child { overflow-wrap: anywhere; }
+
+.timeline-handoff-notice { display: grid; gap: 3px; margin: 11px 0; padding: 8px 9px; color: var(--soft); border: 1px solid rgba(200,255,90,.2); border-radius: 7px; background: rgba(200,255,90,.05); font-size: 10px; }
+.timeline-handoff-notice small { color: var(--muted); font: 8px var(--mono); }
+.timeline-source-unavailable { display: grid; gap: 4px; margin-top: 10px; padding: 9px; color: #ffd2cd; border: 1px dashed rgba(255,139,132,.36); border-radius: 7px; background: rgba(81,33,31,.18); font-size: 10px; line-height: 1.4; }
+.timeline-source-unavailable strong { color: #ffe8e3; font: 9px var(--mono); overflow-wrap: anywhere; }
 
 @media (max-width: 1100px) {
   .timeline-content { grid-template-columns: minmax(0, 1fr); }

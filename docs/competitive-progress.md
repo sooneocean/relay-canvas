@@ -30,6 +30,6 @@ First deliver v0.4's requested editing/comparison/export journey and release it 
 
 ## Observed next creator friction
 
-A read-only v0.4 code walkthrough found that comparison and timeline are separate dialogs in `src/ui/App.tsx`: choosing a good version in Compare does not carry its exact artifact selection into Timeline. The creator must close comparison, open the timeline and find the same run/node in a dropdown. `src/ui/TimelineEditor.tsx` currently identifies sources mainly by node and shortened run ID, and adds one selected source at a time.
+A read-only v0.4 code walkthrough found that choosing a good version in Compare did not carry its exact artifact selection into Timeline. RC-HANDOFF-01 now implements this explicit selection flow, verified on Chrome155 and independently on Chromium156 with real historical index1 Add/read-back. The eighth round is recorded in the ledger; it is an unreleased change after the published v0.4.0. See [acceptance evidence](compare-handoff-review.md).
 
-Next bounded candidate: add an explicit Compare → Timeline handoff preserving run/node/artifact identity, with recognizable source time and duration. Then evaluate a browsable source list with previews for efficient multi-version selection. These are unimplemented follow-ups, not completed rounds or inferred competitor features.
+`src/ui/TimelineEditor.tsx` still uses a dense dropdown with node, output ordinal, time and shortened run ID, and adds one selected source at a time. The next unimplemented candidate is a browsable, searchable source list with previews for efficient multi-version selection. It is not a completed round or an inferred competitor feature.

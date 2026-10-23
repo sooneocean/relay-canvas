@@ -9,10 +9,39 @@ import net from 'node:net';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { Store } from '../server/store.js';
+import { providers, starterBoard } from '../src/shared/defaults.js';
+import { verifyHandoffIntents } from './handoff-intents-smoke.js';
 import type { AppState, Artifact, ArtifactInfo, Board, ExportJob, Run, RunComparison, Timeline } from '../src/shared/types.js';
 
 const root = process.cwd();
 const dataDir = mkdtempSync(path.join(os.tmpdir(), 'relay-editor-smoke-'));
+// This isolated persisted fixture exercises real source validation for an old
+// revision, a node deleted from the current canvas, and artifact index > 0.
+// No production mutation API or generation request is needed to create it.
+const handoffBoard = starterBoard('handoff', 'Comparison handoff fixture');
+handoffBoard.revision = 9;
+handoffBoard.nodes = handoffBoard.nodes.filter(node => node.id !== 'motion');
+handoffBoard.edges = handoffBoard.edges.filter(edge => edge.target !== 'motion');
+const historicalBoard = starterBoard('handoff', handoffBoard.name);
+historicalBoard.revision = 2;
+historicalBoard.nodes.find(node => node.id === 'motion')!.id = 'archived-motion';
+historicalBoard.nodes.find(node => node.id === 'archived-motion')!.data.label = 'Archive clip';
+historicalBoard.edges.find(edge => edge.target === 'motion')!.target = 'archived-motion';
+const fixtureRun = (id: string, revision: number, startedAt: string): Run => ({
+  id, boardId: 'handoff', revision, operationId: id, status: 'succeeded', startedAt, finishedAt: startedAt,
+  snapshot: { ...structuredClone(historicalBoard), revision }, providers: structuredClone(providers),
+  order: ['brief', 'archived-motion'],
+  results: {
+    brief: { nodeId: 'brief', status: 'succeeded', text: 'Fixture creative brief', artifacts: [] },
+    'archived-motion': { nodeId: 'archived-motion', status: 'succeeded', artifacts: [0, 1].map(() => ({ kind: 'video', url: '/demo-motion.mp4', demo: true })) },
+  },
+});
+const fixtureStore = new Store(dataDir);
+fixtureStore.transaction(state => {
+  state.boards.push(handoffBoard);
+  state.runs.push(fixtureRun('handoff-a', 2, '2026-01-02T10:30:00Z'), fixtureRun('handoff-b', 3, '2026-01-03T12:45:00Z'));
+});
 const artifacts = path.join(root, 'work'); mkdirSync(artifacts, { recursive: true });
 const portProbe = net.createServer();
 await new Promise<void>(resolve => portProbe.listen(0, '127.0.0.1', resolve));
@@ -71,13 +100,15 @@ try {
   const canonical = JSON.stringify(comparison);
   await tool<Artifact>('save_artifact', { runId: leftRun.id, nodeId: 'frame', artifactIndex: 0 });
   assert.equal(JSON.stringify(await tool<RunComparison>('compare_runs', { boardId: 'welcome', left: leftRun.id, right: rightRun.id })), canonical, 'local save never changes canonical comparison');
+  for (const runId of ['handoff-a', 'handoff-b']) await tool<Artifact>('save_artifact', { runId, nodeId: 'archived-motion', artifactIndex: 1 });
 
   const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || (existsSync('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome') ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : undefined);
   browser = await chromium.launch({ headless: true, executablePath });
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
   const errors: string[] = []; let expectedFailure = false; let generationRequests = 0;
   page.on('pageerror', error => errors.push(error.message));
-  page.on('console', message => { if (message.type() === 'error' && !(expectedFailure && /Failed to load resource|net::ERR_/.test(message.text()))) errors.push(message.text()); });
+  page.on('console', message => { if (message.type() === 'error' && !(expectedFailure && /Failed to load resource|net::ERR_/.test(message.text()))) errors.push(`${message.text()} ${message.location().url}`.trim()); });
+  page.on('response', response => { if (response.status() >= 400 && !expectedFailure) console.error(`Unexpected fixture response: ${response.status()} ${new URL(response.url()).pathname}`); });
   page.on('request', request => { if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/runs') generationRequests++; });
   await page.goto(origin);
   await page.getByLabel('project-card-welcome', { exact: true }).click();
@@ -309,9 +340,228 @@ try {
   await page.reload(); await page.getByLabel('project-card-welcome', { exact: true }).click();
   await page.getByTestId('timeline-open').click();
   await until(() => page.getByTestId('timeline-dialog').locator('[data-testid^="timeline-clip-"]').count(), count => count === 2, 'timeline survives reload');
+  await page.getByTestId('timeline-close').click();
+  await until(() => page.getByTestId('timeline-dialog').count(), count => count === 0, 'existing timeline closes before handoff journey');
+
+  // Compare -> Timeline is selection only. Exercise exact historical identities
+  // against the real persisted server, not a mocked successful Add response.
+  await page.getByLabel('board-name', { exact: true }).selectOption('handoff');
+  const handoffCompare = () => page.getByTestId('compare-dialog');
+  const handoffTimeline = () => page.getByTestId('timeline-dialog');
+  const handoffSource = (runId: string, index: number) => `${runId}:archived-motion:${index}`;
+  const handoffComparisonPath = '/api/boards/handoff/compare?left=handoff-a&right=handoff-b';
+  const beforeHandoff = await api<AppState>('/api/state');
+  const handoffCanonical = await api<RunComparison>(handoffComparisonPath);
+  const beforeTimeline = await api<Timeline>('/api/boards/handoff/timeline');
+  const handoffTraffic: string[] = [];
+  const watchHandoff = (request: import('@playwright/test').Request) => {
+    const endpoint = new URL(request.url()).pathname;
+    if ((request.method() !== 'GET' && /\/api\/(boards\/handoff\/timeline|runs\/|boards\/handoff\/exports)/.test(endpoint)) || /\/artifacts\/[^/]+\/\d+\/info$/.test(endpoint)) handoffTraffic.push(`${request.method()} ${endpoint}`);
+  };
+  page.on('request', watchHandoff);
+  async function openHandoffCompare() {
+    await page.getByTestId('compare-open').click();
+    await handoffCompare().getByTestId('compare-left-run').selectOption('handoff-a');
+    await handoffCompare().getByTestId('compare-right-run').selectOption('handoff-b');
+    await handoffCompare().getByTestId('compare-node').selectOption('archived-motion');
+    await until(() => handoffCompare().getByTestId('compare-timeline-left-1').isEnabled(), value => value, 'exact historical video is eligible for handoff');
+  }
+  await openHandoffCompare();
+  let releaseHandoffTimeline!: () => void;
+  let releaseHandoffCapabilities!: () => void;
+  const delayedHandoffTimeline = new Promise<void>(resolve => { releaseHandoffTimeline = resolve; });
+  const delayedHandoffCapabilities = new Promise<void>(resolve => { releaseHandoffCapabilities = resolve; });
+  const handoffTimelinePattern = '**/api/boards/handoff/timeline';
+  const capabilitiesPattern = '**/api/editor/capabilities';
+  await page.route(handoffTimelinePattern, async route => { await delayedHandoffTimeline; await route.continue(); });
+  await page.route(capabilitiesPattern, async route => { await delayedHandoffCapabilities; await route.continue(); });
+  await handoffCompare().getByTestId('compare-timeline-left-1').dblclick();
+  await until(() => handoffCompare().count(), count => count === 0, 'handoff closes comparison once');
+  await page.waitForResponse(response => new URL(response.url()).pathname === '/api/state');
+  const handoffTimelineResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/boards/handoff/timeline');
+  releaseHandoffTimeline();
+  await handoffTimelineResponse;
+  await page.unroute(handoffTimelinePattern);
+  await until(() => handoffTimeline().getByTestId('timeline-source').inputValue(), value => value === handoffSource('handoff-a', 1), 'A exact artifact index1 is selected');
+  await until(() => handoffTimeline().getByTestId('timeline-source').isEnabled(), value => value, 'timeline loads without losing the intent');
+  assert.equal(await handoffTimeline().locator('[data-testid^="timeline-clip-"]').count(), 0, 'selection does not add a clip');
+  assert.deepEqual(await api<Timeline>('/api/boards/handoff/timeline'), beforeTimeline, 'handoff leaves timeline/revision/format unchanged');
+  assert.deepEqual(handoffTraffic, [], 'handoff does not save, probe or export');
+  assert.deepEqual((await api<AppState>('/api/state')).boards, beforeHandoff.boards, 'handoff leaves board snapshots unchanged');
+  assert.deepEqual((await api<AppState>('/api/state')).runs, beforeHandoff.runs, 'handoff leaves every run unchanged');
+  assert.deepEqual(await api<RunComparison>(handoffComparisonPath), handoffCanonical, 'handoff leaves canonical comparison unchanged');
+
+  // A manual choice must survive the ordinary one-second runs refresh and
+  // delayed capabilities. It cannot be replaced by an already consumed intent.
+  await handoffTimeline().getByTestId('timeline-source').selectOption(handoffSource('handoff-b', 1));
+  const handoffCapabilitiesResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/editor/capabilities');
+  releaseHandoffCapabilities();
+  await handoffCapabilitiesResponse;
+  await page.unroute(capabilitiesPattern);
+  const refresh = page.waitForResponse(response => new URL(response.url()).pathname === '/api/state');
+  await refresh;
+  assert.equal(await handoffTimeline().getByTestId('timeline-source').inputValue(), handoffSource('handoff-b', 1));
+  await handoffTimeline().getByTestId('timeline-close').click();
+  await page.getByTestId('timeline-open').click();
+  await until(() => handoffTimeline().getByTestId('timeline-source').locator('option').count(), count => count > 1, 'ordinary reopen sources loaded');
+  assert.notEqual(await handoffTimeline().getByTestId('timeline-source').inputValue(), handoffSource('handoff-a', 1), 'ordinary reopen does not replay A handoff');
+  await handoffTimeline().getByTestId('timeline-close').click();
+
+  await openHandoffCompare();
+  await handoffCompare().getByTestId('compare-timeline-right-1').click();
+  await until(() => handoffTimeline().getByTestId('timeline-source').inputValue(), value => value === handoffSource('handoff-b', 1), 'B exact artifact index1 is selected');
+  assert.deepEqual(handoffTraffic, [], 'both handoff sides remain selection only');
+  await handoffTimeline().getByTestId('timeline-add').click();
+  await until(() => handoffTimeline().locator('[data-testid^="timeline-clip-"]').count(), count => count === 1, 'explicit Add adds the selected historical B video');
+  await handoffTimeline().getByTestId('timeline-save').click();
+  const addedTimeline = await until(() => api<Timeline>('/api/boards/handoff/timeline'), value => value.clips.length === 1, 'explicit selected clip saved through real backend');
+  assert.deepEqual(addedTimeline.clips[0].source, { runId: 'handoff-b', nodeId: 'archived-motion', artifactIndex: 1 });
+  assert.equal(addedTimeline.clips[0].media.duration > 0, true, 'the exact artifact was actually probed');
+  await page.screenshot({ path: path.join(artifacts, 'compare-timeline-handoff.png'), fullPage: true });
+  await handoffTimeline().getByTestId('timeline-close').click();
+
+  // Remote-only metadata needs an explicit save action. Save/probe failures
+  // retain an existing draft, and retry never invokes generation.
+  await openHandoffCompare();
+  const beforeRemoteTraffic = handoffTraffic.length;
+  await handoffCompare().getByTestId('compare-timeline-left-0').click();
+  await until(() => handoffTimeline().getByTestId('timeline-source').inputValue(), value => value === handoffSource('handoff-a', 0), 'unsaved source selected exactly');
+  assert.match(await handoffTimeline().getByTestId('timeline-add').innerText(), /保存並加入/);
+  assert.equal(handoffTraffic.length, beforeRemoteTraffic, 'unsaved handoff still performs no save/probe');
+  const retainedClipId = addedTimeline.clips[0].id;
+  await handoffTimeline().getByTestId(`timeline-in-${retainedClipId}`).fill('0.25');
+  // Defensive overlap: an automation-originated click cannot replace an open
+  // dirty timeline, even if Compare was opened behind the normal modal guard.
+  await page.getByTestId('compare-open').evaluate(element => (element as HTMLButtonElement).click());
+  assert.equal(await handoffTimeline().getByTestId(`timeline-in-${retainedClipId}`).inputValue(), '0.25', 'second handoff does not remount or overwrite dirty timeline');
+  assert.equal(await handoffCompare().count(), 0, 'overlapping Compare is rejected before two focus traps can mount');
+  assert.match(await page.locator('body').innerText(), /先關閉時間軸/);
+  const savePattern = '**/api/runs/handoff-a/artifacts/archived-motion/0/save';
+  expectedFailure = true;
+  await page.route(savePattern, route => route.fulfill({ status: 500, contentType: 'application/json', json: { error: 'Controlled handoff save failure' } }));
+  await handoffTimeline().getByTestId('timeline-add').click();
+  await until(() => handoffTimeline().innerText(), text => /保存失敗|Controlled handoff save failure/.test(text), 'explicit save failure is shown');
+  assert.equal(await handoffTimeline().getByTestId(`timeline-in-${retainedClipId}`).inputValue(), '0.25', 'save failure preserves draft');
+  assert.equal(await handoffTimeline().locator('[data-testid^="timeline-clip-"]').count(), 1);
+  await page.unroute(savePattern);
+  const infoPattern = '**/api/runs/handoff-a/artifacts/archived-motion/0/info';
+  await page.route(infoPattern, route => route.fulfill({ status: 500, contentType: 'application/json', json: { error: 'Controlled handoff probe failure' } }));
+  await handoffTimeline().getByTestId('timeline-add').click();
+  await until(() => handoffTimeline().innerText(), text => text.includes('Controlled handoff probe failure'), 'explicit probe failure is shown');
+  assert.equal(await handoffTimeline().getByTestId(`timeline-in-${retainedClipId}`).inputValue(), '0.25', 'probe failure preserves draft');
+  assert.equal(await handoffTimeline().locator('[data-testid^="timeline-clip-"]').count(), 1);
+  await page.unroute(infoPattern);
+  await handoffTimeline().getByTestId('timeline-add').click();
+  await until(() => handoffTimeline().locator('[data-testid^="timeline-clip-"]').count(), count => count === 2, 'explicit retry succeeds without regeneration');
+  expectedFailure = false;
+  await handoffTimeline().getByTestId('timeline-save').click();
+  const retriedTimeline = await until(() => api<Timeline>('/api/boards/handoff/timeline'), value => value.clips.length === 2 && value.clips[0].inSeconds === 0.25, 'retry preserves earlier draft and saves exact source');
+  assert.deepEqual(retriedTimeline.clips[1].source, { runId: 'handoff-a', nodeId: 'archived-motion', artifactIndex: 0 });
+  assert.deepEqual(await api<RunComparison>(handoffComparisonPath), handoffCanonical, 'explicit local save also preserves canonical comparison');
+  await handoffTimeline().getByTestId('timeline-close').click();
+
+  // Controlled live-catalog failures leave the canonical comparison visible,
+  // but it is never enough authority to hand a changed source into Timeline.
+  type CatalogMode = 'normal' | 'drift' | 'failed-run' | 'failed-result' | 'missing-artifact' | 'nonvideo' | 'active' | 'missing-run';
+  let catalogMode: CatalogMode = 'normal';
+  let seenCatalogMode: CatalogMode | undefined;
+  const statePattern = '**/api/state';
+  await page.route(statePattern, async route => {
+    const payload = await api<AppState>('/api/state');
+    const run = payload.runs.find(value => value.id === 'handoff-a')!;
+    const mode = catalogMode;
+    if (mode === 'drift') run.results['archived-motion'].artifacts[1].url = '/demo-motion.mp4?changed';
+    if (mode === 'failed-run') run.status = 'failed';
+    if (mode === 'failed-result') run.results['archived-motion'].status = 'failed';
+    if (mode === 'missing-artifact') run.results['archived-motion'].artifacts.splice(1, 1);
+    if (mode === 'nonvideo') run.results['archived-motion'].artifacts[1].kind = 'image';
+    if (mode === 'active') run.status = 'running';
+    if (mode === 'missing-run') payload.runs = payload.runs.filter(value => value.id !== 'handoff-a');
+    await route.fulfill({ status: 200, contentType: 'application/json', json: payload });
+    seenCatalogMode = mode;
+  });
+  await openHandoffCompare();
+  for (const mode of ['drift', 'failed-run', 'failed-result', 'missing-artifact', 'nonvideo'] as CatalogMode[]) {
+    catalogMode = mode;
+    await until(async () => seenCatalogMode, value => value === mode, `${mode} live catalog received`);
+    await until(() => handoffCompare().getByTestId('compare-timeline-left-1').isDisabled(), value => value, `${mode} cannot hand off canonical fallback`);
+    assert.equal(await handoffTimeline().count(), 0);
+  }
+  for (const mode of ['active', 'missing-run'] as CatalogMode[]) {
+    catalogMode = mode;
+    await until(async () => seenCatalogMode, value => value === mode, `${mode} live catalog received`);
+    await until(() => handoffCompare().getByTestId('compare-timeline-left-1').count(), count => count === 0, `${mode} cannot show an eligible fallback action`);
+  }
+  catalogMode = 'normal';
+  await until(async () => seenCatalogMode, value => value === 'normal', 'live catalog restored');
+  await handoffCompare().getByTestId('compare-left-run').selectOption('handoff-a');
+  await handoffCompare().getByTestId('compare-right-run').selectOption('handoff-b');
+  await handoffCompare().getByTestId('compare-node').selectOption('archived-motion');
+  await until(() => handoffCompare().getByTestId('compare-timeline-left-1').isEnabled(), value => value, 'restored exact identity can hand off again');
+  const beforeDisappearanceTraffic = handoffTraffic.length;
+  await handoffCompare().getByTestId('compare-timeline-left-1').click();
+  await until(() => handoffTimeline().getByTestId('timeline-source').inputValue(), value => value === handoffSource('handoff-a', 1), 'source selected before disappearance');
+  catalogMode = 'missing-artifact';
+  await until(async () => seenCatalogMode, value => value === 'missing-artifact', 'selected artifact disappears in live catalog');
+  await handoffTimeline().getByTestId('timeline-source-unavailable').waitFor();
+  assert.equal(await handoffTimeline().getByTestId('timeline-source').inputValue(), handoffSource('handoff-a', 1), 'unavailable source keeps exact index and never substitutes another video');
+  assert.equal(handoffTraffic.length, beforeDisappearanceTraffic, 'disappearance causes no hidden save, probe or timeline write');
+  assert.deepEqual(await api<Timeline>('/api/boards/handoff/timeline'), retriedTimeline, 'disappearance does not alter persisted timeline');
+  await handoffTimeline().getByTestId('timeline-source').selectOption(handoffSource('handoff-b', 1));
+  catalogMode = 'normal';
+  await until(async () => seenCatalogMode, value => value === 'normal', 'source catalog returns after manual choice');
+  assert.equal(await handoffTimeline().getByTestId('timeline-source').inputValue(), handoffSource('handoff-b', 1), 'reappearing old source cannot replace manual choice');
+  await page.unroute(statePattern);
+  page.off('request', watchHandoff);
+  await handoffTimeline().getByTestId('timeline-close').click();
+
+  // A dirty canvas uses the existing navigation save guard. Failed save keeps
+  // Compare selection; two synchronous clicks while its reply is pending claim
+  // only one handoff and one board save.
+  const boardSavePattern = '**/api/boards/handoff';
+  expectedFailure = true;
+  await page.route(boardSavePattern, async route => {
+    if (route.request().method() !== 'PUT') { await route.continue(); return; }
+    await route.fulfill({ status: 500, contentType: 'application/json', json: { error: 'Controlled handoff canvas guard failure' } });
+  });
+  await page.locator('.react-flow__node[data-id="brief"]').click();
+  await page.getByLabel('prompt-editor').fill('Keep this dirty canvas while choosing a video.');
+  await openHandoffCompare();
+  await handoffCompare().getByTestId('compare-timeline-left-1').click();
+  await until(() => handoffCompare().getByTestId('compare-timeline-left-1').isEnabled(), value => value, 'failed canvas save releases handoff claim for retry');
+  assert.equal(await handoffCompare().getByTestId('compare-left-run').inputValue(), 'handoff-a');
+  assert.equal(await handoffCompare().getByTestId('compare-node').inputValue(), 'archived-motion');
+  assert.equal(await handoffTimeline().count(), 0, 'failed canvas save keeps comparison open');
+  assert.equal(await page.getByLabel('prompt-editor').inputValue(), 'Keep this dirty canvas while choosing a video.', 'failed handoff guard preserves canvas draft');
+  await page.unroute(boardSavePattern);
+  let releaseCanvasGuard!: () => void;
+  const pendingCanvasGuard = new Promise<void>(resolve => { releaseCanvasGuard = resolve; });
+  let heldCanvasSaves = 0;
+  await page.route(boardSavePattern, async route => {
+    if (route.request().method() !== 'PUT') { await route.continue(); return; }
+    heldCanvasSaves++;
+    const payload = await api<Board>('/api/boards/handoff', 'PUT', route.request().postDataJSON());
+    await pendingCanvasGuard;
+    await route.fulfill({ status: 200, contentType: 'application/json', json: payload });
+  });
+  try {
+    await handoffCompare().getByTestId('compare-timeline-left-1').evaluate(element => { (element as HTMLButtonElement).click(); (element as HTMLButtonElement).click(); });
+    await until(async () => heldCanvasSaves, count => count === 1, 'one canvas save is pending despite two rapid handoff clicks');
+    assert.equal(await handoffCompare().count(), 1);
+    assert.equal(await handoffTimeline().count(), 0);
+    const response = page.waitForResponse(value => new URL(value.url()).pathname === '/api/boards/handoff' && value.request().method() === 'PUT');
+    releaseCanvasGuard();
+    await response;
+    await until(() => handoffTimeline().getByTestId('timeline-source').inputValue(), value => value === handoffSource('handoff-a', 1), 'successful guarded handoff opens exact selected source once');
+    assert.equal(heldCanvasSaves, 1);
+    assert.equal(await handoffCompare().count(), 0);
+    assert.deepEqual(await api<Timeline>('/api/boards/handoff/timeline'), retriedTimeline, 'guarded handoff does not add or rewrite timeline');
+  } finally { releaseCanvasGuard(); await page.unroute(boardSavePattern); }
+  expectedFailure = false;
+  await verifyHandoffIntents(browser, root, handoffBoard, (await api<AppState>('/api/state')).runs.filter(run => run.boardId === 'handoff'), retriedTimeline);
   assert.equal(generationRequests, 0, 'editor and comparison never regenerate');
   assert.deepEqual(errors, [], 'no browser errors');
-  writeFileSync(path.join(artifacts, 'editor-smoke-report.json'), JSON.stringify({ status: 'PASS', browser: await browser.version(), platform: process.platform, checks: ['17-tool real MCP handshake', 'strict save/info schema and private read-back', 'immutable terminal comparison after local save', 'timeline add/duplicate/reorder/remove/trim', 'save during concurrent edit', 'sequential trimmed preview crosses cut', 'landscape and portrait MP4 browser playback/download/hash', 'MCP timeline/export/status/idempotency/terminal cancel', 'A/B prompts, media clock, seek, ended/replay and unequal-duration videos', 'reload and viewport layouts'], exports: exports.map(job => ({ id: job.id, format: job.snapshot.format, sha256: job.artifact!.sha256 })), paidRequests: 0 }, null, 2));
+  writeFileSync(path.join(artifacts, 'editor-smoke-report.json'), JSON.stringify({ status: 'PASS', browser: await browser.version(), platform: process.platform, checks: ['17-tool real MCP handshake', 'strict save/info schema and private read-back', 'immutable terminal comparison after local save', 'timeline add/duplicate/reorder/remove/trim', 'save during concurrent edit', 'sequential trimmed preview crosses cut', 'landscape and portrait MP4 browser playback/download/hash', 'MCP timeline/export/status/idempotency/terminal cancel', 'A/B prompts, media clock, seek, ended/replay and unequal-duration videos', 'reload and viewport layouts', 'A/B compare handoff, historical deleted node and exact index1 persisted via real backend', 'selection-only handoff leaves boards, runs, timeline and canonical comparison unchanged', 'delayed timeline/capabilities, manual choice, runs refresh and close/reopen', 'dirty timeline rejects overlapping handoff; explicit save/probe failures preserve draft', 'failed/active/missing/drifted live sources cannot hand off canonical fallback', 'disappearing selected artifact remains unavailable without fallback'], exports: exports.map(job => ({ id: job.id, format: job.snapshot.format, sha256: job.artifact!.sha256 })), paidRequests: 0 }, null, 2));
   console.log('PASS: timeline, real landscape/portrait MP4, A/B comparison and complete MCP journey; zero paid requests.');
 } catch (error) {
   const page = browser?.contexts()[0]?.pages()[0];
