@@ -1,5 +1,5 @@
-import type { GenerationOutput, GenerationRequest, MediaKind, Provider } from '../src/shared/types.js';
-import { isSafeReferenceField, parseGenerationParams, parseProviders } from '../src/shared/schema.js';
+import type { GenerationOutput, GenerationRequest, MediaKind, Provider, ProviderDiagnostic, ProviderModels } from '../src/shared/types.js';
+import { isSafeReferenceField, parseGenerationParams, parseProviders, parseVideosParams } from '../src/shared/schema.js';
 import {
   readPolicy,
   safeJsonRequest,
@@ -58,6 +58,12 @@ function readSecret(env: NodeJS.ProcessEnv, key: string): string {
   return value;
 }
 
+function configuredSecret(env: NodeJS.ProcessEnv, key: string): boolean {
+  if (!key || !Object.prototype.hasOwnProperty.call(env, key)) return false;
+  const value = env[key];
+  return typeof value === 'string' && value.length > 0 && value.length <= 16_384;
+}
+
 function joinFixedPath(base: URL, suffix: string): string {
   const prefix = base.pathname.replace(/\/+$/, '');
   const result = new URL(`${prefix}${suffix}`, base.origin);
@@ -105,6 +111,14 @@ function inspectGeneration(
   if (provider.protocol === 'demo') return { provider, policy };
   if (!policy.remoteEnabled) fail('Remote generation is disabled');
   if (provider.protocol === 'openai' && request.kind !== 'image') fail('Provider capability is not supported');
+  if (provider.protocol === 'videos') {
+    if (request.kind !== 'video') fail('Provider capability is not supported');
+    try { parseVideosParams(request.params); } catch { fail('Invalid provider configuration'); }
+  }
+  if (provider.protocol === 'openai' && Object.prototype.hasOwnProperty.call(request.params, 'output_format')) {
+    const format = request.params.output_format;
+    if (format !== 'png' && format !== 'jpeg' && format !== 'webp') fail('Invalid provider configuration');
+  }
   if (provider.protocol === 'fal') validateFalModel(request.model);
   if (provider.protocol === 'replicate') validateReplicateModel(request.model);
   const base = validateBaseUrl(provider.baseUrl, policy);
@@ -135,6 +149,70 @@ function sameOriginProviderUrl(value: string, origin: string, policy: SecurityPo
 
 function artifact(kind: MediaKind, value: string, policy: SecurityPolicy): GenerationOutput {
   return { artifacts: [{ kind, url: validateMediaUrl(value, policy) }] };
+}
+
+export function providerDiagnostics(
+  providerValues: Provider[],
+  policy: SecurityPolicy = readPolicy(),
+  env: NodeJS.ProcessEnv = process.env,
+): ProviderDiagnostic[] {
+  return providerValues.map((provider) => {
+    const capabilities = provider.protocol === 'openai' ? ['image'] as const
+      : provider.protocol === 'videos' ? ['video'] as const
+      : ['image', 'video'] as const;
+    const codes: string[] = [];
+    let configurationValid = true;
+    const credentialConfigured = configuredSecret(env, provider.keyEnv);
+    if (provider.protocol === 'demo') codes.push('DEMO_LOCAL');
+    else {
+      try { validateBaseUrl(provider.baseUrl, policy); } catch { configurationValid = false; codes.push('INVALID_ORIGIN'); }
+      if (!credentialConfigured) codes.push('CREDENTIAL_MISSING');
+      if (!policy.remoteEnabled) codes.push('REMOTE_DISABLED');
+      if (provider.protocol === 'fal' || provider.protocol === 'replicate') codes.push('MODELS_MANUAL_ONLY');
+    }
+    if (configurationValid && (provider.protocol === 'demo' || (credentialConfigured && policy.remoteEnabled))) codes.push('READY');
+    return {
+      providerId: provider.id,
+      configurationValid,
+      remoteEnabled: policy.remoteEnabled,
+      credentialConfigured,
+      capabilities: [...capabilities],
+      codes,
+    };
+  });
+}
+
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
+export async function providerModels(
+  providerValue: Provider,
+  options: GenerateOptions = {},
+): Promise<ProviderModels> {
+  try {
+    const provider = parseProviders([providerValue])[0];
+    if (provider.protocol === 'demo') return { models: ['demo-image', 'demo-video'] };
+    if (provider.protocol !== 'openai' && provider.protocol !== 'videos') fail('Provider model discovery is not supported');
+    const policy = options.policy ?? readPolicy(options.env);
+    if (!policy.remoteEnabled) fail('Remote generation is disabled');
+    const base = validateBaseUrl(provider.baseUrl, policy);
+    const key = readSecret(options.env ?? process.env, provider.keyEnv);
+    const transport = options.transport ?? safeJsonRequest;
+    const response = await transport(joinFixedPath(base, '/models'), {
+      method: 'GET', headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(30_000),
+    }, policy);
+    if (!isRecord(response) || !Array.isArray(response.data) || response.data.length > 500) fail('Provider returned an invalid response');
+    const models: string[] = [];
+    const seen = new Set<string>();
+    for (const entry of response.data) {
+      if (!isRecord(entry)) fail('Provider returned an invalid response');
+      const id = ownString(entry, 'id');
+      if (!id || !MODEL_ID.test(id) || id.includes(key)) fail('Provider returned an invalid response');
+      if (!seen.has(id)) { seen.add(id); models.push(id); }
+    }
+    return { models };
+  } catch (error) {
+    if (error instanceof AdapterError) throw error;
+    throw new AdapterError('Provider request failed');
+  }
 }
 
 function escapeXml(value: string): string {
@@ -214,7 +292,53 @@ async function openAi(
   if (!base64 || base64.length > 6 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)) {
     fail('Provider returned an invalid response');
   }
-  return artifact('image', `data:image/png;base64,${base64}`, policy);
+  const format = request.params.output_format ?? 'png';
+  if (format !== 'png' && format !== 'jpeg' && format !== 'webp') fail('Invalid provider configuration');
+  return artifact('image', `data:image/${format};base64,${base64}`, policy);
+}
+
+async function videos(
+  request: GenerationRequest,
+  base: URL,
+  key: string,
+  transport: ProviderTransport,
+  policy: SecurityPolicy,
+  pollIntervalMs: number,
+  maxPolls: number,
+): Promise<GenerationOutput> {
+  if (request.kind !== 'video') fail('Provider capability is not supported');
+  const params = parseVideosParams(request.params);
+  const body: Record<string, unknown> = { model: request.model, prompt: request.prompt, ...params };
+  if (request.referenceUrl) body.input_reference = { image_url: request.referenceUrl };
+  const created = await transport(joinFixedPath(base, '/videos'), {
+    method: 'POST', headers: { authorization: `Bearer ${key}` }, body, signal: request.signal,
+  }, policy);
+  if (!isRecord(created)) fail('Provider returned an invalid response');
+  const remoteId = ownString(created, 'id');
+  if (!remoteId || !/^[A-Za-z0-9_-]{1,200}$/.test(remoteId)) fail('Provider returned an invalid response');
+  await request.onSubmitted(remoteId);
+  const complete = (response: Record<string, unknown>): GenerationOutput => {
+    const value = ownString(response, 'url') ?? ownString(response, 'video_url');
+    if (!value) fail('Provider returned an unsupported content response');
+    return { ...artifact('video', value, policy), remoteId };
+  };
+  const initialStatus = ownString(created, 'status');
+  if (initialStatus === 'completed') return complete(created);
+  if (initialStatus === 'failed') fail('Provider generation failed');
+  if (initialStatus !== 'queued' && initialStatus !== 'in_progress') fail('Provider returned an invalid response');
+  const pollUrl = joinFixedPath(base, `/videos/${encodeURIComponent(remoteId)}`);
+  for (let index = 0; index < maxPolls; index += 1) {
+    await pause(pollIntervalMs, request.signal);
+    const polled = await transport(pollUrl, {
+      method: 'GET', headers: { authorization: `Bearer ${key}` }, signal: request.signal,
+    }, policy);
+    if (!isRecord(polled)) fail('Provider returned an invalid response');
+    const status = ownString(polled, 'status');
+    if (status === 'completed') return complete(polled);
+    if (status === 'failed') fail('Provider generation failed');
+    if (status !== 'queued' && status !== 'in_progress') fail('Provider returned an invalid response');
+  }
+  fail('Provider polling limit reached');
 }
 
 async function fal(
@@ -322,6 +446,7 @@ export async function generate(
     }
 
     if (provider.protocol === 'openai') return await openAi(provider, request, base, key, transport, policy);
+    if (provider.protocol === 'videos') return await videos(request, base, key, transport, policy, pollIntervalMs, maxPolls);
     if (provider.protocol === 'fal') return await fal(provider, request, base, key, transport, policy, pollIntervalMs, maxPolls);
     if (provider.protocol === 'replicate') return await replicate(provider, request, base, key, transport, policy, pollIntervalMs, maxPolls);
     fail('Provider protocol is not supported');

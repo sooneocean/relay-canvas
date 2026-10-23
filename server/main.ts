@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Store, atomicWrite } from './store.js';
@@ -6,12 +6,15 @@ import { CanvasService } from './service.js';
 import { createApp, serveProduction } from './app.js';
 
 const root = process.cwd();
-const directory = path.resolve(process.env.RELAY_DATA_DIR ?? path.join(root, '.relay-canvas'));
+const requestedDirectory = path.resolve(process.env.RELAY_DATA_DIR ?? path.join(root, '.relay-canvas'));
 const port = Number(process.env.RELAY_PORT ?? 4310);
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('RELAY_PORT must be between 1024 and 65535.');
 const origin = `http://127.0.0.1:${port}`;
 const dev = process.argv.includes('--dev');
-mkdirSync(directory, { recursive: true, mode: 0o700 });
+mkdirSync(requestedDirectory, { recursive: true, mode: 0o700 });
+const directoryStat = lstatSync(requestedDirectory);
+if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) throw new Error('RELAY_DATA_DIR must be a real directory.');
+const directory = realpathSync(requestedDirectory);
 const lockFile = path.join(directory, 'server.lock'), lock = JSON.stringify({ pid: process.pid, nonce: randomUUID() });
 if (existsSync(lockFile)) {
   const old = readFileSync(lockFile, 'utf8');
@@ -42,7 +45,7 @@ try {
     const session = { origin, token, pid: process.pid };
     atomicWrite(path.join(directory, 'session.json'), session);
     ownedSession = JSON.stringify(session);
-    console.log(`Relay Canvas v0.2.0 — ${origin}`);
+    console.log(`Relay Canvas v0.3.0 — ${origin}`);
     console.log(`Remote generation: ${service.policy.remoteEnabled ? 'enabled (confirmation required)' : 'disabled — Demo is ready'}`);
   });
   server.on('error', () => { console.error('Could not start local server. Check port and workspace ownership.'); process.exitCode = 1; });

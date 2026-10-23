@@ -21,6 +21,7 @@ export interface AssetItem {
   boardName: string;
   nodeId: string;
   runId: string;
+  artifactIndex: number;
   startedAt: string;
   artifact: Artifact;
   kind: Artifact['kind'];
@@ -100,10 +101,11 @@ export function deriveAssets(boards: Board[], runs: Run[]): AssetItem[] {
           boardName: boardNames.get(run.boardId) ?? '',
           nodeId,
           runId: run.id,
+          artifactIndex: index,
           startedAt: run.startedAt,
           artifact,
           kind: artifact.kind,
-          url: artifact.url,
+          url: artifact.localUrl ?? artifact.url,
         }));
       });
     });

@@ -8,6 +8,7 @@ export const providers: Provider[] = [
   { id: 'demo', name: 'Demo Studio', protocol: 'demo', baseUrl: '', keyEnv: '', imageModel: 'demo-image', videoModel: 'demo-video' },
   { id: 'openai', name: 'OpenAI compatible', protocol: 'openai', baseUrl: 'https://api.openai.com/v1', keyEnv: 'RELAY_KEY_OPENAI', imageModel: 'gpt-image-1', videoModel: '' },
   { id: 'newapi', name: 'New API / One API', protocol: 'openai', baseUrl: '', keyEnv: 'RELAY_KEY_NEWAPI', imageModel: 'gpt-image-1', videoModel: '' },
+  { id: 'videos', name: 'Videos JSON relay', protocol: 'videos', baseUrl: '', keyEnv: 'RELAY_KEY_VIDEOS', imageModel: '', videoModel: '' },
   { id: 'fal', name: 'fal.ai', protocol: 'fal', baseUrl: 'https://queue.fal.run', keyEnv: 'RELAY_KEY_FAL', imageModel: 'fal-ai/flux/schnell', videoModel: 'fal-ai/kling-video/v3/standard/image-to-video' },
   { id: 'replicate', name: 'Replicate', protocol: 'replicate', baseUrl: 'https://api.replicate.com/v1', keyEnv: 'RELAY_KEY_REPLICATE', imageModel: 'black-forest-labs/flux-schnell', videoModel: 'minimax/video-01' },
 ];

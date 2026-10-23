@@ -7,6 +7,7 @@ import path from 'node:path';
 import os from 'node:os';
 import net from 'node:net';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { AppState, Board, Run } from '../src/shared/types.js';
 
@@ -18,7 +19,8 @@ const port = (portProbe.address() as net.AddressInfo).port;
 await new Promise<void>(r => portProbe.close(() => r()));
 const origin = `http://127.0.0.1:${port}`;
 const logs: string[] = [];
-const child = spawn(process.execPath, ['build/server/main.js'], { cwd: root, env: { ...process.env, RELAY_DATA_DIR: dataDir, RELAY_PORT: String(port), RELAY_ENABLE_REMOTE: 'false' }, stdio: ['ignore', 'pipe', 'pipe'] });
+const launchServer = () => spawn(process.execPath, ['build/server/main.js'], { cwd: root, env: { ...process.env, RELAY_DATA_DIR: dataDir, RELAY_PORT: String(port), RELAY_ENABLE_REMOTE: 'false' }, stdio: ['ignore', 'pipe', 'pipe'] });
+let child = launchServer();
 child.stdout.on('data', b => logs.push(String(b))); child.stderr.on('data', b => logs.push(String(b)));
 const artifacts = path.join(root, 'work'); mkdirSync(artifacts, { recursive: true });
 const failures: string[] = [];
@@ -31,7 +33,7 @@ async function until<T>(probe: () => Promise<T>, predicate: (value: T) => boolea
 }
 try {
   await until(() => fetch(`${origin}/healthz`).then(r => r.ok), x => x, 'server startup');
-  const session = JSON.parse(readFileSync(path.join(dataDir, 'session.json'), 'utf8')) as { token: string };
+  let session = JSON.parse(readFileSync(path.join(dataDir, 'session.json'), 'utf8')) as { token: string };
   async function api<T>(endpoint: string, method = 'GET', body?: unknown): Promise<T> {
     const response = await fetch(`${origin}${endpoint}`, { method, headers: { Origin: origin, 'X-Canvas-Token': session.token, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
     if (!response.ok) throw new Error(`API ${endpoint}: ${response.status}`);
@@ -42,7 +44,9 @@ try {
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
   let expectedNetworkFailure = false;
   let sessionRequests = 0;
+  let generationRequests = 0;
   page.on('request', request => { if (new URL(request.url()).pathname === '/api/session') sessionRequests++; });
+  page.on('request', request => { if (new URL(request.url()).pathname === '/api/runs' && request.method() === 'POST') generationRequests++; });
   page.on('pageerror', e => failures.push(e.message));
   page.on('console', msg => { if (msg.type() === 'error' && !(expectedNetworkFailure && /Failed to load resource|net::ERR_/.test(msg.text()))) failures.push(msg.text()); });
   await page.goto(origin);
@@ -116,7 +120,50 @@ try {
   assert.equal(await page.locator('.react-flow__node').count(), 4);
   await page.getByLabel('provider-settings').first().click();
   await page.getByText('Remote generation disabled', { exact: true }).waitFor();
+  await page.getByLabel('provider-diagnostics', { exact: true }).click();
+  await page.getByLabel('query-models', { exact: true }).click();
+  await until(() => page.getByLabel('provider-image-model-options', { exact: true }).locator('option').count(), count => count >= 3, 'Demo models discovered without generation');
+  await page.getByLabel('provider-template', { exact: true }).selectOption('videos');
+  const providerIdsBefore = (await api<AppState>('/api/state')).providers.map(p => p.id);
+  await page.getByLabel('add-provider', { exact: true }).click();
+  assert.equal(await page.getByLabel('query-models', { exact: true }).isDisabled(), true);
+  let providerSaveStarted = false;
+  let releaseProviderSave!: () => void;
+  const providerSaveHeld = new Promise<void>(resolve => { releaseProviderSave = resolve; });
+  await page.route('**/api/providers', async route => {
+    if (route.request().method() !== 'PUT') { await route.continue(); return; }
+    const response = await route.fetch(); providerSaveStarted = true;
+    await providerSaveHeld; await route.fulfill({ response });
+  });
+  try {
+    await page.getByLabel('provider-save', { exact: true }).click();
+    await until(async () => providerSaveStarted, value => value, 'provider save held after server commit');
+    await page.getByLabel('provider-name', { exact: true }).fill('Custom video edited during save');
+    releaseProviderSave();
+    await until(() => page.getByLabel('provider-save', { exact: true }).isEnabled(), value => value, 'new provider draft remains dirty');
+    assert.equal(await page.getByLabel('provider-name', { exact: true }).inputValue(), 'Custom video edited during save');
+  } finally { releaseProviderSave(); await page.unroute('**/api/providers'); }
+  await page.getByLabel('provider-save', { exact: true }).click();
+  await until(() => api<AppState>('/api/state'), s => s.providers.some(p => p.protocol === 'videos' && !providerIdsBefore.includes(p.id)), 'custom videos profile persisted');
+  await until(() => api<AppState>('/api/state'), s => s.providers.some(p => p.name === 'Custom video edited during save'), 'latest provider draft persisted');
+  await page.getByLabel('provider-diagnostics', { exact: true }).click();
+  await page.locator('.provider-diagnostics').waitFor();
+  await page.screenshot({ path: path.join(artifacts, 'providers-v03.png'), fullPage: true });
   await page.getByLabel('close-panel').click();
+  const customVideoProvider = (await api<AppState>('/api/state')).providers.find(p => p.name === 'Custom video edited during save')!;
+  await page.locator('.react-flow__node[data-id="motion"]').click();
+  await page.locator('.select-with-action select').selectOption(customVideoProvider.id);
+  await page.getByLabel('video-seconds', { exact: true }).selectOption('8');
+  await page.getByLabel('video-size', { exact: true }).selectOption('1280x720');
+  await page.getByLabel('video-seconds', { exact: true }).selectOption('');
+  assert.equal(await page.getByLabel('video-size', { exact: true }).inputValue(), '1280x720');
+  await page.getByLabel('video-size', { exact: true }).selectOption('');
+  assert.equal(await page.getByLabel('video-seconds', { exact: true }).inputValue(), '');
+  await until(() => api<AppState>('/api/state'), s => {
+    const node = s.boards.find(b => b.id === 'welcome')?.nodes.find(n => n.id === 'motion');
+    return node?.data.providerId === customVideoProvider.id && Object.keys(node.data.params ?? {}).length === 0;
+  }, 'video defaults remove both optional fields from persisted node');
+  await page.locator('.select-with-action select').selectOption('demo');
   const sessionsBeforeNavigation = sessionRequests;
   // All navigation paths share the same guard. A failed save must never discard a draft.
   const second = await api<Board>('/api/boards', 'POST', { name: 'Navigation target' });
@@ -204,6 +251,47 @@ try {
     })).then(values => values.every(Boolean));
   }), x => x, 'Demo thumbnail posters contain the decoded frame');
   await page.screenshot({ path: path.join(artifacts, 'assets-smoke.png'), fullPage: true });
+  const savedArtifacts: Array<{ runId: string; nodeId: string; index: number; localUrl: string; sha256: string }> = [];
+  const generationsBeforeSave = generationRequests;
+  for (const kind of ['video', 'image'] as const) {
+    await page.getByLabel(`gallery-filter-${kind}`).click();
+    const key = (await page.locator('.asset-preview-button').first().getAttribute('aria-label'))!.replace('gallery-item-', '');
+    const [runId, nodeId, rawIndex] = key.split(':'); const index = Number(rawIndex);
+    const original = (await api<Run>(`/api/runs/${runId}`)).results[nodeId].artifacts[index];
+    const pattern = `**/api/runs/${runId}/artifacts/${nodeId}/${index}/save`;
+    if (kind === 'video') {
+      expectedNetworkFailure = true;
+      await page.route(pattern, route => route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Controlled local save failure', code: 'SAVE_FAILED' }) }));
+      const failedSaveResponse = page.waitForResponse(response => response.url().endsWith(`/artifacts/${nodeId}/${index}/save`) && response.status() === 500);
+      await page.getByLabel(`save-asset-${key}`, { exact: true }).click();
+      await (await failedSaveResponse).finished();
+      await until(() => page.getByLabel(`save-asset-${key}`, { exact: true }).isEnabled(), enabled => enabled, 'local save failure can retry');
+      assert.equal((await api<Run>(`/api/runs/${runId}`)).status, 'succeeded');
+      await page.unroute(pattern); expectedNetworkFailure = false;
+    }
+    await page.getByLabel(`save-asset-${key}`, { exact: true }).click();
+    const savedRun = await until(() => api<Run>(`/api/runs/${runId}`), r => Boolean(r.results[nodeId].artifacts[index].localUrl), `${kind} saved locally`);
+    const saved = savedRun.results[nodeId].artifacts[index];
+    assert.equal(saved.url, original.url, 'original upstream reference remains unchanged');
+    assert.match(saved.localUrl!, /^\/api\/media\/[a-f0-9]{64}$/);
+    assert.equal((await fetch(`${origin}${saved.localUrl}`)).status, 403, 'local media is private');
+    const response = await fetch(`${origin}${saved.localUrl}`, { headers: { Origin: origin, 'X-Canvas-Token': session.token } });
+    assert.equal(response.status, 200);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    assert.equal(bytes.length, saved.bytes);
+    assert.equal(createHash('sha256').update(bytes).digest('hex'), saved.sha256);
+    const downloadEvent = page.waitForEvent('download');
+    await page.getByLabel(`download-asset-${key}`, { exact: true }).click();
+    const mediaDownload = await downloadEvent; const output = path.join(dataDir, `${kind}-download`); await mediaDownload.saveAs(output);
+    assert.equal(createHash('sha256').update(readFileSync(output)).digest('hex'), saved.sha256);
+    savedArtifacts.push({ runId, nodeId, index, localUrl: saved.localUrl!, sha256: saved.sha256! });
+    await page.locator('.asset-preview-button').first().click();
+    const media = page.getByLabel('asset-preview', { exact: true }).locator(kind === 'video' ? 'video' : 'img');
+    await until(() => media.getAttribute('src'), src => src === saved.localUrl, 'preview prefers private local media');
+    await page.getByLabel('close-asset-preview').click();
+  }
+  assert.equal(generationRequests, generationsBeforeSave, 'save and save retry never generate again');
+  await page.getByLabel('gallery-filter-video').click();
   await page.locator('.asset-preview-button').first().click();
   await page.getByLabel('asset-preview', { exact: true }).waitFor();
   await until(() => page.getByLabel('asset-preview', { exact: true }).locator('video').evaluate(el => (el as HTMLVideoElement).currentTime), n => n > 0.05, 'gallery preview playback');
@@ -242,8 +330,33 @@ try {
   await page.locator('.react-flow__node[data-id="brief"]').click();
   assert.match(await page.getByLabel('prompt-editor').inputValue(), /edited during save/);
   assert.equal(sessionRequests, sessionsBeforeNavigation, 'view switches never rehydrate and reset the editor');
+  // A real isolated runtime restart rotates auth while keeping local content.
+  expectedNetworkFailure = true; // State polling may observe the intentional downtime.
+  await client.close(); client = undefined;
+  const stopped = new Promise<void>(resolve => child.once('exit', () => resolve()));
+  child.kill('SIGTERM'); await stopped;
+  child = launchServer(); child.stdout.on('data', b => logs.push(String(b))); child.stderr.on('data', b => logs.push(String(b)));
+  await until(() => fetch(`${origin}/healthz`).then(r => r.ok), ok => ok, 'server restarts');
+  const previousToken = session.token;
+  session = JSON.parse(readFileSync(path.join(dataDir, 'session.json'), 'utf8')) as { token: string };
+  assert.notEqual(session.token, previousToken);
+  await page.reload();
+  await page.getByLabel('assets-nav').click();
+  await page.getByLabel('gallery-filter-video').waitFor();
+  expectedNetworkFailure = false;
+  for (const [index, saved] of savedArtifacts.entries()) {
+    await page.getByLabel(`gallery-filter-${index === 0 ? 'video' : 'image'}`).click();
+    assert.equal((await fetch(`${origin}${saved.localUrl}`, { headers: { Origin: origin, 'X-Canvas-Token': previousToken } })).status, 403);
+    await page.getByLabel(`gallery-item-${saved.runId}:${saved.nodeId}:${saved.index}`, { exact: true }).click();
+    const preview = page.getByLabel('asset-preview', { exact: true });
+    if (index === 0) await until(() => preview.locator('video').evaluate(el => (el as HTMLVideoElement).currentTime), value => value > 0.05, 'local video plays after restart');
+    else await until(() => preview.locator('img').evaluate(el => (el as HTMLImageElement).naturalWidth), value => value > 0, 'local image decodes after restart');
+    await page.getByLabel('close-asset-preview').click();
+  }
+  await page.screenshot({ path: path.join(artifacts, 'local-assets-v03.png'), fullPage: true });
+  expectedNetworkFailure = false;
   assert.deepEqual(failures, [], `Browser console errors: ${failures.join('\n')}`);
-  writeFileSync(path.join(artifacts, 'smoke-report.json'), JSON.stringify({ status: 'PASS', browser: await browser.version(), checks: ['creator home and project search', 'edit/save', 'drag', 'connect handles and persist', 'Demo image to video exact reference', 'video playback advances', 'JSON export/import', 'reload', 'MCP list and patch', 'MCP run and idempotent replay', 'Agent UI sync', 'add/delete node', 'provider settings', '12 navigation failure and concurrent-edit scenarios', 'asset filters/search/preview/source', 'quick image/video project persistence', 'desktop and narrow viewport layouts', 'no browser errors'], paidRequests: 0 }, null, 2));
+  writeFileSync(path.join(artifacts, 'smoke-report.json'), JSON.stringify({ status: 'PASS', browser: await browser.version(), checks: ['creator home and project search', 'edit/save', 'drag', 'connect handles and persist', 'Demo image to video exact reference', 'video playback advances', 'JSON export/import', 'reload', 'MCP list and patch', 'MCP run and idempotent replay', 'Agent UI sync', 'add/delete node', 'provider settings/templates/diagnostics/models', 'private local image/video save and exact download', 'save failure retries without generation', 'local playback after runtime restart and auth rotation', '12 navigation failure and concurrent-edit scenarios', 'asset filters/search/preview/source', 'quick image/video project persistence', 'desktop and narrow viewport layouts', 'no browser errors'], paidRequests: 0 }, null, 2));
   console.log('PASS: creator home, gallery, guarded navigation, canvas, persistence, Demo image/video, MCP tools, Agent UI sync; zero paid requests.');
 } catch (error) {
   console.error((error as Error).stack ?? (error as Error).message);

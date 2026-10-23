@@ -5,7 +5,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 
 const directory = path.resolve(process.env.RELAY_DATA_DIR ?? path.join(process.cwd(), '.relay-canvas'));
-const server = new McpServer({ name: 'relay-canvas', version: '0.2.0' });
+const server = new McpServer({ name: 'relay-canvas', version: '0.3.0' });
 const id = z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/);
 async function call(endpoint: string, method = 'GET', body?: unknown) {
   try {

@@ -83,6 +83,8 @@ import type {
   ExecutionPlan,
   NodeResult,
   Provider,
+  ProviderDiagnostic,
+  ProviderModels,
   Run,
   Status,
 } from '../shared/types.js';
@@ -259,6 +261,13 @@ function assetForResult(result?: NodeResult): Artifact | undefined {
   return result?.artifacts?.[0];
 }
 
+function artifactUrl(artifact?: Artifact): string | undefined {
+  return artifact?.localUrl ?? artifact?.url;
+}
+
+type AssetSaveState = { status: 'saving' | 'saved' | 'failed'; message?: string };
+type ProviderTemplate = 'openai' | 'newapi' | 'videos' | 'fal' | 'replicate';
+
 function VideoThumbnail({ src, alt, className = '' }: { src: string; alt: string; className?: string }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const previewTimeRef = useRef<number | undefined>(undefined);
@@ -385,6 +394,12 @@ function AppShell() {
   const [confirmRun, setConfirmRun] = useState<{ nodeId?: string; operationId: string; plan: ExecutionPlan }>();
   const [providerDraftId, setProviderDraftId] = useState('demo');
   const [providersDirty, setProvidersDirty] = useState(false);
+  const [providerDiagnostics, setProviderDiagnostics] = useState<Record<string, ProviderDiagnostic>>({});
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
+  const [providerModels, setProviderModels] = useState<Record<string, string[]>>({});
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [providersSaving, setProvidersSaving] = useState(false);
+  const [assetSaveStates, setAssetSaveStates] = useState<Record<string, AssetSaveState>>({});
   const [conflict, setConflict] = useState<BoardConflict>();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const tokenRef = useRef(token);
@@ -393,6 +408,10 @@ function AppShell() {
   const boardsRef = useRef(boards);
   const editVersionRef = useRef(0);
   const saveInFlightRef = useRef<Promise<Board | undefined> | null>(null);
+  const providersRef = useRef(providers);
+  const providerDraftIdRef = useRef(providerDraftId);
+  const providerEditVersionRef = useRef(0);
+  const providerSaveInFlightRef = useRef<Promise<void> | null>(null);
   const statePollInFlightRef = useRef(false);
   const conflictNoticeRef = useRef<string | undefined>(undefined);
   const autosaveTimer = useRef<number | undefined>(undefined);
@@ -422,6 +441,8 @@ function AppShell() {
   useEffect(() => { activeBoardIdRef.current = activeBoardId; }, [activeBoardId]);
   useEffect(() => { dirtyRef.current = dirty; }, [dirty]);
   useEffect(() => { boardsRef.current = boards; }, [boards]);
+  useEffect(() => { providersRef.current = providers; }, [providers]);
+  useEffect(() => { providerDraftIdRef.current = providerDraftId; }, [providerDraftId]);
 
   const notify = useCallback((message: string, tone: 'info' | 'error' | 'success' = 'info') => {
     setToast({ message, tone });
@@ -433,7 +454,7 @@ function AppShell() {
     headers.set('Accept', 'application/json');
     if (requestToken) headers.set('X-Canvas-Token', requestToken);
     if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-    const response = await fetch(path, { ...init, headers });
+    const response = await fetch(path, { ...init, headers, credentials: init.credentials ?? 'same-origin' });
     let payload: unknown;
     try { payload = await response.json(); } catch { payload = undefined; }
     if (!response.ok) {
@@ -465,7 +486,10 @@ function AppShell() {
         setActiveBoardId(nextBoard.id);
         paintBoard(nextBoard);
       }
-      if (state.providers?.length) setProviders(state.providers);
+      if (state.providers?.length) {
+        providerEditVersionRef.current += 1;
+        setProviders(state.providers);
+      }
       setProvidersDirty(false);
       if (state.runs) setRuns(state.runs);
       if (state.settings) setSettings(state.settings);
@@ -491,7 +515,10 @@ function AppShell() {
       const state = await requestJson<AppState>('/api/state');
       if (state.runs) setRuns(state.runs);
       if (state.settings) setSettings(state.settings);
-      if (state.providers && !providersDirty) setProviders(state.providers);
+      if (state.providers && !providersDirty && JSON.stringify(state.providers) !== JSON.stringify(providersRef.current)) {
+        providerEditVersionRef.current += 1;
+        setProviders(state.providers);
+      }
       if (state.boards?.length) {
         const currentBoards = boardsRef.current;
         const activeId = activeBoardIdRef.current;
@@ -554,7 +581,10 @@ function AppShell() {
       boardsRef.current = state.boards;
       setBoards(state.boards);
       if (state.runs) setRuns(state.runs);
-      if (state.providers) setProviders(state.providers);
+      if (state.providers) {
+        providerEditVersionRef.current += 1;
+        setProviders(state.providers);
+      }
       if (state.settings) setSettings(state.settings);
       setProvidersDirty(false);
       paintBoard(remoteBoard);
@@ -956,7 +986,7 @@ function AppShell() {
     setNodes((current) => current.map((node) => {
       const result = resultByNode[node.id];
       const artifact = assetForResult(result);
-      return result ? { ...node, data: { ...node.data, runStatus: result.status, runError: result.error, previewUrl: artifact?.url } } : node;
+      return result ? { ...node, data: { ...node.data, runStatus: result.status, runError: result.error, previewUrl: artifactUrl(artifact) } } : node;
     }));
   }, [latestRunSignature]);
 
@@ -970,47 +1000,196 @@ function AppShell() {
     }, '切換專案');
   }, [guardNavigation]);
 
-  const updateProviderDraft = useCallback((patch: Partial<Provider>) => {
-    setProviders((current) => current.map((provider) => provider.id === providerDraftId ? { ...provider, ...patch } : provider));
-    setProvidersDirty(true);
-  }, [providerDraftId]);
+  const saveAsset = useCallback(async (runId: string, nodeId: string, artifactIndex: number) => {
+    const key = `${runId}:${nodeId}:${artifactIndex}`;
+    const currentState = assetSaveStates[key];
+    if (currentState?.status === 'saving') return;
+    const run = runs.find((candidate) => candidate.id === runId);
+    const artifact = run?.results[nodeId]?.artifacts?.[artifactIndex];
+    if (!artifact) {
+      setAssetSaveStates((current) => ({ ...current, [key]: { status: 'failed', message: '找不到這份素材。' } }));
+      return;
+    }
+    if (artifact.localUrl || artifact.localId) {
+      setAssetSaveStates((current) => ({ ...current, [key]: { status: 'saved' } }));
+      return;
+    }
+    if (apiState !== 'ready' || !tokenRef.current) {
+      setAssetSaveStates((current) => ({ ...current, [key]: { status: 'failed', message: '服務尚未連線，請重試。' } }));
+      notify('素材保存失敗，請確認服務連線後重試。', 'error');
+      return;
+    }
+    setAssetSaveStates((current) => ({ ...current, [key]: { status: 'saving' } }));
+    try {
+      const response = await requestJson<Artifact | { artifact: Artifact }>(`/api/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(nodeId)}/${artifactIndex}/save`, { method: 'POST', body: '{}' });
+      const savedArtifact = 'artifact' in response ? response.artifact : response;
+      setRuns((current) => current.map((candidate) => {
+        if (candidate.id !== runId) return candidate;
+        const result = candidate.results[nodeId];
+        if (!result) return candidate;
+        return {
+          ...candidate,
+          results: {
+            ...candidate.results,
+            [nodeId]: { ...result, artifacts: result.artifacts.map((item, index) => index === artifactIndex ? savedArtifact : item) },
+          },
+        };
+      }));
+      setAssetSaveStates((current) => ({ ...current, [key]: { status: 'saved' } }));
+      notify('素材已保存到本機。', 'success');
+    } catch {
+      setAssetSaveStates((current) => ({ ...current, [key]: { status: 'failed', message: '保存失敗，請重試。' } }));
+      notify('素材保存失敗，請重試。', 'error');
+    }
+  }, [apiState, assetSaveStates, notify, requestJson, runs]);
 
-  const addProvider = useCallback(() => {
+  const updateProviderDraft = useCallback((patch: Partial<Provider>) => {
+    const draftId = providerDraftIdRef.current;
+    providerEditVersionRef.current += 1;
+    setProviders((current) => {
+      const next = current.map((provider) => provider.id === draftId ? { ...provider, ...patch } : provider);
+      providersRef.current = next;
+      return next;
+    });
+    setProviderDiagnostics((current) => {
+      const next = { ...current };
+      delete next[draftId];
+      return next;
+    });
+    setProviderModels((current) => {
+      const next = { ...current };
+      delete next[draftId];
+      return next;
+    });
+    setProvidersDirty(true);
+  }, []);
+
+  const addProvider = useCallback((template: ProviderTemplate = 'openai') => {
     if (providers.length >= 20) {
       notify('供應商最多 20 個。', 'error');
       return;
     }
     const id = makeId('provider');
     const envSuffix = id.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase();
+    const templates: Record<ProviderTemplate, Omit<Provider, 'id' | 'keyEnv'>> = {
+      openai: { name: 'OpenAI compatible', protocol: 'openai', baseUrl: 'https://api.openai.com/v1', imageModel: 'gpt-image-1', videoModel: '' },
+      newapi: { name: 'New API / One API', protocol: 'openai', baseUrl: '', imageModel: 'gpt-image-1', videoModel: '' },
+      videos: { name: 'Videos JSON relay', protocol: 'videos', baseUrl: '', imageModel: '', videoModel: '' },
+      fal: { name: 'fal.ai', protocol: 'fal', baseUrl: 'https://queue.fal.run', imageModel: 'fal-ai/flux/schnell', videoModel: 'fal-ai/kling-video/v3/standard/image-to-video' },
+      replicate: { name: 'Replicate', protocol: 'replicate', baseUrl: 'https://api.replicate.com/v1', imageModel: 'black-forest-labs/flux-schnell', videoModel: 'minimax/video-01' },
+    };
     const provider: Provider = {
       id,
-      name: 'New provider',
-      protocol: 'openai',
-      baseUrl: '',
+      ...templates[template],
       keyEnv: `RELAY_KEY_${envSuffix}`.slice(0, 74),
-      imageModel: 'model-name',
-      videoModel: '',
     };
-    setProviders((current) => [...current, provider]);
+    providerEditVersionRef.current += 1;
+    setProviders((current) => {
+      const next = [...current, provider];
+      providersRef.current = next;
+      return next;
+    });
     setProvidersDirty(true);
+    providerDraftIdRef.current = id;
     setProviderDraftId(id);
-    notify('已新增供應商設定，請填入協定與環境變數名稱。', 'info');
+    notify(`已新增 ${provider.name} 設定，請填入協定與環境變數名稱。`, 'info');
   }, [notify, providers.length]);
 
   const saveProviders = useCallback(async () => {
+    if (providerSaveInFlightRef.current) return providerSaveInFlightRef.current;
     if (apiState !== 'ready') {
       notify('服務尚未連線，無法保存供應商設定。', 'error');
       return;
     }
+    const snapshot = providersRef.current;
+    const editVersionAtStart = providerEditVersionRef.current;
+    const operation = (async () => {
+      setProvidersSaving(true);
+      try {
+        const response = await requestJson<Provider[] | { providers: Provider[] }>('/api/providers', { method: 'PUT', body: JSON.stringify({ providers: snapshot }) });
+        const savedProviders = 'providers' in response ? response.providers : response;
+        if (providerEditVersionRef.current !== editVersionAtStart) {
+          setProvidersDirty(true);
+          notify('供應商已保存較早版本；保存期間的新編輯仍保留，請再次保存。', 'info');
+          return;
+        }
+        providersRef.current = savedProviders;
+        setProviders(savedProviders);
+        setProvidersDirty(false);
+        setProviderDiagnostics({});
+        setProviderModels({});
+        notify('供應商設定已保存。', 'success');
+      } catch (error) {
+        notify(`供應商設定保存失敗：${errorMessage(error)}`, 'error');
+      } finally {
+        setProvidersSaving(false);
+      }
+    })();
+    providerSaveInFlightRef.current = operation;
     try {
-      const response = await requestJson<Provider[] | { providers: Provider[] }>('/api/providers', { method: 'PUT', body: JSON.stringify({ providers }) });
-      setProviders('providers' in response ? response.providers : response);
-      setProvidersDirty(false);
-      notify('供應商設定已保存。', 'success');
-    } catch (error) {
-      notify(`供應商設定保存失敗：${errorMessage(error)}`, 'error');
+      await operation;
+    } finally {
+      if (providerSaveInFlightRef.current === operation) providerSaveInFlightRef.current = null;
     }
-  }, [apiState, notify, providers, requestJson]);
+  }, [apiState, notify, requestJson]);
+
+  const refreshProviderDiagnostics = useCallback(async () => {
+    if (providersDirty || apiState !== 'ready' || !tokenRef.current) return;
+    const requestProviderId = providerDraftIdRef.current;
+    const requestVersion = providerEditVersionRef.current;
+    const requestProfile = JSON.stringify(providersRef.current.find((provider) => provider.id === requestProviderId));
+    const requestIsCurrent = () => providerDraftIdRef.current === requestProviderId
+      && providerEditVersionRef.current === requestVersion
+      && JSON.stringify(providersRef.current.find((provider) => provider.id === requestProviderId)) === requestProfile;
+    setDiagnosticsLoading(true);
+    try {
+      const response = await requestJson<ProviderDiagnostic[] | { diagnostics: ProviderDiagnostic[] }>('/api/providers/diagnostics');
+      const diagnostics = 'diagnostics' in response ? response.diagnostics : response;
+      if (!requestIsCurrent()) return;
+      setProviderDiagnostics(Object.fromEntries(diagnostics.map((diagnostic) => [diagnostic.providerId, diagnostic])));
+      notify('Provider 診斷已更新。', 'success');
+    } catch {
+      if (requestIsCurrent()) notify('Provider 診斷失敗，請稍後重試。', 'error');
+    } finally {
+      setDiagnosticsLoading(false);
+    }
+  }, [apiState, notify, providersDirty, requestJson]);
+
+  const queryProviderModels = useCallback(async () => {
+    const requestProviderId = providerDraftIdRef.current;
+    const provider = providersRef.current.find((candidate) => candidate.id === requestProviderId);
+    if (!provider || providersDirty || apiState !== 'ready' || !tokenRef.current) return;
+    const requestVersion = providerEditVersionRef.current;
+    const requestProfile = JSON.stringify(provider);
+    const requestIsCurrent = () => providerDraftIdRef.current === requestProviderId
+      && providerEditVersionRef.current === requestVersion
+      && JSON.stringify(providersRef.current.find((candidate) => candidate.id === requestProviderId)) === requestProfile;
+    if (provider.protocol === 'demo') {
+      setProviderModels((current) => ({ ...current, [provider.id]: [provider.imageModel, provider.videoModel].filter(Boolean) }));
+      notify('Demo 模型清單為固定離線清單。', 'info');
+      return;
+    }
+    if (provider.protocol !== 'openai' && provider.protocol !== 'videos') {
+      notify('此協定未提供安全模型查詢，請手動輸入模型。', 'info');
+      return;
+    }
+    const diagnostic = providerDiagnostics[provider.id];
+    if (!settings.remoteEnabled || !diagnostic?.configurationValid || !diagnostic.remoteEnabled || !diagnostic.credentialConfigured) {
+      notify('模型查詢需要已保存且 ready 的遠端 provider。', 'error');
+      return;
+    }
+    setModelsLoading(true);
+    try {
+      const response = await requestJson<ProviderModels>(`/api/providers/${encodeURIComponent(provider.id)}/models`);
+      if (!requestIsCurrent()) return;
+      setProviderModels((current) => ({ ...current, [provider.id]: response.models }));
+      notify(`已取得 ${response.models.length} 個模型。`, 'success');
+    } catch {
+      if (requestIsCurrent()) notify('模型查詢失敗，請確認 provider 設定。', 'error');
+    } finally {
+      setModelsLoading(false);
+    }
+  }, [apiState, notify, providerDiagnostics, providersDirty, requestJson, settings.remoteEnabled]);
 
   const onDrop = useCallback((event: DragEvent<HTMLElement>) => {
     event.preventDefault();
@@ -1057,10 +1236,12 @@ function AppShell() {
       onFilterChange={setAssetFilter}
       onBack={goHome}
       onOpenBoard={(boardId, nodeId) => openProject(boardId, nodeId)}
-      preview={assetPreview}
+      preview={assetPreview ? assets.find((asset) => asset.id === assetPreview.id) ?? assetPreview : undefined}
       onPreview={setAssetPreview}
       onClosePreview={() => setAssetPreview(undefined)}
       onCreate={() => void createBoard()}
+      assetSaveStates={assetSaveStates}
+      onSaveAsset={saveAsset}
     >{toastView}</AssetsPage>;
   }
 
@@ -1074,7 +1255,7 @@ function AppShell() {
             <div className="brand-name">Relay Canvas</div>
             <div className="brand-kicker">IDEAS, CONNECTED.</div>
           </div>
-          <span className="version-tag">v0.2.0</span>
+          <span className="version-tag">v0.3.0</span>
         </div>
         <div className="board-switcher">
           <Layers3 size={15} />
@@ -1167,7 +1348,7 @@ function AppShell() {
             </ReactFlow>
             <div className="canvas-watermark"><span className="watermark-pulse" />{apiState === 'ready' ? 'Connected to local runtime' : 'Demo canvas · local preview'}</div>
           </div>
-          {selectedNode && !panelOpen && panel === 'inspector' && <div className={`floating-composer${selectedNode.data.previewUrl || selectedNode.data.assetUrl ? ' has-media-preview' : ''}`} aria-label="floating-composer"><button className="floating-composer-close" aria-label="close-floating-composer" onClick={() => setSelectedNodeId(undefined)}><X size={14} /></button><InspectorPanel node={selectedNode} providers={providers} selectedResult={selectedResult} onChange={updateSelectedNode} onDelete={deleteSelectedNode} onOpenProviders={() => { setProviderDraftId(selectedNode.data.providerId ?? 'demo'); setPanel('providers'); setPanelOpen(true); }} /></div>}
+          {selectedNode && !panelOpen && panel === 'inspector' && <div className={`floating-composer${selectedNode.data.previewUrl || selectedNode.data.assetUrl ? ' has-media-preview' : ''}`} aria-label="floating-composer"><button className="floating-composer-close" aria-label="close-floating-composer" onClick={() => setSelectedNodeId(undefined)}><X size={14} /></button><InspectorPanel node={selectedNode} providers={providers} selectedResult={selectedResult} runId={latestRun?.id} assetSaveStates={assetSaveStates} onSaveAsset={saveAsset} onChange={updateSelectedNode} onDelete={deleteSelectedNode} onOpenProviders={() => { const id = selectedNode.data.providerId ?? 'demo'; providerDraftIdRef.current = id; setProviderDraftId(id); setPanel('providers'); setPanelOpen(true); }} /></div>}
           {plan && <div className={`validation-toast ${plan.errors.length ? 'has-errors' : ''}`}><span>{plan.errors.length ? <AlertCircle size={14} /> : <Check size={14} />}</span><div><strong>{plan.errors.length ? 'Validation needs attention' : 'Ready to run'}</strong><small>{plan.errors.length ? plan.errors[0] : `${plan.order.length} node${plan.order.length === 1 ? '' : 's'} in execution order`}</small></div><button aria-label="close-validation" onClick={() => setPlan(undefined)}><X size={14} /></button></div>}
         </main>
 
@@ -1177,9 +1358,9 @@ function AppShell() {
             <button className={panel === 'inspector' ? 'is-active' : ''} onClick={() => setPanel('inspector')}><PanelRight size={15} />Inspector</button>
             <button className={panel === 'history' ? 'is-active' : ''} onClick={() => setPanel('history')}><Clock3 size={15} />History{runs.length > 0 && <span className="tab-count">{runs.length}</span>}</button>
           </div>
-          {panel === 'inspector' && <InspectorPanel node={selectedNode} providers={providers} selectedResult={selectedResult} onChange={updateSelectedNode} onDelete={deleteSelectedNode} onOpenProviders={() => { setProviderDraftId(selectedNode?.data.providerId ?? 'demo'); setPanel('providers'); setPanelOpen(true); }} />}
-          {panel === 'history' && <HistoryPanel runs={runs.filter((run) => run.boardId === activeBoardId)} activeRunId={activeRun?.id} currentRevision={activeBoard?.revision} onSelect={(run) => { if (run.revision !== activeBoard?.revision) { notify('這筆執行來自較舊 revision，保留在 history，不覆蓋目前畫布。', 'info'); return; } setNodes((current) => current.map((node) => { const result = run.results[node.id]; const artifact = assetForResult(result); return result ? { ...node, data: { ...node.data, runStatus: result.status, runError: result.error, previewUrl: artifact?.url } } : node; })); }} />}
-          {panel === 'providers' && <ProvidersPanel providers={providers} selectedId={providerDraftId} settings={settings} dirty={providersDirty} onSelect={setProviderDraftId} onChange={updateProviderDraft} onAdd={addProvider} onSave={() => void saveProviders()} />}
+          {panel === 'inspector' && <InspectorPanel node={selectedNode} providers={providers} selectedResult={selectedResult} runId={latestRun?.id} assetSaveStates={assetSaveStates} onSaveAsset={saveAsset} onChange={updateSelectedNode} onDelete={deleteSelectedNode} onOpenProviders={() => { const id = selectedNode?.data.providerId ?? 'demo'; providerDraftIdRef.current = id; setProviderDraftId(id); setPanel('providers'); setPanelOpen(true); }} />}
+          {panel === 'history' && <HistoryPanel runs={runs.filter((run) => run.boardId === activeBoardId)} activeRunId={activeRun?.id} currentRevision={activeBoard?.revision} onSelect={(run) => { if (run.revision !== activeBoard?.revision) { notify('這筆執行來自較舊 revision，保留在 history，不覆蓋目前畫布。', 'info'); return; } setNodes((current) => current.map((node) => { const result = run.results[node.id]; const artifact = assetForResult(result); return result ? { ...node, data: { ...node.data, runStatus: result.status, runError: result.error, previewUrl: artifactUrl(artifact) } } : node; })); }} />}
+          {panel === 'providers' && <ProvidersPanel providers={providers} selectedId={providerDraftId} settings={settings} apiReady={apiState === 'ready'} dirty={providersDirty} saving={providersSaving} diagnostics={providerDiagnostics} diagnosticsLoading={diagnosticsLoading} models={providerModels[providerDraftId] ?? []} modelsLoading={modelsLoading} onDiagnostics={() => void refreshProviderDiagnostics()} onQueryModels={() => void queryProviderModels()} onSelect={(id) => { providerDraftIdRef.current = id; setProviderDraftId(id); }} onChange={updateProviderDraft} onAdd={addProvider} onSave={() => void saveProviders()} />}
           {panel === 'help' && <HelpPanel />}
         </aside>}
       </div>
@@ -1228,10 +1409,10 @@ function HomePage({ cards, query, apiState, apiError, navigationPending, onQuery
       <div className="home-sidebar-label">CREATE</div>
       <button className="home-create-link" aria-label="create-image" onClick={onCreateImage} disabled={navigationPending}><span className="home-create-icon"><ImagePlus size={16} /></span><span><strong>圖片創作</strong><small>Image direction</small></span></button>
       <button className="home-create-link" aria-label="create-video" onClick={onCreateVideo} disabled={navigationPending}><span className="home-create-icon video"><Video size={16} /></span><span><strong>影片創作</strong><small>Motion study</small></span></button>
-      <div className="home-sidebar-bottom"><span className="demo-chip">DEMO</span><span>v0.2.0</span><span className={`home-api-state ${apiState}`}><i />{apiState === 'ready' ? 'Local API' : apiState === 'loading' ? 'Connecting' : 'Offline'}</span></div>
+      <div className="home-sidebar-bottom"><span className="demo-chip">DEMO</span><span>v0.3.0</span><span className={`home-api-state ${apiState}`}><i />{apiState === 'ready' ? 'Local API' : apiState === 'loading' ? 'Connecting' : 'Offline'}</span></div>
     </aside>
     <main className="home-main">
-      <header className="home-header"><div><span className="home-eyebrow">PROJECTS / LOCAL WORKSPACE</span><h1>把想法變成畫面。</h1><p>從一個方向開始，讓素材沿著畫布流動。</p></div><div className="home-header-actions"><span className="preview-tag">v0.2.0</span><button className="home-codex-button" onClick={onOpenCodex}><Code2 size={15} />Codex help</button></div></header>
+      <header className="home-header"><div><span className="home-eyebrow">PROJECTS / LOCAL WORKSPACE</span><h1>把想法變成畫面。</h1><p>從一個方向開始，讓素材沿著畫布流動。</p></div><div className="home-header-actions"><span className="preview-tag">v0.3.0</span><button className="home-codex-button" onClick={onOpenCodex}><Code2 size={15} />Codex help</button></div></header>
       <section className="new-project-zone"><button className="new-project-card" aria-label="new-project" onClick={onCreate} disabled={navigationPending}><span className="new-project-plus"><Plus size={28} strokeWidth={1.5} /></span><strong>新建專案</strong><small>Start a new creative canvas</small></button></section>
       <section className="quick-create"><div className="section-heading"><div><span className="home-eyebrow">QUICK START</span><h2>選一個入口</h2></div><span className="section-note">Local-first · API connected</span></div><div className="quick-create-grid"><button onClick={onCreateImage} aria-label="create-image" disabled={navigationPending}><span className="quick-icon image"><ImageIcon size={19} /></span><span><strong>圖片創作</strong><small>Build a still frame</small></span><ArrowRight size={15} /></button><button onClick={onCreateVideo} aria-label="create-video" disabled={navigationPending}><span className="quick-icon video"><Film size={19} /></span><span><strong>影片創作</strong><small>Turn a frame into motion</small></span><ArrowRight size={15} /></button></div></section>
       <section id="projects-section" className="projects-section"><div className="section-heading projects-heading"><div><span className="home-eyebrow">YOUR WORK</span><h2>專案</h2></div><label className="project-search"><Search size={15} /><input aria-label="project-search" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜尋專案" /></label></div>{apiState === 'offline' && <div className="home-api-notice"><AlertCircle size={14} />{apiError || '服務離線；目前可查看 Demo 畫布。'}</div>}{cards.length === 0 ? <div className="empty-projects"><FolderPlus size={22} /><h3>還沒有符合的專案</h3><p>換一個搜尋字詞，或建立新的創作畫布。</p><button className="light-button" onClick={onCreate} disabled={navigationPending}><Plus size={14} />新建專案</button></div> : <div className="project-grid">{cards.map((card, index) => <ProjectCardView key={card.boardId} card={card} index={index} onOpen={() => onOpenProject(card.boardId)} />)}</div>}</section>
@@ -1243,10 +1424,10 @@ function HomePage({ cards, query, apiState, apiError, navigationPending, onQuery
 
 function ProjectCardView({ card, index, onOpen }: { card: ProjectCard; index: number; onOpen: () => void }) {
   const thumbnail = card.thumbnail;
-  return <button className="project-card" data-testid={card.boardId === 'welcome' ? 'project-card-welcome' : undefined} aria-label={card.boardId === 'welcome' ? 'project-card-welcome' : `project-card-${card.boardId}`} onClick={onOpen}><div className={`project-card-media ${thumbnail ? 'has-thumb' : 'is-empty'}`}>{thumbnail?.kind === 'image' && <img src={thumbnail.url} alt="" referrerPolicy="no-referrer" crossOrigin="anonymous" />}{thumbnail?.kind === 'video' && <VideoThumbnail src={thumbnail.url} alt="影片縮圖" />}{!thumbnail && <><span className="empty-canvas-mark"><LayoutGrid size={24} /></span><span>EMPTY CANVAS</span></>}</div><div className="project-card-body"><div><strong>{card.name}</strong><small>{card.thumbnailRunAt ? `上次生成 · ${new Date(card.thumbnailRunAt).toLocaleDateString('zh-TW')}` : card.latestRunAt ? `最近執行 · ${new Date(card.latestRunAt).toLocaleDateString('zh-TW')}` : `${card.nodeCount} nodes · ready to shape`}</small></div><span className="project-card-index">{String(index + 1).padStart(2, '0')}</span></div><div className="project-card-meta"><span>{card.nodeCount} nodes</span><span>{card.edgeCount} links</span><span className="project-open-label">開啟 <ArrowRight size={13} /></span></div></button>;
+  return <button className="project-card" data-testid={card.boardId === 'welcome' ? 'project-card-welcome' : undefined} aria-label={card.boardId === 'welcome' ? 'project-card-welcome' : `project-card-${card.boardId}`} onClick={onOpen}><div className={`project-card-media ${thumbnail ? 'has-thumb' : 'is-empty'}`}>{thumbnail?.kind === 'image' && <img src={artifactUrl(thumbnail)} alt="" referrerPolicy="no-referrer" crossOrigin="anonymous" />}{thumbnail?.kind === 'video' && <VideoThumbnail src={artifactUrl(thumbnail) ?? thumbnail.url} alt="影片縮圖" />}{!thumbnail && <><span className="empty-canvas-mark"><LayoutGrid size={24} /></span><span>EMPTY CANVAS</span></>}</div><div className="project-card-body"><div><strong>{card.name}</strong><small>{card.thumbnailRunAt ? `上次生成 · ${new Date(card.thumbnailRunAt).toLocaleDateString('zh-TW')}` : card.latestRunAt ? `最近執行 · ${new Date(card.latestRunAt).toLocaleDateString('zh-TW')}` : `${card.nodeCount} nodes · ready to shape`}</small></div><span className="project-card-index">{String(index + 1).padStart(2, '0')}</span></div><div className="project-card-meta"><span>{card.nodeCount} nodes</span><span>{card.edgeCount} links</span><span className="project-open-label">開啟 <ArrowRight size={13} /></span></div></button>;
 }
 
-function AssetsPage({ assets, totalCount, query, filter, navigationPending, onQueryChange, onFilterChange, onBack, onOpenBoard, preview, onPreview, onClosePreview, onCreate, children }: {
+function AssetsPage({ assets, totalCount, query, filter, navigationPending, onQueryChange, onFilterChange, onBack, onOpenBoard, preview, onPreview, onClosePreview, onCreate, assetSaveStates, onSaveAsset, children }: {
   assets: AssetItem[];
   totalCount: number;
   query: string;
@@ -1260,20 +1441,36 @@ function AssetsPage({ assets, totalCount, query, filter, navigationPending, onQu
   onPreview: (asset: AssetItem) => void;
   onClosePreview: () => void;
   onCreate: () => void;
+  assetSaveStates: Record<string, AssetSaveState>;
+  onSaveAsset: (runId: string, nodeId: string, artifactIndex: number) => void;
   children?: ReactNode;
 }) {
-  return <div className="assets-layout"><header className="assets-header"><button className="topbar-back" aria-label="back-home" onClick={onBack} disabled={navigationPending}><ArrowLeft size={15} />Projects</button><div className="assets-brand"><div className="brand-mark"><span /></div><strong>Relay Canvas</strong><span className="preview-tag">v0.2.0</span></div><div className="assets-header-note">REAL OUTPUTS / LOCAL CATALOG</div></header><main className="assets-main"><div className="assets-heading"><div><span className="home-eyebrow">MEDIA LIBRARY</span><h1>素材</h1><p>只顯示已完成執行產生的真實圖片與影片。</p></div><div className="assets-actions"><label className="project-search"><Search size={15} /><input aria-label="asset-search" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜尋素材" /></label><button className="light-button" aria-label="new-project" onClick={onCreate} disabled={navigationPending}><Plus size={14} />新建專案</button></div></div><div className="asset-toolbar"><div className="asset-filters"><button className={filter === 'all' ? 'is-active' : ''} onClick={() => onFilterChange('all')}>全部 <span>{totalCount}</span></button><button className={filter === 'image' ? 'is-active' : ''} aria-label="gallery-filter-image" onClick={() => onFilterChange('image')}>圖片</button><button className={filter === 'video' ? 'is-active' : ''} aria-label="gallery-filter-video" onClick={() => onFilterChange('video')}>影片</button></div><span className="asset-count">{assets.length.toString().padStart(2, '0')} shown / {totalCount.toString().padStart(2, '0')} total</span></div>{assets.length === 0 ? <div className="empty-assets"><div className="empty-assets-icon"><LayoutGrid size={22} /></div><h2>尚無生成素材</h2><p>完成一次 Demo 或已確認的遠端執行後，成果會出現在這裡。</p><button className="light-button" onClick={onCreate} disabled={navigationPending}><Plus size={14} />建立第一個專案</button></div> : <div className="asset-grid">{assets.map((asset) => <AssetCard key={asset.id} asset={asset} onPreview={() => onPreview(asset)} onOpenBoard={() => onOpenBoard(asset.boardId, asset.nodeId)} />)}</div>}</main>{preview && <AssetPreview asset={preview} onClose={onClosePreview} onOpenBoard={() => { onClosePreview(); onOpenBoard(preview.boardId, preview.nodeId); }} />}{children}</div>;
+  return <div className="assets-layout"><header className="assets-header"><button className="topbar-back" aria-label="back-home" onClick={onBack} disabled={navigationPending}><ArrowLeft size={15} />Projects</button><div className="assets-brand"><div className="brand-mark"><span /></div><strong>Relay Canvas</strong><span className="preview-tag">v0.3.0</span></div><div className="assets-header-note">REAL OUTPUTS / LOCAL CATALOG</div></header><main className="assets-main"><div className="assets-heading"><div><span className="home-eyebrow">MEDIA LIBRARY</span><h1>素材</h1><p>只顯示已完成執行產生的真實圖片與影片。</p></div><div className="assets-actions"><label className="project-search"><Search size={15} /><input aria-label="asset-search" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜尋素材" /></label><button className="light-button" aria-label="new-project" onClick={onCreate} disabled={navigationPending}><Plus size={14} />新建專案</button></div></div><div className="asset-toolbar"><div className="asset-filters"><button className={filter === 'all' ? 'is-active' : ''} onClick={() => onFilterChange('all')}>全部 <span>{totalCount}</span></button><button className={filter === 'image' ? 'is-active' : ''} aria-label="gallery-filter-image" onClick={() => onFilterChange('image')}>圖片</button><button className={filter === 'video' ? 'is-active' : ''} aria-label="gallery-filter-video" onClick={() => onFilterChange('video')}>影片</button></div><span className="asset-count">{assets.length.toString().padStart(2, '0')} shown / {totalCount.toString().padStart(2, '0')} total</span></div>{assets.length === 0 ? <div className="empty-assets"><div className="empty-assets-icon"><LayoutGrid size={22} /></div><h2>尚無生成素材</h2><p>完成一次 Demo 或已確認的遠端執行後，成果會出現在這裡。</p><button className="light-button" onClick={onCreate} disabled={navigationPending}><Plus size={14} />建立第一個專案</button></div> : <div className="asset-grid">{assets.map((asset) => <AssetCard key={asset.id} asset={asset} saveState={assetSaveStates[asset.id]} onSave={() => onSaveAsset(asset.runId, asset.nodeId, asset.artifactIndex)} onPreview={() => onPreview(asset)} onOpenBoard={() => onOpenBoard(asset.boardId, asset.nodeId)} />)}</div>}</main>{preview && <AssetPreview asset={preview} saveState={assetSaveStates[preview.id]} onSave={() => onSaveAsset(preview.runId, preview.nodeId, preview.artifactIndex)} onClose={onClosePreview} onOpenBoard={() => { onClosePreview(); onOpenBoard(preview.boardId, preview.nodeId); }} />}{children}</div>;
 }
 
-function AssetCard({ asset, onPreview, onOpenBoard }: { asset: AssetItem; onPreview: () => void; onOpenBoard: () => void }) {
-  return <article className="asset-card"><button className="asset-preview-button" aria-label={`gallery-item-${asset.id}`} onClick={onPreview}>{asset.kind === 'image' ? <img src={asset.url} alt={asset.nodeId} referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <VideoThumbnail src={asset.url} alt={asset.nodeId} />}<span className="asset-kind-badge">{asset.artifact.demo ? 'DEMO' : asset.kind.toUpperCase()}</span><span className="asset-hover-icon"><Maximize2 size={15} /></span></button><div className="asset-card-info"><div><strong>{asset.boardName}</strong><small>{asset.nodeId} · {new Date(asset.startedAt).toLocaleDateString('zh-TW')}</small></div><button className="asset-open-board" aria-label={`open-board-${asset.boardId}`} onClick={onOpenBoard}>開啟畫布 <ArrowRight size={13} /></button></div></article>;
+function assetDownloadName(asset: AssetItem): string {
+  const extension = asset.kind === 'video' ? (asset.artifact.mimeType === 'video/webm' ? 'webm' : 'mp4') : (asset.artifact.mimeType === 'image/jpeg' ? 'jpg' : asset.artifact.mimeType === 'image/webp' ? 'webp' : 'png');
+  return `relay-${asset.kind}-${asset.artifactIndex}.${extension}`;
 }
 
-function AssetPreview({ asset, onClose, onOpenBoard }: { asset: AssetItem; onClose: () => void; onOpenBoard: () => void }) {
-  return <div className="asset-preview-scrim" role="presentation" onClick={onClose}><div className="asset-preview-dialog" role="dialog" aria-modal="true" aria-label="asset-preview" onClick={(event) => event.stopPropagation()}><button className="asset-preview-close" aria-label="close-asset-preview" onClick={onClose}><X size={16} /></button><div className="asset-preview-media">{asset.kind === 'image' ? <img src={asset.url} alt={asset.nodeId} referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <video src={asset.url} controls autoPlay muted playsInline crossOrigin="anonymous" />}</div><div className="asset-preview-caption"><div><span className="home-eyebrow">{asset.artifact.demo ? 'DEMO OUTPUT' : 'OUTPUT'}</span><h2>{asset.boardName}</h2><p>{asset.nodeId} · {new Date(asset.startedAt).toLocaleString('zh-TW')}</p></div><button className="light-button" onClick={onOpenBoard}>開啟專案 <ArrowRight size={14} /></button></div></div></div>;
+function assetSaveLabel(asset: AssetItem, saveState?: AssetSaveState): string {
+  if (saveState?.status === 'saving') return '保存中';
+  if (saveState?.status === 'failed') return '重試保存';
+  if (saveState?.status === 'saved' || asset.artifact.localUrl || asset.artifact.localId) return '已保存本機';
+  return '保存本機';
 }
 
-function InspectorPanel({ node, providers, selectedResult, onChange, onDelete, onOpenProviders }: { node?: FlowNode; providers: Provider[]; selectedResult?: NodeResult; onChange: (patch: Partial<CanvasData>) => void; onDelete: () => void; onOpenProviders: () => void }) {
+function AssetCard({ asset, saveState, onSave, onPreview, onOpenBoard }: { asset: AssetItem; saveState?: AssetSaveState; onSave: () => void; onPreview: () => void; onOpenBoard: () => void }) {
+  const saved = saveState?.status === 'saved' || Boolean(asset.artifact.localUrl || asset.artifact.localId);
+  return <article className="asset-card"><button className="asset-preview-button" aria-label={`gallery-item-${asset.id}`} onClick={onPreview}>{asset.kind === 'image' ? <img src={asset.url} alt={asset.nodeId} referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <VideoThumbnail src={asset.url} alt={asset.nodeId} />}<span className="asset-kind-badge">{asset.artifact.demo ? 'DEMO' : asset.kind.toUpperCase()}</span><span className="asset-hover-icon"><Maximize2 size={15} /></span></button><div className="asset-card-info"><div><strong>{asset.boardName}</strong><small>{asset.nodeId} · {new Date(asset.startedAt).toLocaleDateString('zh-TW')}</small><span className={`asset-local-status ${saveState?.status === 'failed' ? 'is-failed' : saved ? 'is-saved' : ''}`}>{saveState?.status === 'failed' ? saveState.message ?? '保存失敗' : saved ? '已保存本機' : '僅遠端引用'}</span></div><button className="asset-open-board" aria-label={`open-board-${asset.boardId}`} onClick={onOpenBoard}>開啟畫布 <ArrowRight size={13} /></button></div><div className="asset-card-actions"><button className="asset-save-button" aria-label={`save-asset-${asset.id}`} disabled={saved || saveState?.status === 'saving'} onClick={onSave}>{saveState?.status === 'saving' ? <LoaderCircle className="spin" size={13} /> : saveState?.status === 'failed' ? <RefreshCw size={13} /> : <Save size={13} />}{assetSaveLabel(asset, saveState)}</button>{saved && <a className="asset-download-button" aria-label={`download-asset-${asset.id}`} href={asset.url} download={assetDownloadName(asset)}><Download size={13} />下載</a>}</div></article>;
+}
+
+function AssetPreview({ asset, saveState, onSave, onClose, onOpenBoard }: { asset: AssetItem; saveState?: AssetSaveState; onSave: () => void; onClose: () => void; onOpenBoard: () => void }) {
+  const saved = saveState?.status === 'saved' || Boolean(asset.artifact.localUrl || asset.artifact.localId);
+  return <div className="asset-preview-scrim" role="presentation" onClick={onClose}><div className="asset-preview-dialog" role="dialog" aria-modal="true" aria-label="asset-preview" onClick={(event) => event.stopPropagation()}><button className="asset-preview-close" aria-label="close-asset-preview" onClick={onClose}><X size={16} /></button><div className="asset-preview-media">{asset.kind === 'image' ? <img src={asset.url} alt={asset.nodeId} referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <video src={asset.url} controls autoPlay muted playsInline crossOrigin="anonymous" />}</div><div className="asset-preview-caption"><div><span className="home-eyebrow">{asset.artifact.demo ? 'DEMO OUTPUT' : 'OUTPUT'}</span><h2>{asset.boardName}</h2><p>{asset.nodeId} · {new Date(asset.startedAt).toLocaleString('zh-TW')}</p><span className={`asset-local-status ${saveState?.status === 'failed' ? 'is-failed' : saved ? 'is-saved' : ''}`}>{saveState?.status === 'failed' ? saveState.message ?? '保存失敗' : saved ? '已保存本機' : '僅遠端引用'}</span></div><div className="asset-preview-actions"><button className="asset-save-button" aria-label={`save-asset-${asset.id}`} disabled={saved || saveState?.status === 'saving'} onClick={onSave}>{saveState?.status === 'saving' ? <LoaderCircle className="spin" size={13} /> : saveState?.status === 'failed' ? <RefreshCw size={13} /> : <Save size={13} />}{assetSaveLabel(asset, saveState)}</button>{saved && <a className="asset-download-button" aria-label={`download-asset-${asset.id}`} href={asset.url} download={assetDownloadName(asset)}><Download size={13} />下載</a>}<button className="light-button" onClick={onOpenBoard}>開啟專案 <ArrowRight size={14} /></button></div></div></div></div>;
+}
+
+function InspectorPanel({ node, providers, selectedResult, runId, assetSaveStates, onSaveAsset, onChange, onDelete, onOpenProviders }: { node?: FlowNode; providers: Provider[]; selectedResult?: NodeResult; runId?: string; assetSaveStates: Record<string, AssetSaveState>; onSaveAsset: (runId: string, nodeId: string, artifactIndex: number) => void; onChange: (patch: Partial<CanvasData>) => void; onDelete: () => void; onOpenProviders: () => void }) {
   if (!node) {
     return <div className="empty-panel"><div className="empty-icon"><Maximize2 size={20} /></div><h2>Select a node</h2><p>從畫布選一個節點，開始編輯提示詞、模型與輸出設定。</p><div className="empty-hint"><Link2 size={14} />拖曳節點右側連接點建立資料流</div></div>;
   }
@@ -1288,6 +1485,7 @@ function InspectorPanel({ node, providers, selectedResult, onChange, onDelete, o
       providerId,
       model,
       ...(node.data.kind === 'video' ? { referenceField: recommendedReferenceField(model ?? '') } : {}),
+      ...(nextProvider?.protocol === 'videos' ? { params: {} } : {}),
     });
   };
   const handleModelChange = (model: string) => {
@@ -1303,11 +1501,11 @@ function InspectorPanel({ node, providers, selectedResult, onChange, onDelete, o
       {isGenerator && <>
         <div className="section-divider"><span>GENERATION</span></div>
         <Field label="Provider"><div className="select-with-action"><select value={node.data.providerId ?? 'demo'} onChange={(event) => handleProviderChange(event.target.value)}><option value="">Select provider</option>{providers.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}{candidate.protocol === 'demo' ? ' · DEMO' : ''}</option>)}</select><button className="mini-icon-button" onClick={onOpenProviders} aria-label="provider-settings" title="編輯供應商"><Settings2 size={14} /></button></div></Field>
-        <Field label="Model" hint={provider?.protocol === 'demo' ? '離線 Demo，不消耗 AI 額度。' : '自訂模型／協定驗證，未做 live 驗證。'}><input value={node.data.model ?? ''} onChange={(event) => handleModelChange(event.target.value)} placeholder="model-name" /></Field>
+        <Field label="Model" hint={provider?.protocol === 'demo' ? '離線 Demo，不消耗 AI 額度。' : provider?.protocol === 'videos' ? 'Videos JSON relay contract；不預填官方 Sora，請手動輸入模型。' : '自訂模型／協定驗證，未做 live 驗證。'}><input aria-label="node-model" value={node.data.model ?? ''} onChange={(event) => handleModelChange(event.target.value)} placeholder={provider?.protocol === 'videos' ? 'relay model' : 'model-name'} /></Field>
         {node.data.kind === 'video' && <Field label="Reference field"><input value={node.data.referenceField ?? 'image_url'} onChange={(event) => onChange({ referenceField: event.target.value })} /></Field>}
-        <div className="params-box"><div className="params-heading"><span>PARAMETERS</span><SlidersHorizontal size={13} /></div><div className="params-grid"><ParamField label="Aspect" value={String(node.data.params?.aspect_ratio ?? '16:9')} onChange={(value) => onChange({ params: { ...(node.data.params ?? {}), aspect_ratio: value } })} /><ParamField label="Quality" value={String(node.data.params?.quality ?? 'standard')} onChange={(value) => onChange({ params: { ...(node.data.params ?? {}), quality: value } })} /></div></div>
+        <div className="params-box"><div className="params-heading"><span>PARAMETERS</span><SlidersHorizontal size={13} /></div>{provider?.protocol === 'videos' && node.data.kind === 'video' ? <VideoParams params={node.data.params} onChange={(params) => onChange({ params })} /> : <div className="params-grid"><ParamField label="Aspect" value={String(node.data.params?.aspect_ratio ?? '16:9')} onChange={(value) => onChange({ params: { ...(node.data.params ?? {}), aspect_ratio: value } })} /><ParamField label="Quality" value={String(node.data.params?.quality ?? 'standard')} onChange={(value) => onChange({ params: { ...(node.data.params ?? {}), quality: value } })} /></div>}</div>
       </>}
-      {selectedResult && <ResultBlock result={selectedResult} />}
+      {selectedResult && <ResultBlock result={selectedResult} runId={runId} nodeId={node.id} saveState={runId ? assetSaveStates[`${runId}:${node.id}:0`] : undefined} onSave={runId ? () => onSaveAsset(runId, node.id, 0) : undefined} />}
       <div className="inspector-footer"><span><Info size={12} /> Changes autosave when connected</span></div>
     </div>
   );
@@ -1321,19 +1519,39 @@ function ParamField({ label, value, onChange }: { label: string; value: string; 
   return <label className="param-field"><span>{label}</span><input value={value} onChange={(event) => onChange(event.target.value)} /></label>;
 }
 
-function ResultBlock({ result }: { result: NodeResult }) {
+function VideoParams({ params, onChange }: { params?: Record<string, unknown>; onChange: (params: Record<string, unknown>) => void }) {
+  const seconds = params?.seconds === '4' || params?.seconds === '8' || params?.seconds === '12' ? params.seconds : '';
+  const size = params?.size === '720x1280' || params?.size === '1280x720' || params?.size === '1024x1792' || params?.size === '1792x1024' ? params.size : '';
+  const update = (key: 'seconds' | 'size', value: string) => {
+    const next = { ...(params ?? {}) };
+    if (value) next[key] = value;
+    else delete next[key];
+    onChange(next);
+  };
+  return <div className="params-grid video-params"><label className="param-field"><span>Seconds</span><select aria-label="video-seconds" value={seconds} onChange={(event) => update('seconds', event.target.value)}><option value="">Default</option><option value="4">4</option><option value="8">8</option><option value="12">12</option></select></label><label className="param-field"><span>Size</span><select aria-label="video-size" value={size} onChange={(event) => update('size', event.target.value)}><option value="">Default</option><option value="720x1280">720x1280</option><option value="1280x720">1280x720</option><option value="1024x1792">1024x1792</option><option value="1792x1024">1792x1024</option></select></label></div>;
+}
+
+function ResultBlock({ result, runId, nodeId, saveState, onSave }: { result: NodeResult; runId?: string; nodeId?: string; saveState?: AssetSaveState; onSave?: () => void }) {
   const artifact = assetForResult(result);
-  return <div className="result-block"><div className="result-heading"><span>LAST RESULT</span><span className={`result-status ${statusClass(result.status)}`}>{statusLabel(result.status)}</span></div>{artifact?.url && <div className="result-asset"><span>{artifact.demo ? 'DEMO OUTPUT' : 'OUTPUT'}</span>{artifact.kind === 'image' ? <img src={artifact.url} alt="Generated output" referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <video src={artifact.url} controls muted playsInline crossOrigin="anonymous" />}</div>}{result.error && <p className="result-error"><AlertCircle size={13} />{result.error}</p>}{result.referenceUrl && <p className="result-reference">Reference bound from this run</p>}</div>;
+  const url = artifactUrl(artifact);
+  const saved = Boolean(artifact?.localUrl || artifact?.localId || saveState?.status === 'saved');
+  const assetKey = runId && nodeId ? `${runId}:${nodeId}:0` : '';
+  const extension = artifact?.kind === 'video' ? (artifact.mimeType === 'video/webm' ? 'webm' : 'mp4') : artifact?.mimeType === 'image/jpeg' ? 'jpg' : artifact?.mimeType === 'image/webp' ? 'webp' : artifact?.mimeType === 'image/svg+xml' ? 'svg' : 'png';
+  return <div className="result-block"><div className="result-heading"><span>LAST RESULT</span><span className={`result-status ${statusClass(result.status)}`}>{statusLabel(result.status)}</span></div>{url && artifact && <div className="result-asset"><span>{artifact.demo ? 'DEMO OUTPUT' : 'OUTPUT'}</span>{artifact.kind === 'image' ? <img src={url} alt="Generated output" referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <video src={url} controls muted playsInline crossOrigin="anonymous" />}<div className="result-asset-actions">{onSave && <button className="asset-save-button" aria-label={`save-asset-${assetKey}`} disabled={saved || saveState?.status === 'saving'} onClick={onSave}>{saveState?.status === 'saving' ? <LoaderCircle className="spin" size={13} /> : saveState?.status === 'failed' ? <RefreshCw size={13} /> : <Save size={13} />}{saveState?.status === 'failed' ? '重試保存' : saved ? '已保存本機' : '保存本機'}</button>}{saved && <a className="asset-download-button" aria-label={`download-asset-${assetKey}`} href={url} download={`relay-${artifact.kind}-0.${extension}`}><Download size={13} />下載</a>}</div></div>}{result.error && <p className="result-error"><AlertCircle size={13} />{result.error}</p>}{result.referenceUrl && <p className="result-reference">Reference bound from this run</p>}</div>;
 }
 
 function HistoryPanel({ runs, activeRunId, currentRevision, onSelect }: { runs: Run[]; activeRunId?: string; currentRevision?: number; onSelect: (run: Run) => void }) {
   return <div className="history-content"><div className="panel-heading"><div><span className="panel-eyebrow">EXECUTION LOG</span><h2>Run history</h2></div><span className="history-count">{runs.length.toString().padStart(2, '0')}</span></div>{runs.length === 0 ? <div className="empty-panel compact"><div className="empty-icon"><Clock3 size={19} /></div><h2>No runs yet</h2><p>執行節點後，這裡會保留狀態與產物。</p></div> : <div className="run-list">{runs.map((run) => <button key={run.id} className={`run-card ${run.id === activeRunId ? 'is-active' : ''} ${run.revision !== currentRevision ? 'is-stale' : ''}`} onClick={() => onSelect(run)}><div className="run-card-top"><span className={`run-status-mark ${statusClass(run.status)}`} /> <strong>Canvas execution</strong><span className={`run-status-label ${statusClass(run.status)}`}>{statusLabel(run.status)}</span></div><div className="run-card-meta"><span>{new Date(run.startedAt).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' })}</span><span>{run.order.length} nodes</span><span>rev {run.revision}{run.revision !== currentRevision ? ' · archived' : ''}</span></div></button>)}</div>}</div>;
 }
 
-function ProvidersPanel({ providers, selectedId, settings, dirty, onSelect, onChange, onAdd, onSave }: { providers: Provider[]; selectedId: string; settings: AppState['settings']; dirty: boolean; onSelect: (id: string) => void; onChange: (patch: Partial<Provider>) => void; onAdd: () => void; onSave: () => void }) {
+function ProvidersPanel({ providers, selectedId, settings, apiReady, dirty, saving, diagnostics, diagnosticsLoading, models, modelsLoading, onDiagnostics, onQueryModels, onSelect, onChange, onAdd, onSave }: { providers: Provider[]; selectedId: string; settings: AppState['settings']; apiReady: boolean; dirty: boolean; saving: boolean; diagnostics: Record<string, ProviderDiagnostic>; diagnosticsLoading: boolean; models: string[]; modelsLoading: boolean; onDiagnostics: () => void; onQueryModels: () => void; onSelect: (id: string) => void; onChange: (patch: Partial<Provider>) => void; onAdd: (template: ProviderTemplate) => void; onSave: () => void }) {
   const selected = providers.find((provider) => provider.id === selectedId) ?? providers[0];
+  const [template, setTemplate] = useState<ProviderTemplate>('openai');
+  const diagnostic = diagnostics[selected?.id ?? ''];
   if (!selected) return null;
-  return <div className="providers-content"><div className="panel-heading"><div><span className="panel-eyebrow">RUNTIME CONFIG</span><h2>Providers</h2></div><div className="provider-heading-actions"><button className="icon-button" aria-label="add-provider" onClick={onAdd} title="新增供應商"><Plus size={15} /></button><button className="primary-button compact-button" onClick={onSave} disabled={!dirty}><Save size={14} />Save</button></div></div><div className="provider-list">{providers.map((provider) => <button key={provider.id} className={`provider-row ${provider.id === selected.id ? 'is-selected' : ''}`} onClick={() => onSelect(provider.id)}><span className="provider-orb" data-protocol={provider.protocol}>{provider.protocol === 'demo' ? <Sparkles size={14} /> : <Zap size={14} />}</span><span><strong>{provider.name}</strong><small>{provider.protocol === 'demo' ? 'Offline preview' : provider.protocol.toUpperCase()}</small></span><ChevronDown className="provider-chevron" size={14} /></button>)}</div><div className="provider-detail"><Field label="Provider ID"><input value={selected.id} readOnly /></Field><Field label="Display name"><input value={selected.name} onChange={(event) => onChange({ name: event.target.value })} /></Field><Field label="Protocol"><select value={selected.protocol} onChange={(event) => onChange({ protocol: event.target.value as Provider['protocol'] })}><option value="demo">Demo</option><option value="openai">OpenAI compatible</option><option value="fal">fal.ai</option><option value="replicate">Replicate</option></select></Field><Field label="Base URL" hint="只允許伺服器設定的 exact HTTPS origin。"><input value={selected.baseUrl} onChange={(event) => onChange({ baseUrl: event.target.value })} placeholder="https://api.example.com" /></Field><Field label="Key env name" hint="只填環境變數名稱，不要填入金鑰值。"><input value={selected.keyEnv} onChange={(event) => onChange({ keyEnv: event.target.value })} placeholder="RELAY_KEY_PROVIDER" /></Field><Field label="Image model"><input value={selected.imageModel} onChange={(event) => onChange({ imageModel: event.target.value })} /></Field><Field label="Video model"><input value={selected.videoModel} onChange={(event) => onChange({ videoModel: event.target.value })} placeholder="Not supported" /></Field><div className="key-env"><LockKeyhole size={13} /><span>Runtime reads the secret from server env</span><code>{selected.keyEnv || 'No key required'}</code></div></div><div className="remote-banner"><div className="remote-banner-icon"><Activity size={15} /></div><div><strong>{settings.remoteEnabled ? 'Remote generation enabled' : 'Remote generation disabled'}</strong><p>{settings.remoteEnabled ? '每次外部生成仍需在執行前確認。' : 'Demo 可離線執行；遠端 provider 目前由伺服器停用。'}</p></div></div></div>;
+  const imageModelChoice = models.includes(selected.imageModel) ? selected.imageModel : '';
+  const videoModelChoice = models.includes(selected.videoModel) ? selected.videoModel : '';
+  return <div className="providers-content"><div className="panel-heading"><div><span className="panel-eyebrow">RUNTIME CONFIG</span><h2>Providers</h2></div><div className="provider-heading-actions"><select className="provider-template-select" aria-label="provider-template" value={template} onChange={(event) => setTemplate(event.target.value as ProviderTemplate)}><option value="openai">OpenAI 圖片</option><option value="newapi">NewAPI 圖片</option><option value="videos">Videos JSON 中轉站</option><option value="fal">fal</option><option value="replicate">Replicate</option></select><button className="icon-button" aria-label="add-provider" onClick={() => onAdd(template)} title="新增供應商" disabled={!apiReady}><Plus size={15} /></button><button className="primary-button compact-button" aria-label="provider-save" onClick={onSave} disabled={!apiReady || !dirty || saving}>{saving ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}{saving ? '保存中' : 'Save'}</button></div></div><div className="provider-list">{providers.map((provider) => <button key={provider.id} className={`provider-row ${provider.id === selected.id ? 'is-selected' : ''}`} onClick={() => onSelect(provider.id)}><span className="provider-orb" data-protocol={provider.protocol}>{provider.protocol === 'demo' ? <Sparkles size={14} /> : <Zap size={14} />}</span><span><strong>{provider.name}</strong><small>{provider.protocol === 'demo' ? 'Offline preview' : provider.protocol.toUpperCase()}</small></span><ChevronDown className="provider-chevron" size={14} /></button>)}</div><div className="provider-detail"><Field label="Provider ID"><input aria-label="provider-id" value={selected.id} readOnly /></Field><Field label="Display name"><input aria-label="provider-name" value={selected.name} onChange={(event) => onChange({ name: event.target.value })} /></Field><Field label="Protocol"><select aria-label="provider-protocol" value={selected.protocol} onChange={(event) => onChange({ protocol: event.target.value as Provider['protocol'] })}><option value="demo">Demo</option><option value="openai">OpenAI compatible / NewAPI</option><option value="videos">Videos JSON relay</option><option value="fal">fal.ai</option><option value="replicate">Replicate</option></select></Field><Field label="Base URL" hint="只允許伺服器設定的 exact HTTPS origin。"><input aria-label="provider-base-url" value={selected.baseUrl} onChange={(event) => onChange({ baseUrl: event.target.value })} placeholder="https://api.example.com/v1" /></Field><Field label="Key env name" hint="只填環境變數名稱，不要填入金鑰值。"><input aria-label="provider-key-env" value={selected.keyEnv} onChange={(event) => onChange({ keyEnv: event.target.value })} placeholder="RELAY_KEY_PROVIDER" /></Field><Field label="Image model"><input aria-label="provider-image-model" value={selected.imageModel} onChange={(event) => onChange({ imageModel: event.target.value })} />{models.length > 0 && <select aria-label="provider-image-model-options" value={imageModelChoice} onChange={(event) => event.target.value && onChange({ imageModel: event.target.value })}><option value="">選擇查詢模型（可保留手動輸入）</option>{models.map((model) => <option key={`image-${model}`} value={model}>{model}</option>)}</select>}</Field><Field label="Video model" hint={selected.protocol === 'videos' ? 'Videos JSON relay 只在你指定 model 時送出。' : undefined}><input aria-label="provider-video-model" value={selected.videoModel} onChange={(event) => onChange({ videoModel: event.target.value })} placeholder={selected.protocol === 'videos' ? 'relay model（手動）' : 'Not supported'} />{models.length > 0 && <select aria-label="provider-video-model-options" value={videoModelChoice} onChange={(event) => event.target.value && onChange({ videoModel: event.target.value })}><option value="">選擇查詢模型（可保留手動輸入）</option>{models.map((model) => <option key={`video-${model}`} value={model}>{model}</option>)}</select>}</Field><div className="provider-actions"><button className="secondary-button" aria-label="provider-diagnostics" onClick={onDiagnostics} disabled={!apiReady || dirty || diagnosticsLoading}>{diagnosticsLoading ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}診斷</button><button className="secondary-button" aria-label="query-models" onClick={onQueryModels} disabled={!apiReady || dirty || modelsLoading}>{modelsLoading ? <LoaderCircle className="spin" size={13} /> : <Search size={13} />}查詢模型</button></div>{diagnostic && <div className="provider-diagnostics" role="status"><div className="diagnostic-chips"><span className={diagnostic.credentialConfigured ? 'is-ok' : ''}>KEY {diagnostic.credentialConfigured ? '已設' : '未設'}</span><span className={diagnostic.configurationValid ? 'is-ok' : 'is-bad'}>ORIGIN {diagnostic.configurationValid ? '允許' : '阻擋'}</span><span className={diagnostic.remoteEnabled ? 'is-ok' : ''}>REMOTE {diagnostic.remoteEnabled ? 'READY' : 'OFF'}</span><span>CAP {diagnostic.capabilities.join(', ') || 'none'}</span></div><small>{diagnostic.codes.length ? `codes: ${diagnostic.codes.join(', ')}` : 'codes: none'} · KEY 已設僅代表環境變數存在，不代表 live valid</small></div>}<div className="key-env"><LockKeyhole size={13} /><span>Runtime reads the secret from server env</span><code>{selected.keyEnv || 'No key required'}</code></div></div><div className="remote-banner"><div className="remote-banner-icon"><Activity size={15} /></div><div><strong>{settings.remoteEnabled ? 'Remote generation enabled' : 'Remote generation disabled'}</strong><p>{settings.remoteEnabled ? '每次外部生成仍需在執行前確認。' : 'Demo 可離線執行；遠端 provider 目前由伺服器停用。'}</p></div></div></div>;
 }
 
 function HelpPanel() {

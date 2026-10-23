@@ -139,6 +139,24 @@ function tokenMatches(actual: string | undefined, expected: string): boolean {
   return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
 }
 
+function mediaCookie(cookie: string | undefined): string | undefined {
+  if (cookie === undefined || cookie.length > 4096 || /[\u0000-\u001f\u007f]/.test(cookie)) return undefined;
+  let found: string | undefined;
+  for (const part of cookie.split(';')) {
+    const index = part.indexOf('=');
+    if (index < 1) return undefined;
+    const name = part.slice(0, index).trim();
+    const value = part.slice(index + 1).trim();
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || !/^[\x21-\x3A\x3C-\x7E]*$/.test(value)) return undefined;
+    if (name === 'relay_canvas_media') {
+      if (found !== undefined) return undefined;
+      if (!/^[A-Za-z0-9]+$/.test(value)) return undefined;
+      found = value;
+    }
+  }
+  return found;
+}
+
 function deny(res: Parameters<RequestHandler>[1], status: number, code: string): void {
   res.status(status).json({ error: 'Request rejected', code });
 }
@@ -191,13 +209,25 @@ export function createBoundary(options: {
     if (path !== '/api' && !path.startsWith('/api/')) return next();
     res.setHeader('Cache-Control', 'no-store');
 
-    if (!['GET', 'POST', 'PUT'].includes(req.method)) return deny(res, 405, 'method_not_allowed');
+    const mediaRoute = path.startsWith('/api/media/');
+    if (!['GET', 'POST', 'PUT'].includes(req.method) && !(mediaRoute && req.method === 'HEAD')) return deny(res, 405, 'method_not_allowed');
     const sameOriginMetadata = req.get('sec-fetch-site') === 'same-origin';
     if (path === '/api/session') {
       if (req.method !== 'GET') return deny(res, 405, 'method_not_allowed');
       if (req.get('x-canvas-client') !== 'ui' || (requestOrigin !== options.origin && !sameOriginMetadata)) {
         return deny(res, 403, 'invalid_session_request');
       }
+      return next();
+    }
+
+    if (mediaRoute) {
+      if (req.method !== 'GET' && req.method !== 'HEAD') return deny(res, 405, 'method_not_allowed');
+      const headerAuthorized = tokenMatches(req.get('x-canvas-token'), options.token) &&
+        (requestOrigin === options.origin || (requestOrigin === undefined && sameOriginMetadata));
+      const cookieAuthorized = sameOriginMetadata &&
+        (requestOrigin === undefined || requestOrigin === options.origin) &&
+        tokenMatches(mediaCookie(req.get('cookie')), options.token);
+      if (!headerAuthorized && !cookieAuthorized) return deny(res, 403, 'invalid_token');
       return next();
     }
 

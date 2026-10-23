@@ -2,16 +2,25 @@ import { randomUUID } from 'node:crypto';
 import { AppError, modelFor, plan, topology } from './graph.js';
 import { Store } from './store.js';
 import { generate, preflightGeneration } from './providers.js';
+import { providerDiagnostics, providerModels, type ProviderTransport } from './providers.js';
+import { MediaStore } from './media.js';
 import { readPolicy, validateBaseUrl, validateMediaUrl } from './security.js';
 import { parseBoard, parseOperations, parseProviders, parseRunInput } from '../src/shared/schema.js';
-import type { Board, GenerationOutput, GenerationRequest, Provider, Run } from '../src/shared/types.js';
+import type { Artifact, Board, GenerationOutput, GenerationRequest, Provider, Run } from '../src/shared/types.js';
 import { recommendedReferenceField } from '../src/shared/defaults.js';
 
 type Generator = (provider: Provider, request: GenerationRequest) => Promise<GenerationOutput>;
 export class CanvasService {
   private active?: { id: string; controller: AbortController };
   private tasks = new Map<string, Promise<void>>();
-  constructor(readonly store: Store, readonly policy = readPolicy(), private generator: Generator = (p, r) => generate(p, r, { policy })) {}
+  private artifactSaves = new Map<string, Promise<Artifact>>();
+  readonly media: MediaStore;
+  constructor(
+    readonly store: Store,
+    readonly policy = readPolicy(),
+    private generator: Generator = (p, r) => generate(p, r, { policy }),
+    media?: MediaStore,
+  ) { this.media = media ?? new MediaStore(store.directory, policy); }
   state() { return { ...this.store.read(), settings: this.policy }; }
   board(id: string) { const board = this.store.read().boards.find(b => b.id === id); if (!board) throw new AppError('NOT_FOUND', '找不到畫布。', 404); return board; }
   create(name: string) {
@@ -57,8 +66,63 @@ export class CanvasService {
     if (this.active) throw new AppError('BUSY', '執行中無法變更供應商設定。', 409);
     return this.store.transaction(data => { data.providers = providers; return providers; });
   }
+  diagnostics(env: NodeJS.ProcessEnv = process.env) { return providerDiagnostics(this.store.read().providers, this.policy, env); }
+  async models(id: string, env: NodeJS.ProcessEnv = process.env, transport?: ProviderTransport) {
+    const provider = this.store.read().providers.find(candidate => candidate.id === id);
+    if (!provider) throw new AppError('NOT_FOUND', '找不到供應商。', 404);
+    try { return await providerModels(provider, { policy: this.policy, env, transport }); }
+    catch { throw new AppError('MODEL_DISCOVERY_FAILED', '模型清單無法讀取；請手動輸入模型。', 400); }
+  }
   validate(id: string, selected?: string) { return plan(this.board(id), this.store.read().providers, selected); }
   getRun(id: string) { const run = this.store.read().runs.find(r => r.id === id); if (!run) throw new AppError('NOT_FOUND', '找不到執行紀錄。', 404); return run; }
+  async saveArtifact(runId: string, nodeId: string, index: number, signal?: AbortSignal): Promise<Artifact> {
+    if (!Number.isSafeInteger(index) || index < 0) throw new AppError('INVALID_INPUT', '素材索引無效。', 400);
+    const key = `${runId}\u0000${nodeId}\u0000${index}`;
+    const existing = this.artifactSaves.get(key);
+    if (existing) return await existing;
+    if (this.artifactSaves.size >= 8) throw new AppError('MEDIA_SAVE_BUSY', '同時保存的素材過多，請稍後重試。', 429);
+    const readSource = (): Artifact => {
+      const run = this.getRun(runId); const result = run.results[nodeId];
+      if (!result) throw new AppError('NOT_FOUND', '找不到節點結果。', 404);
+      if (run.status !== 'succeeded' || result.status !== 'succeeded') throw new AppError('NOT_SUCCEEDED', '只有成功完成的素材可以保存。', 409);
+      const source = result.artifacts[index];
+      if (!source) throw new AppError('NOT_FOUND', '找不到素材。', 404);
+      if (source.demo) {
+        const snapshotNode = run.snapshot.nodes.find(node => node.id === nodeId);
+        const provider = run.providers.find(candidate => candidate.id === snapshotNode?.data.providerId);
+        if (!snapshotNode || provider?.protocol !== 'demo') throw new AppError('INVALID_INPUT', 'Demo 素材來源無效。', 400);
+      }
+      return source;
+    };
+    readSource();
+    const operation = (async () => {
+      try { return await this.media.save(readSource, artifact => {
+        this.store.transaction(data => {
+          const current = data.runs.find(candidate => candidate.id === runId);
+          const currentResult = current?.results[nodeId];
+          if (!current || current.status !== 'succeeded' || !currentResult || currentResult.status !== 'succeeded' || !currentResult.artifacts[index]) {
+            throw new AppError('REVISION_CONFLICT', '素材狀態已改變。', 409);
+          }
+          currentResult.artifacts[index] = artifact;
+        });
+      }, { signal, isReferenced: localId => this.store.artifactReferenced(localId) }); }
+      catch (error) {
+        if (error instanceof AppError) throw error;
+        throw new AppError('MEDIA_SAVE_FAILED', '素材保存失敗；原始生成結果仍保留，可稍後重試。', 400);
+      }
+    })().finally(() => { if (this.artifactSaves.get(key) === operation) this.artifactSaves.delete(key); });
+    this.artifactSaves.set(key, operation);
+    return await operation;
+  }
+  mediaArtifact(localId: string): Artifact {
+    if (!/^[a-f0-9]{64}$/.test(localId)) throw new AppError('INVALID_INPUT', '素材 ID 無效。', 400);
+    for (const run of this.store.read().runs) for (const result of Object.values(run.results)) {
+      if (run.status !== 'succeeded' || result.status !== 'succeeded') continue;
+      const artifact = result.artifacts.find(candidate => candidate.localId === localId && candidate.sha256 === localId);
+      if (artifact) return artifact;
+    }
+    throw new AppError('NOT_FOUND', '找不到素材。', 404);
+  }
   private updateRun(id: string, change: (run: Run) => void) { return this.store.transaction(data => { const run = data.runs.find(r => r.id === id)!; change(run); return run; }); }
   start(input: unknown): Run {
     const request = parseRunInput(input), data = this.store.read();

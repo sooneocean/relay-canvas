@@ -153,7 +153,7 @@ const boardSchema = z.object({
 const providerSchema = z.object({
   id: idSchema,
   name: shortText,
-  protocol: z.enum(['demo', 'openai', 'fal', 'replicate']),
+  protocol: z.enum(['demo', 'openai', 'videos', 'fal', 'replicate']),
   baseUrl: z.string().max(4096),
   keyEnv: z.union([z.literal(''), z.string().max(74).regex(KEY_ENV)]),
   imageModel: modelSchema,
@@ -202,6 +202,15 @@ export function parseOperations(value: unknown): Operation[] {
 
 export function parseGenerationParams(value: unknown): Record<string, unknown> {
   return parseSafe(paramsSchema, value);
+}
+
+const videosParamsSchema = z.object({
+  seconds: z.enum(['4', '8', '12']).optional(),
+  size: z.enum(['720x1280', '1280x720', '1024x1792', '1792x1024']).optional(),
+}).strict();
+
+export function parseVideosParams(value: unknown): { seconds?: '4' | '8' | '12'; size?: '720x1280' | '1280x720' | '1024x1792' | '1792x1024' } {
+  return parseSafe(videosParamsSchema, value);
 }
 
 export interface RunInput {
