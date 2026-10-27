@@ -42,5 +42,5 @@ try {
 } finally {
   await browser?.close();
   server.closeAllConnections();
-  await new Promise<void>(resolve => server.close(resolve));
+  await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 }
