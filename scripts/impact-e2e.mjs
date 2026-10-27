@@ -7,13 +7,18 @@ import process from 'node:process';
 // The existing smoke programs are standalone, serial journeys, not Playwright Test cases.
 // Keep selection explicit and fail closed until they are split into independent tests.
 export const SUITES = Object.freeze([
-  { id: 'core', file: 'scripts/smoke.ts' },
-  { id: 'editor', file: 'scripts/editor-smoke.ts' },
-  { id: 'relay', file: 'scripts/relay-flow-smoke.ts' },
-  { id: 'media', file: 'scripts/media-sources-smoke.ts' },
+  { id: 'core', file: 'scripts/smoke.ts', browser: true },
+  { id: 'editor', file: 'scripts/editor-smoke.ts', browser: true },
+  { id: 'source-browser', file: 'scripts/source-browser-runner.ts', browser: true },
+  { id: 'thumbnail', file: 'scripts/thumbnail-smoke.ts', browser: true },
+  { id: 'relay', file: 'scripts/relay-flow-smoke.ts', browser: true },
+  { id: 'media', file: 'scripts/media-sources-smoke.ts', browser: true },
+  { id: 'media-network', file: 'scripts/media-network-smoke.ts', browser: false },
 ]);
 const ALL = SUITES.map(suite => suite.id);
 const EDITOR_MEDIA = ['editor', 'relay', 'media'];
+const TIMELINE_MEDIA = ['editor', 'source-browser', 'relay', 'media'];
+const THUMBNAIL_MEDIA = ['editor', 'source-browser', 'thumbnail', 'relay', 'media'];
 
 function classify(file) {
   if (/^(?:docs\/|README\.md$|AGENTS\.md$|CHANGELOG\.md$|LICENSE$)/.test(file)) return { suites: [] };
@@ -22,12 +27,18 @@ function classify(file) {
 
   // Explicitly mapped stand-alone smoke entrypoints and their helper fixtures.
   if (file === 'scripts/smoke.ts') return { suites: ['core'] };
-  if (/^scripts\/(?:editor-smoke|source-browser-smoke|thumbnail-lifetime-smoke|handoff-intents-smoke)\.ts$/.test(file)) return { suites: ['editor'] };
+  if (/^scripts\/(?:editor-smoke|handoff-intents-smoke)\.ts$/.test(file)) return { suites: ['editor'] };
+  if (/^scripts\/(?:source-browser-smoke|source-browser-runner)\.ts$/.test(file)) return { suites: ['source-browser'] };
+  if (/^scripts\/(?:thumbnail-lifetime-smoke|thumbnail-smoke)\.ts$/.test(file)) return { suites: ['thumbnail'] };
   if (/^scripts\/(?:relay-flow-smoke|relay-ui-boundaries-smoke|relay-fixture-server)\.ts$/.test(file)) return { suites: ['relay'] };
-  if (/^scripts\/(?:media-sources-smoke|import-network-smoke|v07-source-fixture)\.ts$/.test(file)) return { suites: ['media'] };
+  if (file === 'scripts/media-sources-smoke.ts') return { suites: ['media'] };
+  if (/^scripts\/(?:import-network-smoke|media-network-smoke)\.ts$/.test(file)) return { suites: ['media-network'] };
+  if (file === 'scripts/v07-source-fixture.ts') return { suites: ['media', 'media-network'] };
 
   // Features exercised by several integration journeys.
-  if (/^src\/ui\/(?:TimelineEditor|RunCompare|VideoThumbnail)\.tsx$/.test(file)) return { suites: EDITOR_MEDIA };
+  if (file === 'src/ui/TimelineEditor.tsx') return { suites: TIMELINE_MEDIA };
+  if (file === 'src/ui/RunCompare.tsx') return { suites: EDITOR_MEDIA };
+  if (file === 'src/ui/VideoThumbnail.tsx') return { suites: THUMBNAIL_MEDIA };
   if (/^server\/(?:editor|editor-supervisor)\.ts$/.test(file)) return { suites: EDITOR_MEDIA };
 
   // Shared UI, persistence, media routes, schemas, dependencies, and CI are
@@ -68,7 +79,7 @@ export function runPlan(plan, spawn = spawnSync, log = console.log) {
     if (!plan.suites.includes(suite.id)) continue;
     const start = Date.now();
     log(`E2E start: ${suite.id} (${suite.file})`);
-    const outcome = spawn(process.execPath, ['--import', 'tsx', suite.file], { stdio: 'inherit' });
+    const outcome = spawn(process.execPath, ['scripts/profile-smoke.mjs', suite.id, suite.file], { stdio: 'inherit' });
     if (outcome.error || outcome.status !== 0) {
       log(`E2E failed: ${suite.id} (${Date.now() - start}ms)`);
       return false;
@@ -104,7 +115,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     if (action === '--plan') {
       if (process.env.GITHUB_OUTPUT) {
         appendFileSync(process.env.GITHUB_OUTPUT, [
-          `needs_browser=${plan.suites.length > 0}`,
+          `needs_smoke=${plan.suites.length > 0}`,
+          `needs_browser=${plan.suites.some(id => SUITES.find(suite => suite.id === id)?.browser !== false)}`,
           `needs_package=${plan.packageSmoke}`,
           `full=${plan.full}`,
           `selected_suites=${plan.suites.join(',')}`,

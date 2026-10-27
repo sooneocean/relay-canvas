@@ -30,8 +30,8 @@ jobs:
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: node scripts/impact-e2e.mjs --plan
-      - name: Verify impact selector
-        run: node --test scripts/impact-e2e.test.mjs
+      - name: Verify impact selector and RSS sampler
+        run: node --test scripts/impact-e2e.test.mjs scripts/profile-smoke.test.mjs
       - run: npm ci
       - name: Use the primary Ubuntu archive mirror
         run: |
@@ -106,7 +106,7 @@ jobs:
         timeout-minutes: 6
         run: npx playwright install --with-deps chromium
       - name: Run impact-selected E2E serially
-        if: steps.impact.outputs.needs_browser == 'true'
+        if: steps.impact.outputs.needs_smoke == 'true'
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: node scripts/impact-e2e.mjs --run
@@ -116,3 +116,11 @@ jobs:
       - name: Verify packaged release
         if: steps.impact.outputs.needs_package == 'true'
         run: npm run smoke:package
+      - name: Publish E2E time and process-tree memory reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-resource-profiles
+          path: work/e2e-profile-*.json
+          if-no-files-found: ignore
+          retention-days: 7
