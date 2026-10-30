@@ -27,6 +27,7 @@ entrypoint and fixture lifetime. Full regression still includes all seven.
   browser **and** package regression. Filename renames are treated as a
   deletion plus an addition.
 - Documentation and unit-test-only PRs need no browser.
+- Changes to `scripts/release-gate.mjs` are release-sensitive and trigger all seven scenarios and package verification.
 - `media-network` only PRs run the 30s network scenario without installing
   Chromium. Changes to its shared media fixture run `media` too.
 - Main and v* tag commits always run all scenarios and package checks: this
