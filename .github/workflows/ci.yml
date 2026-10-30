@@ -2,7 +2,13 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -13,10 +19,19 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+      - name: Select safe PR E2E impact
+        id: impact
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: node scripts/impact-e2e.mjs --plan
+      - name: Verify impact selector
+        run: node --test scripts/impact-e2e.test.mjs
       - run: npm ci
       - name: Use the primary Ubuntu archive mirror
         run: |
@@ -87,8 +102,17 @@ jobs:
       - run: npm run test:release
       - run: npm run build
       - name: Install Playwright Chromium and system dependencies
+        if: steps.impact.outputs.needs_browser == 'true'
         timeout-minutes: 6
         run: npx playwright install --with-deps chromium
-      - run: npm run smoke
-      - run: npm run package:release
-      - run: npm run smoke:package
+      - name: Run impact-selected E2E serially
+        if: steps.impact.outputs.needs_browser == 'true'
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: node scripts/impact-e2e.mjs --run
+      - name: Package release candidate
+        if: steps.impact.outputs.needs_package == 'true'
+        run: npm run package:release
+      - name: Verify packaged release
+        if: steps.impact.outputs.needs_package == 'true'
+        run: npm run smoke:package
