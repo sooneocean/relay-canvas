@@ -33,6 +33,24 @@ assert.ok(address && typeof address !== 'string');
 const origin = `http://127.0.0.1:${address.port}`;
 let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 try {
+  // Validate the loopback media fixture before exercising thumbnail lifecycle.
+  // This also provides a narrow, production-safe PR for measuring selected CI.
+  const mediaUrl = `${origin}/demo-motion.mp4`;
+  const head = await fetch(mediaUrl, { method: 'HEAD' });
+  assert.equal(head.status, 200);
+  assert.equal(head.headers.get('content-type'), 'video/mp4');
+  assert.equal(Number(head.headers.get('content-length')), video.length);
+  assert.equal((await head.arrayBuffer()).byteLength, 0, 'HEAD never sends video bytes');
+
+  const partial = await fetch(mediaUrl, { headers: { Range: 'bytes=0-15' } });
+  assert.equal(partial.status, 206);
+  assert.equal(partial.headers.get('content-range'), `bytes 0-15/${video.length}`);
+  assert.deepEqual(Buffer.from(await partial.arrayBuffer()), video.subarray(0, 16));
+
+  const outOfRange = await fetch(mediaUrl, { headers: { Range: `bytes=${video.length}-` } });
+  assert.equal(outOfRange.status, 416);
+  assert.equal(outOfRange.headers.get('content-range'), `bytes */${video.length}`);
+
   const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ||
     (existsSync('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome') ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : undefined);
   browser = await chromium.launch({ headless: true, executablePath });
