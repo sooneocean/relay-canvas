@@ -56,6 +56,12 @@ async function main() {
   const start = Date.now();
   const child = spawn(process.execPath, ['--import', 'tsx', file], { stdio: 'inherit' });
   let peak = null, samples = 0, sampleErrors = 0, sampling = null, launchError;
+  // Attach completion listeners before the first asynchronous sampling call.
+  // Otherwise a quickly failing smoke can be mistaken for a successful run.
+  const completion = new Promise(resolve => {
+    child.once('error', error => { launchError = String(error); });
+    child.once('close', (code, signal) => resolve({ code, signal }));
+  });
   const capture = async () => {
     if (sampling || !child.pid || child.exitCode !== null || child.signalCode !== null) return;
     sampling = (async () => {
@@ -75,10 +81,7 @@ async function main() {
   const timer = setInterval(() => { void capture(); }, 400);
   timer.unref();
   await capture();
-  const { code, signal } = await new Promise(resolve => {
-    child.once('error', error => { launchError = String(error); });
-    child.once('close', (code, signal) => resolve({ code, signal }));
-  });
+  const { code, signal } = await completion;
   clearInterval(timer);
   if (sampling) await sampling;
 
