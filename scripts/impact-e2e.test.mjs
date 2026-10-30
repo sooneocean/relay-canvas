@@ -46,16 +46,19 @@ test('standalone smoke changes map to their sole journey', () => {
   }
 });
 
-test('timeline, comparison, thumbnails and editor backend include every related smoke', () => {
+test('timeline, comparison and editor backend include every related smoke', () => {
   for (const file of [
     'src/ui/TimelineEditor.tsx',
     'src/ui/RunCompare.tsx',
-    'src/ui/VideoThumbnail.tsx',
     'server/editor.ts',
     'server/editor-supervisor.ts',
   ]) {
     assert.deepEqual(pr([file]).suites, ['editor', 'relay', 'media'], file);
   }
+});
+
+test('VideoThumbnail edits always exercise core project cards and gallery integration', () => {
+  assert.deepEqual(pr(['src/ui/VideoThumbnail.tsx']).suites, ['core', 'editor', 'relay', 'media']);
 });
 
 test('package scripts run package smoke even for a narrow PR', () => {
