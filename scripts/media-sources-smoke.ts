@@ -137,6 +137,7 @@ try {
     const label = page.locator('.inspector-content input').first();
     await label.fill('Keep this newer local edit');
     assert.equal(await label.inputValue(), 'Keep this newer local edit', 'local edit must land before unblocking import and remote state polling');
+    await until(() => page.getByLabel('save', { exact: true }).isEnabled(), value => value, 'newer local edit is marked dirty');
     release(); allowStatePolls();
     await until(() => page.locator('.media-import-notice').innerText(), value => value.includes('較新的編輯'), 'late import preserves newer edit');
     assert.equal(await label.inputValue(), 'Keep this newer local edit');
