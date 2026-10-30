@@ -122,19 +122,27 @@ try {
   await importFile('local-photo.jpg');
 
   // A held real import response must preserve edits made after submission.
+  // Pause UI state polling until the local edit is recorded; otherwise a 1s poll
+  // can ingest the newly committed remote revision before the edit, making the
+  // intended edit-versus-remote conflict nondeterministic.
   await selectNode(png.nodeId);
+  let allowStatePolls!: () => void;
+  const pollingGate = new Promise<void>(resolve => { allowStatePolls = resolve; });
+  await page.route('**/api/state', async route => { await pollingGate; await route.continue(); });
   let heldReady = false; let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
   await page.route(importPattern, async route => { const response = await route.fetch(); heldReady = true; await held; await route.fulfill({ response }); });
   try {
     await page.getByTestId('import-media-input').setInputFiles(fixture.files['local-art.webp']);
     await until(async () => heldReady, value => value, 'held import committed');
     const label = page.locator('.inspector-content input').first();
-    await label.fill('Keep this newer local edit'); release();
-    await until(() => page.locator('body').innerText(), value => /保留|版本|重新|較新/.test(value), 'late import preserves newer edit');
+    await label.fill('Keep this newer local edit');
+    assert.equal(await label.inputValue(), 'Keep this newer local edit', 'local edit must land before unblocking import and remote state polling');
+    release(); allowStatePolls();
+    await until(() => page.locator('.media-import-notice').innerText(), value => value.includes('較新的編輯'), 'late import preserves newer edit');
     assert.equal(await label.inputValue(), 'Keep this newer local edit');
     await until(() => page.getByLabel('reload-board', { exact: true }).count(), value => value > 0, 'import conflict offers deliberate reload');
     await page.getByLabel('reload-board', { exact: true }).click();
-  } finally { release(); await page.unroute(importPattern); }
+  } finally { release(); allowStatePolls(); await page.unroute('**/api/state'); await page.unroute(importPattern); }
   await until(() => page.locator('.react-flow__node').count(), value => value === 5, 'deliberate reload includes committed source');
   assert.equal((await state()).localAssets!.length, 5);
   const webp = (await state()).localAssets!.find(asset => asset.name === 'local-art.webp')!;
