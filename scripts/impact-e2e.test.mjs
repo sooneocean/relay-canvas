@@ -18,7 +18,7 @@ test('documentation and unit-test-only PRs need no browser or package smoke', ()
   for (const files of [
     ['README.md', 'docs/local-media.md'],
     ['tests/media-stream.test.ts'],
-    ['scripts/release-gate.mjs', 'scripts/release-gate.test.mjs'],
+    ['scripts/release-gate.test.mjs'],
   ]) {
     const plan = pr(files);
     assert.equal(plan.full, false);
@@ -78,7 +78,7 @@ test('unknown or shared change fails closed to all smoke + package', () => {
   for (const file of [
     'server/media.ts', 'server/security.ts', 'server/service.ts', 'server/app.ts',
     'src/shared/schema.ts', 'src/ui/App.tsx', 'src/ui/styles.css',
-    'package-lock.json', 'package.json', 'public/demo-motion.mp4',
+    'package-lock.json', 'package.json', 'public/demo-motion.mp4', 'scripts/release-gate.mjs',
     '.github/workflows/ci.yml', 'scripts/impact-e2e.mjs',
     'scripts/impact-e2e.test.mjs', 'new-unmapped-file.ts',
   ]) {
