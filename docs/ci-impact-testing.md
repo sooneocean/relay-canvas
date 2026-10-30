@@ -11,6 +11,7 @@ it does not attempt to select individual lines or Playwright tests.
 - Docs-only and unit-test-only PRs skip browser setup and smoke, but still run
   the static checks, unit tests and build.
 - Package script changes run `package:release` and `smoke:package`.
+- Release-gate implementation changes are release-sensitive and require all smoke journeys and package checks.
 - Any shared/core/unknown file, unsafe diff, invalid path or empty diff falls
   back to all four browser journeys **and** package smoke.
 - `push` on `main` and `v*` tags always runs all four journeys and package smoke.
