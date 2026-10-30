@@ -17,7 +17,7 @@ const EDITOR_MEDIA = ['editor', 'relay', 'media'];
 
 function classify(file) {
   if (/^(?:docs\/|README\.md$|AGENTS\.md$|CHANGELOG\.md$|LICENSE$)/.test(file)) return { suites: [] };
-  if (/^tests\/[^/]+\.test\.ts$/.test(file) || /^scripts\/release-gate(?:\.test)?\.mjs$/.test(file)) return { suites: [] };
+  if (/^tests\/[^/]+\.test\.ts$/.test(file) || file === 'scripts/release-gate.test.mjs') return { suites: [] };
   if (/^scripts\/package-(?:release|smoke)\.mjs$/.test(file)) return { suites: [], packageSmoke: true };
 
   // Explicitly mapped stand-alone smoke entrypoints and their helper fixtures.
