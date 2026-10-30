@@ -13,9 +13,9 @@
     "check": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
     "build": "vite build && tsc -p tsconfig.server.json",
     "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
-    "test:impact": "node --test scripts/impact-e2e.test.mjs",
+    "test:impact": "node --test scripts/impact-e2e.test.mjs scripts/profile-smoke.test.mjs",
     "test:release": "node --test scripts/release-gate.test.mjs",
-    "smoke": "tsx scripts/smoke.ts && tsx scripts/editor-smoke.ts && tsx scripts/relay-flow-smoke.ts && tsx scripts/media-sources-smoke.ts",
+    "smoke": "tsx scripts/smoke.ts && tsx scripts/editor-smoke.ts && tsx scripts/source-browser-runner.ts && tsx scripts/thumbnail-smoke.ts && tsx scripts/relay-flow-smoke.ts && tsx scripts/media-sources-smoke.ts && tsx scripts/media-network-smoke.ts",
     "package:release": "node scripts/package-release.mjs",
     "smoke:package": "node scripts/package-smoke.mjs"
   },

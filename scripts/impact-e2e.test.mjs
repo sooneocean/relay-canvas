@@ -31,34 +31,40 @@ test('standalone smoke changes map to their sole journey', () => {
   const paths = [
     ['scripts/smoke.ts', 'core'],
     ['scripts/editor-smoke.ts', 'editor'],
-    ['scripts/source-browser-smoke.ts', 'editor'],
-    ['scripts/thumbnail-lifetime-smoke.ts', 'editor'],
+    ['scripts/source-browser-smoke.ts', 'source-browser'],
+    ['scripts/source-browser-runner.ts', 'source-browser'],
+    ['scripts/thumbnail-lifetime-smoke.ts', 'thumbnail'],
+    ['scripts/thumbnail-smoke.ts', 'thumbnail'],
     ['scripts/handoff-intents-smoke.ts', 'editor'],
     ['scripts/relay-flow-smoke.ts', 'relay'],
     ['scripts/relay-ui-boundaries-smoke.ts', 'relay'],
     ['scripts/relay-fixture-server.ts', 'relay'],
     ['scripts/media-sources-smoke.ts', 'media'],
-    ['scripts/import-network-smoke.ts', 'media'],
-    ['scripts/v07-source-fixture.ts', 'media'],
+    ['scripts/import-network-smoke.ts', 'media-network'],
+    ['scripts/media-network-smoke.ts', 'media-network'],
   ];
   for (const [file, suite] of paths) {
     assert.deepEqual(pr([file]).suites, [suite], file);
   }
 });
 
-test('timeline, comparison and editor backend include every related smoke', () => {
-  for (const file of [
-    'src/ui/TimelineEditor.tsx',
-    'src/ui/RunCompare.tsx',
-    'server/editor.ts',
-    'server/editor-supervisor.ts',
-  ]) {
+test('feature changes preserve all related journeys; isolated network can run without Chromium', () => {
+  assert.deepEqual(pr(['src/ui/TimelineEditor.tsx']).suites, ['editor', 'source-browser', 'relay', 'media']);
+  assert.deepEqual(pr(['src/ui/RunCompare.tsx']).suites, ['editor', 'relay', 'media']);
+  assert.deepEqual(pr(['src/ui/VideoThumbnail.tsx']).suites, ['core', 'editor', 'source-browser', 'thumbnail', 'relay', 'media']);
+  for (const file of ['server/editor.ts', 'server/editor-supervisor.ts']) {
     assert.deepEqual(pr([file]).suites, ['editor', 'relay', 'media'], file);
   }
+  assert.deepEqual(pr(['scripts/v07-source-fixture.ts']).suites, ['media', 'media-network']);
+  const onlyNetwork = pr(['scripts/import-network-smoke.ts']);
+  assert.deepEqual(onlyNetwork.suites, ['media-network']);
+  assert.equal(SUITES.find(suite => suite.id === onlyNetwork.suites[0]).browser, false);
 });
 
-test('VideoThumbnail edits always exercise core project cards and gallery integration', () => {
-  assert.deepEqual(pr(['src/ui/VideoThumbnail.tsx']).suites, ['core', 'editor', 'relay', 'media']);
+test('VideoThumbnail edits must retain the core gallery and project-card smoke', () => {
+  const suites = pr(['src/ui/VideoThumbnail.tsx']).suites;
+  assert.equal(suites.includes('core'), true);
+  assert.deepEqual(suites, ['core', 'editor', 'source-browser', 'thumbnail', 'relay', 'media']);
 });
 
 test('package scripts run package smoke even for a narrow PR', () => {

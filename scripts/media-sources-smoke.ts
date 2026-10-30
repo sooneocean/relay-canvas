@@ -6,7 +6,6 @@ import { chromium, type Locator } from '@playwright/test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { createSourceFixture, SOURCE_MEDIA_ORIGIN, SOURCE_VIDEO_MODEL } from './v07-source-fixture.js';
-import { verifyImportNetwork } from './import-network-smoke.js';
 import type { AppState, Artifact, Board, ExportJob, LocalAsset, Run, RunComparison, Timeline } from '../src/shared/types.js';
 
 const root = process.cwd(), work = path.join(root, 'work'); mkdirSync(work, { recursive: true });
@@ -77,7 +76,6 @@ async function newRun(selected = false, external = false, imageQuantity = 0): Pr
   return run;
 }
 try {
-  const network = await verifyImportNetwork(fixture);
   await page.route('**/*', async route => {
     const request = route.request(), url = new URL(request.url());
     if (url.origin === fixture.origin) { await route.continue(); return; }
@@ -124,19 +122,28 @@ try {
   await importFile('local-photo.jpg');
 
   // A held real import response must preserve edits made after submission.
+  // Pause UI state polling until the local edit is recorded; otherwise a 1s poll
+  // can ingest the newly committed remote revision before the edit, making the
+  // intended edit-versus-remote conflict nondeterministic.
   await selectNode(png.nodeId);
+  let allowStatePolls!: () => void;
+  const pollingGate = new Promise<void>(resolve => { allowStatePolls = resolve; });
+  await page.route('**/api/state', async route => { await pollingGate; await route.continue(); });
   let heldReady = false; let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
   await page.route(importPattern, async route => { const response = await route.fetch(); heldReady = true; await held; await route.fulfill({ response }); });
   try {
     await page.getByTestId('import-media-input').setInputFiles(fixture.files['local-art.webp']);
     await until(async () => heldReady, value => value, 'held import committed');
     const label = page.locator('.inspector-content input').first();
-    await label.fill('Keep this newer local edit'); release();
-    await until(() => page.locator('body').innerText(), value => /保留|版本|重新|較新/.test(value), 'late import preserves newer edit');
+    await label.fill('Keep this newer local edit');
+    assert.equal(await label.inputValue(), 'Keep this newer local edit', 'local edit must land before unblocking import and remote state polling');
+    await until(() => page.getByLabel('save', { exact: true }).isEnabled(), value => value, 'newer local edit is marked dirty');
+    release(); allowStatePolls();
+    await until(() => page.locator('.media-import-notice').innerText(), value => value.includes('較新的編輯'), 'late import preserves newer edit');
     assert.equal(await label.inputValue(), 'Keep this newer local edit');
     await until(() => page.getByLabel('reload-board', { exact: true }).count(), value => value > 0, 'import conflict offers deliberate reload');
     await page.getByLabel('reload-board', { exact: true }).click();
-  } finally { release(); await page.unroute(importPattern); }
+  } finally { release(); allowStatePolls(); await page.unroute('**/api/state'); await page.unroute(importPattern); }
   await until(() => page.locator('.react-flow__node').count(), value => value === 5, 'deliberate reload includes committed source');
   assert.equal((await state()).localAssets!.length, 5);
   const webp = (await state()).localAssets!.find(asset => asset.name === 'local-art.webp')!;
@@ -274,7 +281,7 @@ try {
   fixture.assertNoLeaks(await state()); fixture.assertNoLeaks(await fixture.api<RunComparison>(comparisonPath)); fixture.assertNoLeaks(readFileSync(fixture.store.file, 'utf8'));
   assert.deepEqual(errors, []); assert.deepEqual(unexpectedOutbound, []);
   assert.deepEqual(fixture.submissions(), { images: 2, videos: 3, localReferences: 1 }, 'save/compare/edit/export/reload never generates');
-  const report = { status: 'PASS', browser: await browser.version(), network, importedFormats: ['image/png', 'image/jpeg', 'image/webp', 'video/mp4', 'video/webm'], imports: (await state()).localAssets!.length, fixtureSubmissions: fixture.submissions(), paidRequests: 0, liveProviderRequests: 0, checks: ['raw UI import and private preview/download/hash', 'same-operation committed-response-loss recovery', 'late import preserves edits and deliberate reload', 'invalid signature rejection', 'local passthrough zero provider calls', 'real MCP assetId authority and UI sync', 'disclosed local image transfer with canonical-only persistence', 'two multi-output generations with exact index1 comparison save/download', 'mixed imported/generated MP4/WebM trims/order and cross-cut playback', 'both real MP4 formats/playback/download/hash and offline-CDN reload'], exports: exports.map(job => ({ format: job.snapshot.format, sha256: job.artifact!.sha256 })) };
+  const report = { status: 'PASS', browser: await browser.version(), importedFormats: ['image/png', 'image/jpeg', 'image/webp', 'video/mp4', 'video/webm'], imports: (await state()).localAssets!.length, fixtureSubmissions: fixture.submissions(), paidRequests: 0, liveProviderRequests: 0, checks: ['raw UI import and private preview/download/hash', 'same-operation committed-response-loss recovery', 'late import preserves edits and deliberate reload', 'invalid signature rejection', 'local passthrough zero provider calls', 'real MCP assetId authority and UI sync', 'disclosed local image transfer with canonical-only persistence', 'two multi-output generations with exact index1 comparison save/download', 'mixed imported/generated MP4/WebM trims/order and cross-cut playback', 'both real MP4 formats/playback/download/hash and offline-CDN reload'], exports: exports.map(job => ({ format: job.snapshot.format, sha256: job.artifact!.sha256 })) };
   writeFileSync(path.join(work, 'v07-media-sources-report.json'), JSON.stringify(report, null, 2));
   console.log('PASS: multi-output relay + five local media formats → MCP/source-safe generation → exact Compare → mixed timeline → both local MP4 exports; zero live/paid requests.');
 } catch (error) {

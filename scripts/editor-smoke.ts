@@ -12,8 +12,6 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Store } from '../server/store.js';
 import { providers, starterBoard } from '../src/shared/defaults.js';
 import { verifyHandoffIntents } from './handoff-intents-smoke.js';
-import { sourceBrowserFixtures, verifySourceBrowser } from './source-browser-smoke.js';
-import { verifyThumbnailLifetime } from './thumbnail-lifetime-smoke.js';
 import type { AppState, Artifact, ArtifactInfo, Board, ExportJob, Run, RunComparison, Timeline } from '../src/shared/types.js';
 
 const root = process.cwd();
@@ -43,9 +41,6 @@ const fixtureStore = new Store(dataDir);
 fixtureStore.transaction(state => {
   state.boards.push(handoffBoard);
   state.runs.push(fixtureRun('handoff-a', 2, '2026-01-02T10:30:00Z'), fixtureRun('handoff-b', 3, '2026-01-03T12:45:00Z'));
-  const sources = sourceBrowserFixtures();
-  state.boards.push(sources.board);
-  state.runs.push(...sources.runs);
 });
 const artifacts = path.join(root, 'work'); mkdirSync(artifacts, { recursive: true });
 const portProbe = net.createServer();
@@ -565,8 +560,6 @@ try {
     assert.deepEqual(await api<Timeline>('/api/boards/handoff/timeline'), retriedTimeline, 'guarded handoff does not add or rewrite timeline');
   } finally { releaseCanvasGuard(); await page.unroute(boardSavePattern); }
   expectedFailure = false;
-  await verifySourceBrowser(browser, root, origin, api);
-  await verifyThumbnailLifetime(browser, root, origin);
   await verifyHandoffIntents(browser, root, handoffBoard, (await api<AppState>('/api/state')).runs.filter(run => run.boardId === 'handoff'), retriedTimeline);
   assert.equal(generationRequests, 0, 'editor and comparison never regenerate');
   assert.deepEqual(errors, [], 'no browser errors');
