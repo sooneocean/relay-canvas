@@ -61,6 +61,12 @@ test('feature changes preserve all related journeys; isolated network can run wi
   assert.equal(SUITES.find(suite => suite.id === onlyNetwork.suites[0]).browser, false);
 });
 
+test('VideoThumbnail edits must retain the core gallery and project-card smoke', () => {
+  const suites = pr(['src/ui/VideoThumbnail.tsx']).suites;
+  assert.equal(suites.includes('core'), true);
+  assert.deepEqual(suites, ['core', 'editor', 'source-browser', 'thumbnail', 'relay', 'media']);
+});
+
 test('package scripts run package smoke even for a narrow PR', () => {
   const plan = pr(['scripts/package-release.mjs']);
   assert.deepEqual(plan.suites, []);
