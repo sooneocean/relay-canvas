@@ -27,7 +27,8 @@ function classify(file) {
   if (/^scripts\/(?:media-sources-smoke|import-network-smoke|v07-source-fixture)\.ts$/.test(file)) return { suites: ['media'] };
 
   // Features exercised by several integration journeys.
-  if (/^src\/ui\/(?:TimelineEditor|RunCompare|VideoThumbnail)\.tsx$/.test(file)) return { suites: EDITOR_MEDIA };
+  if (file === 'src/ui/VideoThumbnail.tsx') return { suites: ['core', ...EDITOR_MEDIA] };
+  if (/^src\/ui\/(?:TimelineEditor|RunCompare)\.tsx$/.test(file)) return { suites: EDITOR_MEDIA };
   if (/^server\/(?:editor|editor-supervisor)\.ts$/.test(file)) return { suites: EDITOR_MEDIA };
 
   // Shared UI, persistence, media routes, schemas, dependencies, and CI are
