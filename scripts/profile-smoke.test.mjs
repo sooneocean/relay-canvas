@@ -48,7 +48,7 @@ test('quick failing child during slow first ps sample exits nonzero and writes F
     const ps = (process.env.PATH ?? '').split(path.delimiter)
       .map(entry => path.join(entry, 'ps')).find(existsSync);
     assert.ok(ps, 'ps executable is available on Linux/macOS');
-    writeFileSync(path.join(directory, 'ps'), '#!/bin/sh\\nsleep 1\\nexec "' + ps + '" "$@"\\n'.replaceAll('\\n', '\n'), { mode: 0o755 });
+    writeFileSync(path.join(directory, 'ps'), `#!/bin/sh\nsleep 1\nexec "${ps}" "$@"\n`, { mode: 0o755 });
     const wrapper = fileURLToPath(new URL('./profile-smoke.mjs', import.meta.url));
     const result = spawnSync(process.execPath, [wrapper, 'early-exit', 'scripts/does-not-exist.ts'], {
       cwd: directory,
