@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Artifact, EditorCapabilities, MediaInfo, Timeline } from '../src/shared/types.js';
 import { parseMediaInfo } from '../src/shared/schema.js';
+import { upscaleBounds } from '../src/shared/upscale.js';
 import { MediaStore, MAX_MEDIA_BYTES, type MediaReservation } from './media.js';
 
 const MAX_EPHEMERAL = 192 * 1024 * 1024;
@@ -209,6 +210,77 @@ export class EditorRuntime {
       return parseMediaInfo({ duration: Number(parsed.format?.duration), width: video.width, height: video.height, hasAudio: parsed.streams?.some(stream => stream.codec_type === 'audio') ?? false });
     } finally { this.probes--; if (job) this.workspace.cleanup(job); release(); }
   }
+  /**
+   * Non-generative, per-frame Lanczos resampling to a 1080p display canvas.
+   * Source timestamps and frame cadence are passed through: no frame picking,
+   * no synthesized motion and no independent per-frame color grading.
+   *
+   * Browser-compatible H.264/yuv420p output inevitably re-encodes chroma:
+   * this path is NOT a lossless YUV444 preservation master.
+   */
+  async upscale(
+    source: Artifact,
+    commit: (artifact: Artifact) => void,
+    isReferenced: (localId: string) => boolean,
+    signal?: AbortSignal,
+  ): Promise<Artifact> {
+    if (!this.ffmpeg || !this.ffprobe || source.kind !== 'video' ||
+        !['video/mp4', 'video/webm'].includes(source.mimeType ?? '')) {
+      throw new Error('Upscale requires locally saved MP4/WebM and FFmpeg');
+    }
+    const media = await this.probe(source);
+    if (media.duration > 60 || media.duration < 1) throw new Error('Upscale accepts only 1-60 seconds');
+    const target = upscaleBounds(media);
+    const release = this.workspace.reserve(MAX_EPHEMERAL);
+    let reservation: MediaReservation | undefined;
+    let job: ReturnType<EphemeralWorkspace['create']> | undefined;
+    let committed = false;
+    try {
+      if (signal?.aborted) throw new Error('Upscale cancelled');
+      reservation = await this.media.reserveDerived(MAX_MEDIA_BYTES);
+      job = this.workspace.create();
+      const inputName = source.mimeType === 'video/mp4' ? 'source-000.mp4' : 'source-000.webm';
+      copyVerified(this.media, source, path.join(job.directory, inputName));
+      if (!(await this.capabilities()).available) throw new Error('Editor tools unavailable');
+      // No fps filter and no image sequence: use actual source timestamps.
+      const filter = [
+        'scale=' + target.width + ':' + target.height +
+          ':flags=lanczos:force_original_aspect_ratio=decrease',
+        'pad=' + target.width + ':' + target.height +
+          ':(ow-iw)/2:(oh-ih)/2:black',
+        'setsar=1', 'format=yuv420p',
+      ].join(',');
+      const args = [
+        '-hide_banner', '-loglevel', 'error', '-nostdin',
+        '-max_alloc', String(MAX_MEDIA_BYTES), '-filter_threads', '2',
+        ...inputArgs(inputName, source.mimeType!),
+        '-map', '0:v:0', '-map', '0:a:0?',
+        '-vf', filter, '-fps_mode:v', 'passthrough',
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+        '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k',
+        '-threads', '2', '-movflags', '+faststart',
+        '-fs', String(reservation.bytes + 1), '-y', 'output.mp4',
+      ];
+      const result = await runSupervised(this.ffmpeg, args, job.directory, 180_000, signal).result;
+      if (result.code !== 0 || result.truncated || signal?.aborted) throw new Error('Upscale failed or cancelled');
+      const output = path.join(job.directory, 'output.mp4'), stat = lstatSync(output);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 ||
+          stat.size > reservation.bytes || this.workspace.check(job) > MAX_EPHEMERAL) {
+        throw new Error('Upscale output is invalid or exceeds storage limit');
+      }
+      const fd = openSync(output, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const artifact = await this.media.commitDerived(reservation, fd, stat.size, commit, isReferenced);
+        committed = true;
+        return artifact;
+      } finally { closeSync(fd); }
+    } finally {
+      if (!committed && reservation) await this.media.releaseReservation(reservation);
+      if (job) this.workspace.cleanup(job);
+      release();
+    }
+  }
+
   async export(
     timeline: Timeline,
     commit: (artifact: Artifact) => void,

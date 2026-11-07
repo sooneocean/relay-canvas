@@ -98,6 +98,7 @@ import { deriveAssets, deriveProjects, type AssetItem, type ProjectCard } from '
 import RunCompare from './RunCompare.js';
 import TimelineEditor, { validateTimelineHandoff, type SaveArtifact, type TimelineHandoffIntent, type UiRequest } from './TimelineEditor.js';
 import VideoThumbnail from './VideoThumbnail.js';
+import VideoUpscaleActions from './VideoUpscaleActions.js';
 
 type FlowNode = Node<CanvasData & { previewUrl?: string; runStatus?: Status; runError?: string }, 'canvas'>;
 type FlowEdge = Edge;
@@ -504,6 +505,7 @@ function AppShell() {
   const [compareOpen, setCompareOpen] = useState(false);
   const [handoffIntent, setHandoffIntent] = useState<TimelineHandoffIntent>();
   const [assetSaveStates, setAssetSaveStates] = useState<Record<string, AssetSaveState>>({});
+  const [upscaleBusyAssets, setUpscaleBusyAssets] = useState<Record<string, boolean>>({});
   const [conflict, setConflict] = useState<BoardConflict>();
   const [mediaImport, setMediaImport] = useState<MediaImportState>();
   const [mediaImportNotice, setMediaImportNotice] = useState<string>();
@@ -1490,6 +1492,67 @@ function AppShell() {
     return operation;
   }, [apiState, notify, requestJson]);
 
+  const startUpscale = useCallback(async (asset: AssetItem) => {
+    if (asset.kind !== 'video' || !asset.artifact.localId ||
+        asset.artifact.localId !== asset.artifact.sha256 ||
+        apiState !== 'ready' || !tokenRef.current) {
+      notify('請先將影片保存本機，確認服務連線後再進行1080p升頻。', 'error');
+      return;
+    }
+    if (upscaleBusyAssets[asset.id]) return;
+    setUpscaleBusyAssets(current => ({ ...current, [asset.id]: true }));
+    try {
+      const job = await requestJson<ExportJob>(
+        '/api/boards/' + encodeURIComponent(asset.boardId) + '/upscale',
+        { method: 'POST', body: JSON.stringify({
+          operationId: crypto.randomUUID(),
+          source: {
+            runId: asset.runId, nodeId: asset.nodeId,
+            artifactIndex: asset.artifactIndex,
+          },
+          preset: 'lanczos_1080p',
+        }) },
+      );
+      setExports(current => [job, ...current.filter(previous => previous.id !== job.id)]);
+      notify('已送出本機1080p保真升頻，原影片不會被取代。', 'info');
+    } catch (error) {
+      notify('升頻無法啟動：' + errorMessage(error), 'error');
+    } finally {
+      setUpscaleBusyAssets(current => ({ ...current, [asset.id]: false }));
+    }
+  }, [apiState, notify, requestJson, upscaleBusyAssets]);
+
+  useEffect(() => {
+    if (apiState !== 'ready') return;
+    const pending = exports.filter(job => job.upscale &&
+      (job.status === 'pending' || job.status === 'running'));
+    if (!pending.length) return;
+    let disposed = false;
+    let polling = false;
+    const poll = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        for (const job of pending) {
+          try {
+            const latest = await requestJson<ExportJob>('/api/exports/' + encodeURIComponent(job.id));
+            if (disposed) break;
+            setExports(current => current.map(existing =>
+              existing.id === latest.id ? latest : existing));
+            if (latest.status === 'succeeded' && job.status !== 'succeeded') {
+              notify('1080p升頻完成，已可下載新影片。', 'success');
+            } else if (latest.status === 'failed' && job.status !== 'failed') {
+              notify('1080p升頻失敗；原始影片未變動。', 'error');
+            }
+          } catch { /* retry through next poll; no blind submit */ }
+        }
+      } finally { polling = false; }
+    };
+    void poll();
+    const timer = window.setInterval(() => { void poll(); }, 3000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [apiState, exports, notify, requestJson]);
+
   const updateProviderDraft = useCallback((patch: Partial<Provider>) => {
     const draftId = providerDraftIdRef.current;
     providerEditVersionRef.current += 1;
@@ -1690,6 +1753,9 @@ function AppShell() {
       onCreate={() => void createBoard()}
       assetSaveStates={assetSaveStates}
       onSaveAsset={saveAsset}
+      upscaleJobs={exports}
+      upscaleBusyAssets={upscaleBusyAssets}
+      onUpscale={startUpscale}
     >{toastView}</AssetsPage>;
   }
 
@@ -1882,7 +1948,7 @@ function ProjectCardView({ card, index, onOpen }: { card: ProjectCard; index: nu
   return <button className="project-card" data-testid={card.boardId === 'welcome' ? 'project-card-welcome' : undefined} aria-label={card.boardId === 'welcome' ? 'project-card-welcome' : `project-card-${card.boardId}`} onClick={onOpen}><div className={`project-card-media ${thumbnail ? 'has-thumb' : 'is-empty'}`}>{thumbnail?.kind === 'image' && <img src={artifactUrl(thumbnail)} alt="" referrerPolicy="no-referrer" crossOrigin="anonymous" />}{thumbnail?.kind === 'video' && <VideoThumbnail src={artifactUrl(thumbnail) ?? thumbnail.url} alt="影片縮圖" />}{!thumbnail && <><span className="empty-canvas-mark"><LayoutGrid size={24} /></span><span>EMPTY CANVAS</span></>}</div><div className="project-card-body"><div><strong>{card.name}</strong><small>{card.thumbnailRunAt ? `上次生成 · ${new Date(card.thumbnailRunAt).toLocaleDateString('zh-TW')}` : card.latestRunAt ? `最近執行 · ${new Date(card.latestRunAt).toLocaleDateString('zh-TW')}` : `${card.nodeCount} nodes · ready to shape`}</small></div><span className="project-card-index">{String(index + 1).padStart(2, '0')}</span></div><div className="project-card-meta"><span>{card.nodeCount} nodes</span><span>{card.edgeCount} links</span><span className="project-open-label">開啟 <ArrowRight size={13} /></span></div></button>;
 }
 
-function AssetsPage({ assets, totalCount, query, filter, navigationPending, onQueryChange, onFilterChange, onBack, onOpenBoard, preview, onPreview, onClosePreview, onCreate, assetSaveStates, onSaveAsset, children }: {
+function AssetsPage({ assets, totalCount, query, filter, navigationPending, onQueryChange, onFilterChange, onBack, onOpenBoard, preview, onPreview, onClosePreview, onCreate, assetSaveStates, onSaveAsset, upscaleJobs, upscaleBusyAssets, onUpscale, children }: {
   assets: AssetItem[];
   totalCount: number;
   query: string;
@@ -1898,9 +1964,16 @@ function AssetsPage({ assets, totalCount, query, filter, navigationPending, onQu
   onCreate: () => void;
   assetSaveStates: Record<string, AssetSaveState>;
   onSaveAsset: (runId: string, nodeId: string, artifactIndex: number) => void;
+  upscaleJobs: ExportJob[];
+  upscaleBusyAssets: Record<string, boolean>;
+  onUpscale: (asset: AssetItem) => void;
   children?: ReactNode;
 }) {
-  return <div className="assets-layout"><header className="assets-header"><button className="topbar-back" aria-label="back-home" onClick={onBack} disabled={navigationPending}><ArrowLeft size={15} />Projects</button><div className="assets-brand"><div className="brand-mark"><span /></div><strong>Relay Canvas</strong><span className="preview-tag">v0.3.0</span></div><div className="assets-header-note">REAL OUTPUTS / LOCAL CATALOG</div></header><main className="assets-main"><div className="assets-heading"><div><span className="home-eyebrow">MEDIA LIBRARY</span><h1>素材</h1><p>只顯示已完成執行產生的真實圖片與影片。</p></div><div className="assets-actions"><label className="project-search"><Search size={15} /><input aria-label="asset-search" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜尋素材" /></label><button className="light-button" aria-label="new-project" onClick={onCreate} disabled={navigationPending}><Plus size={14} />新建專案</button></div></div><div className="asset-toolbar"><div className="asset-filters"><button className={filter === 'all' ? 'is-active' : ''} onClick={() => onFilterChange('all')}>全部 <span>{totalCount}</span></button><button className={filter === 'image' ? 'is-active' : ''} aria-label="gallery-filter-image" onClick={() => onFilterChange('image')}>圖片</button><button className={filter === 'video' ? 'is-active' : ''} aria-label="gallery-filter-video" onClick={() => onFilterChange('video')}>影片</button></div><span className="asset-count">{assets.length.toString().padStart(2, '0')} shown / {totalCount.toString().padStart(2, '0')} total</span></div>{assets.length === 0 ? <div className="empty-assets"><div className="empty-assets-icon"><LayoutGrid size={22} /></div><h2>尚無生成素材</h2><p>完成一次 Demo 或已確認的遠端執行後，成果會出現在這裡。</p><button className="light-button" onClick={onCreate} disabled={navigationPending}><Plus size={14} />建立第一個專案</button></div> : <div className="asset-grid">{assets.map((asset) => <AssetCard key={asset.id} asset={asset} saveState={assetSaveStates[asset.id]} onSave={() => onSaveAsset(asset.runId, asset.nodeId, asset.artifactIndex)} onPreview={() => onPreview(asset)} onOpenBoard={() => onOpenBoard(asset.boardId, asset.nodeId)} />)}</div>}</main>{preview && <AssetPreview asset={preview} saveState={assetSaveStates[preview.id]} onSave={() => onSaveAsset(preview.runId, preview.nodeId, preview.artifactIndex)} onClose={onClosePreview} onOpenBoard={() => { onClosePreview(); onOpenBoard(preview.boardId, preview.nodeId); }} />}{children}</div>;
+  const jobFor = (asset: AssetItem) => upscaleJobs.find(job =>
+    job.upscale?.source.runId === asset.runId &&
+    job.upscale.source.nodeId === asset.nodeId &&
+    job.upscale.source.artifactIndex === asset.artifactIndex);
+  return <div className="assets-layout"><header className="assets-header"><button className="topbar-back" aria-label="back-home" onClick={onBack} disabled={navigationPending}><ArrowLeft size={15} />Projects</button><div className="assets-brand"><div className="brand-mark"><span /></div><strong>Relay Canvas</strong><span className="preview-tag">v0.3.0</span></div><div className="assets-header-note">REAL OUTPUTS / LOCAL CATALOG</div></header><main className="assets-main"><div className="assets-heading"><div><span className="home-eyebrow">MEDIA LIBRARY</span><h1>素材</h1><p>只顯示已完成執行產生的真實圖片與影片。</p></div><div className="assets-actions"><label className="project-search"><Search size={15} /><input aria-label="asset-search" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜尋素材" /></label><button className="light-button" aria-label="new-project" onClick={onCreate} disabled={navigationPending}><Plus size={14} />新建專案</button></div></div><div className="asset-toolbar"><div className="asset-filters"><button className={filter === 'all' ? 'is-active' : ''} onClick={() => onFilterChange('all')}>全部 <span>{totalCount}</span></button><button className={filter === 'image' ? 'is-active' : ''} aria-label="gallery-filter-image" onClick={() => onFilterChange('image')}>圖片</button><button className={filter === 'video' ? 'is-active' : ''} aria-label="gallery-filter-video" onClick={() => onFilterChange('video')}>影片</button></div><span className="asset-count">{assets.length.toString().padStart(2, '0')} shown / {totalCount.toString().padStart(2, '0')} total</span></div>{assets.length === 0 ? <div className="empty-assets"><div className="empty-assets-icon"><LayoutGrid size={22} /></div><h2>尚無生成素材</h2><p>完成一次 Demo 或已確認的遠端執行後，成果會出現在這裡。</p><button className="light-button" onClick={onCreate} disabled={navigationPending}><Plus size={14} />建立第一個專案</button></div> : <div className="asset-grid">{assets.map((asset) => <AssetCard key={asset.id} asset={asset} saveState={assetSaveStates[asset.id]} upscaleJob={jobFor(asset)} upscaleStarting={upscaleBusyAssets[asset.id]} onUpscale={() => onUpscale(asset)} onSave={() => onSaveAsset(asset.runId, asset.nodeId, asset.artifactIndex)} onPreview={() => onPreview(asset)} onOpenBoard={() => onOpenBoard(asset.boardId, asset.nodeId)} />)}</div>}</main>{preview && <AssetPreview asset={preview} saveState={assetSaveStates[preview.id]} upscaleJob={jobFor(preview)} upscaleStarting={upscaleBusyAssets[preview.id]} onUpscale={() => onUpscale(preview)} onSave={() => onSaveAsset(preview.runId, preview.nodeId, preview.artifactIndex)} onClose={onClosePreview} onOpenBoard={() => { onClosePreview(); onOpenBoard(preview.boardId, preview.nodeId); }} />}{children}</div>;
 }
 
 function assetDownloadName(asset: AssetItem): string {
@@ -1915,14 +1988,14 @@ function assetSaveLabel(asset: AssetItem, saveState?: AssetSaveState): string {
   return '保存本機';
 }
 
-function AssetCard({ asset, saveState, onSave, onPreview, onOpenBoard }: { asset: AssetItem; saveState?: AssetSaveState; onSave: () => void; onPreview: () => void; onOpenBoard: () => void }) {
+function AssetCard({ asset, saveState, upscaleJob, upscaleStarting, onUpscale, onSave, onPreview, onOpenBoard }: { asset: AssetItem; saveState?: AssetSaveState; upscaleJob?: ExportJob; upscaleStarting?: boolean; onUpscale: () => void; onSave: () => void; onPreview: () => void; onOpenBoard: () => void }) {
   const saved = saveState?.status === 'saved' || Boolean(asset.artifact.localUrl || asset.artifact.localId);
-  return <article className="asset-card"><button className="asset-preview-button" aria-label={`gallery-item-${asset.id}`} onClick={onPreview}>{asset.kind === 'image' ? <img src={asset.url} alt={asset.nodeId} referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <VideoThumbnail src={asset.url} alt={asset.nodeId} />}<span className="asset-kind-badge">{asset.artifact.demo ? 'DEMO' : asset.kind.toUpperCase()}</span><span className="asset-hover-icon"><Maximize2 size={15} /></span></button><div className="asset-card-info"><div><strong>{asset.boardName}</strong><small>{asset.nodeId} · {new Date(asset.startedAt).toLocaleDateString('zh-TW')}</small><span className={`asset-local-status ${saveState?.status === 'failed' ? 'is-failed' : saved ? 'is-saved' : ''}`}>{saveState?.status === 'failed' ? saveState.message ?? '保存失敗' : saved ? '已保存本機' : '僅遠端引用'}</span></div><button className="asset-open-board" aria-label={`open-board-${asset.boardId}`} onClick={onOpenBoard}>開啟畫布 <ArrowRight size={13} /></button></div><div className="asset-card-actions"><button className="asset-save-button" aria-label={`save-asset-${asset.id}`} disabled={saved || saveState?.status === 'saving'} onClick={onSave}>{saveState?.status === 'saving' ? <LoaderCircle className="spin" size={13} /> : saveState?.status === 'failed' ? <RefreshCw size={13} /> : <Save size={13} />}{assetSaveLabel(asset, saveState)}</button>{saved && <a className="asset-download-button" aria-label={`download-asset-${asset.id}`} href={asset.url} download={assetDownloadName(asset)}><Download size={13} />下載</a>}</div></article>;
+  return <article className="asset-card"><button className="asset-preview-button" aria-label={`gallery-item-${asset.id}`} onClick={onPreview}>{asset.kind === 'image' ? <img src={asset.url} alt={asset.nodeId} referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <VideoThumbnail src={asset.url} alt={asset.nodeId} />}<span className="asset-kind-badge">{asset.artifact.demo ? 'DEMO' : asset.kind.toUpperCase()}</span><span className="asset-hover-icon"><Maximize2 size={15} /></span></button><div className="asset-card-info"><div><strong>{asset.boardName}</strong><small>{asset.nodeId} · {new Date(asset.startedAt).toLocaleDateString('zh-TW')}</small><span className={`asset-local-status ${saveState?.status === 'failed' ? 'is-failed' : saved ? 'is-saved' : ''}`}>{saveState?.status === 'failed' ? saveState.message ?? '保存失敗' : saved ? '已保存本機' : '僅遠端引用'}</span></div><button className="asset-open-board" aria-label={`open-board-${asset.boardId}`} onClick={onOpenBoard}>開啟畫布 <ArrowRight size={13} /></button></div><div className="asset-card-actions"><button className="asset-save-button" aria-label={`save-asset-${asset.id}`} disabled={saved || saveState?.status === 'saving'} onClick={onSave}>{saveState?.status === 'saving' ? <LoaderCircle className="spin" size={13} /> : saveState?.status === 'failed' ? <RefreshCw size={13} /> : <Save size={13} />}{assetSaveLabel(asset, saveState)}</button>{saved && <a className="asset-download-button" aria-label={`download-asset-${asset.id}`} href={asset.url} download={assetDownloadName(asset)}><Download size={13} />下載</a>}<VideoUpscaleActions source={asset.artifact} job={upscaleJob} starting={upscaleStarting} onUpscale={onUpscale} /></div></article>;
 }
 
-function AssetPreview({ asset, saveState, onSave, onClose, onOpenBoard }: { asset: AssetItem; saveState?: AssetSaveState; onSave: () => void; onClose: () => void; onOpenBoard: () => void }) {
+function AssetPreview({ asset, saveState, upscaleJob, upscaleStarting, onUpscale, onSave, onClose, onOpenBoard }: { asset: AssetItem; saveState?: AssetSaveState; upscaleJob?: ExportJob; upscaleStarting?: boolean; onUpscale: () => void; onSave: () => void; onClose: () => void; onOpenBoard: () => void }) {
   const saved = saveState?.status === 'saved' || Boolean(asset.artifact.localUrl || asset.artifact.localId);
-  return <div className="asset-preview-scrim" role="presentation" onClick={onClose}><div className="asset-preview-dialog" role="dialog" aria-modal="true" aria-label="asset-preview" onClick={(event) => event.stopPropagation()}><button className="asset-preview-close" aria-label="close-asset-preview" onClick={onClose}><X size={16} /></button><div className="asset-preview-media">{asset.kind === 'image' ? <img src={asset.url} alt={asset.nodeId} referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <video src={asset.url} controls autoPlay muted playsInline crossOrigin="anonymous" />}</div><div className="asset-preview-caption"><div><span className="home-eyebrow">{asset.artifact.demo ? 'DEMO OUTPUT' : 'OUTPUT'}</span><h2>{asset.boardName}</h2><p>{asset.nodeId} · {new Date(asset.startedAt).toLocaleString('zh-TW')}</p><span className={`asset-local-status ${saveState?.status === 'failed' ? 'is-failed' : saved ? 'is-saved' : ''}`}>{saveState?.status === 'failed' ? saveState.message ?? '保存失敗' : saved ? '已保存本機' : '僅遠端引用'}</span></div><div className="asset-preview-actions"><button className="asset-save-button" aria-label={`save-asset-${asset.id}`} disabled={saved || saveState?.status === 'saving'} onClick={onSave}>{saveState?.status === 'saving' ? <LoaderCircle className="spin" size={13} /> : saveState?.status === 'failed' ? <RefreshCw size={13} /> : <Save size={13} />}{assetSaveLabel(asset, saveState)}</button>{saved && <a className="asset-download-button" aria-label={`download-asset-${asset.id}`} href={asset.url} download={assetDownloadName(asset)}><Download size={13} />下載</a>}<button className="light-button" onClick={onOpenBoard}>開啟專案 <ArrowRight size={14} /></button></div></div></div></div>;
+  return <div className="asset-preview-scrim" role="presentation" onClick={onClose}><div className="asset-preview-dialog" role="dialog" aria-modal="true" aria-label="asset-preview" onClick={(event) => event.stopPropagation()}><button className="asset-preview-close" aria-label="close-asset-preview" onClick={onClose}><X size={16} /></button><div className="asset-preview-media">{asset.kind === 'image' ? <img src={asset.url} alt={asset.nodeId} referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <video src={asset.url} controls autoPlay muted playsInline crossOrigin="anonymous" />}</div><div className="asset-preview-caption"><div><span className="home-eyebrow">{asset.artifact.demo ? 'DEMO OUTPUT' : 'OUTPUT'}</span><h2>{asset.boardName}</h2><p>{asset.nodeId} · {new Date(asset.startedAt).toLocaleString('zh-TW')}</p><span className={`asset-local-status ${saveState?.status === 'failed' ? 'is-failed' : saved ? 'is-saved' : ''}`}>{saveState?.status === 'failed' ? saveState.message ?? '保存失敗' : saved ? '已保存本機' : '僅遠端引用'}</span></div><div className="asset-preview-actions"><button className="asset-save-button" aria-label={`save-asset-${asset.id}`} disabled={saved || saveState?.status === 'saving'} onClick={onSave}>{saveState?.status === 'saving' ? <LoaderCircle className="spin" size={13} /> : saveState?.status === 'failed' ? <RefreshCw size={13} /> : <Save size={13} />}{assetSaveLabel(asset, saveState)}</button>{saved && <a className="asset-download-button" aria-label={`download-asset-${asset.id}`} href={asset.url} download={assetDownloadName(asset)}><Download size={13} />下載</a>}<VideoUpscaleActions source={asset.artifact} job={upscaleJob} starting={upscaleStarting} onUpscale={onUpscale} /><button className="light-button" onClick={onOpenBoard}>開啟專案 <ArrowRight size={14} /></button></div></div></div></div>;
 }
 
 function InspectorPanel({ node, providers, localAssets, selectedResult, runId, assetSaveStates, onSaveAsset, onChange, onDelete, onOpenProviders }: { node?: FlowNode; providers: Provider[]; localAssets: LocalAsset[]; selectedResult?: NodeResult; runId?: string; assetSaveStates: Record<string, AssetSaveState>; onSaveAsset: (runId: string, nodeId: string, artifactIndex: number) => void; onChange: (patch: Partial<CanvasData>) => void; onDelete: () => void; onOpenProviders: () => void }) {

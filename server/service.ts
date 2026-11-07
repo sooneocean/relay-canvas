@@ -13,6 +13,8 @@ import type {
   GenerationRequest, ImportAssetInput, ImportAssetResult, LocalAsset, Provider, Run, RunComparison, RunComparisonField, StoredExportJob, Timeline,
 } from '../src/shared/types.js';
 import { recommendedReferenceField } from '../src/shared/defaults.js';
+import { parseUpscaleInput } from '../src/shared/schema.js';
+import { upscaleBounds } from '../src/shared/upscale.js';
 
 type Generator = (provider: Provider, request: GenerationRequest) => Promise<GenerationOutput>;
 const NODE_FOOTPRINT = { width: 340, height: 240 } as const;
@@ -271,6 +273,101 @@ export class CanvasService {
     this.exportTasks.set(id, task); void task.catch(() => undefined);
     return this.publicExport(job);
   }
+  /**
+   * Start an opt-in, free local 1080p upscale. Reuses durable export fencing
+   * and media registry; no provider, seed, or AI model is called.
+   */
+  async startUpscale(boardId: string, input: unknown): Promise<ExportJob> {
+    this.board(boardId);
+    const request = parseUpscaleInput(input);
+    const findPrior = () => this.store.read().exports?.find(job => job.operationId === request.operationId);
+    const matchPrior = (existing: StoredExportJob): ExportJob => {
+      if (existing.boardId !== boardId || existing.upscale?.preset !== request.preset ||
+          existing.upscale.source.runId !== request.source.runId ||
+          existing.upscale.source.nodeId !== request.source.nodeId ||
+          existing.upscale.source.artifactIndex !== request.source.artifactIndex) {
+        throw new AppError('OPERATION_CONFLICT', 'operationId already used for another job.', 409);
+      }
+      return this.publicExport(existing);
+    };
+    const prior = findPrior();
+    if (prior) return matchPrior(prior);
+    if (this.activeExport) throw new AppError('BUSY', 'A video export or upscale is already running.', 409);
+    const artifact = this.source(boardId, request.source);
+    let media;
+    try {
+      this.media.verifyArtifact(artifact);
+      media = await this.editor.probe(artifact);
+      if (media.duration > 60 || media.duration < 1) throw new Error('Invalid clip duration');
+      upscaleBounds(media);
+    } catch {
+      throw new AppError('UPSCALE_SOURCE_INVALID', 'Save a valid 1-60 second video smaller than 1080p before upscaling.', 400);
+    }
+    const replay = findPrior();
+    if (replay) return matchPrior(replay);
+    if (this.activeExport) throw new AppError('BUSY', 'A video export or upscale is already running.', 409);
+    if ((this.store.read().exports?.length ?? 0) >= 100) throw new AppError('LIMIT', 'Export job limit reached.', 409);
+    const snapshot: Timeline = {
+      boardId, revision: 0, format: media.height > media.width ? 'portrait' : 'landscape',
+      clips: [{
+        id: randomUUID(), source: request.source, inSeconds: 0,
+        outSeconds: media.duration, artifact, media,
+      }],
+    };
+    const id = randomUUID(), attemptNonce = randomUUID(), controller = new AbortController();
+    const job: StoredExportJob = {
+      id, boardId, timelineRevision: 0, operationId: request.operationId,
+      status: 'pending', startedAt: new Date().toISOString(),
+      snapshot, attemptNonce,
+      upscale: { preset: request.preset, source: request.source, sourceSha256: artifact.sha256! },
+    };
+    this.store.transaction(data => {
+      if (data.exports?.some(previous => previous.operationId === request.operationId)) {
+        throw new AppError('OPERATION_CONFLICT', 'Upscale operation was already submitted.', 409);
+      }
+      const run = data.runs.find(r => r.id === request.source.runId);
+      const current = run?.results[request.source.nodeId]?.artifacts[request.source.artifactIndex];
+      if (!run || run.boardId !== boardId || run.status !== 'succeeded' ||
+          !current || current.localId !== artifact.localId || current.sha256 !== artifact.sha256) {
+        throw new AppError('REVISION_CONFLICT', 'Video source changed during upscale preflight.', 409);
+      }
+      data.exports ??= [];
+      data.exports.unshift(job);
+    });
+    this.activeExport = { id, attemptNonce, controller };
+    const task = Promise.resolve().then(() => this.executeUpscale(job, controller.signal)).finally(() => {
+      if (this.activeExport?.id === id && this.activeExport.attemptNonce === attemptNonce) this.activeExport = undefined;
+      this.exportTasks.delete(id);
+    });
+    this.exportTasks.set(id, task);
+    void task.catch(() => undefined);
+    return this.publicExport(job);
+  }
+
+  private async executeUpscale(initial: StoredExportJob, signal: AbortSignal): Promise<void> {
+    try {
+      this.updateExport(initial.id, initial.attemptNonce, job => { job.status = 'running'; });
+      const source = initial.snapshot.clips[0].artifact;
+      await this.editor.upscale(source, artifact => {
+        this.updateExport(initial.id, initial.attemptNonce, job => {
+          job.status = 'succeeded';
+          job.artifact = artifact;
+          job.finishedAt = new Date().toISOString();
+        });
+      }, localId => this.store.artifactReferenced(localId), signal);
+    } catch {
+      try {
+        this.updateExport(initial.id, initial.attemptNonce, job => {
+          job.status = signal.aborted ? 'cancelled' : 'failed';
+          job.finishedAt = new Date().toISOString();
+          job.error = signal.aborted
+            ? 'Video upscale cancelled.'
+            : 'Video upscale failed; source preserved. Check FFmpeg and storage quota.';
+        });
+      } catch { /* cancelled/durable terminal state wins */ }
+    }
+  }
+
   private updateExport(id: string, attemptNonce: string, change: (job: StoredExportJob) => void): StoredExportJob {
     return this.store.transaction(data => {
       const job = data.exports?.find(candidate => candidate.id === id);

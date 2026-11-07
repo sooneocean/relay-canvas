@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type {
   Artifact,
   Board,
+  ClipSource,
   CanonicalRun,
   EditorCapabilities,
   ExportInput,
@@ -289,6 +290,16 @@ const timelineSchema = z.object({
   if (new Set(timeline.clips.map(clip => clip.id)).size !== timeline.clips.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate clip id' });
   if (timeline.clips.reduce((sum, clip) => sum + clip.outSeconds - clip.inSeconds, 0) > 180) context.addIssue({ code: z.ZodIssueCode.custom, message: 'timeline duration exceeds limit' });
 });
+const upscaleDescriptorSchema = z.object({
+  preset: z.literal('lanczos_1080p'),
+  source: clipSourceSchema,
+  sourceSha256: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+const upscaleInputSchema = z.object({
+  operationId: idSchema,
+  source: clipSourceSchema,
+  preset: z.literal('lanczos_1080p'),
+}).strict();
 const exportInputSchema = z.object({ expectedRevision: revisionSchema, operationId: idSchema }).strict();
 const exportStatusSchema = z.enum(['pending', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted']);
 const exportJobShape = {
@@ -301,17 +312,42 @@ const exportJobShape = {
   finishedAt: isoDateSchema.optional(),
   error: z.string().max(1000).optional(),
   snapshot: timelineSchema,
+  upscale: upscaleDescriptorSchema.optional(),
   artifact: savedVideoArtifactSchema.optional(),
 };
 const exportJobSchema = z.object(exportJobShape).strict().superRefine((job, context) => {
   if (job.snapshot.boardId !== job.boardId || job.snapshot.revision !== job.timelineRevision) context.addIssue({ code: z.ZodIssueCode.custom, message: 'export snapshot identity mismatch' });
   if (job.status === 'succeeded' && !job.artifact) context.addIssue({ code: z.ZodIssueCode.custom, message: 'successful export requires artifact' });
   if (job.artifact && job.artifact.mimeType !== 'video/mp4') context.addIssue({ code: z.ZodIssueCode.custom, message: 'export must be MP4' });
+  if (job.upscale) {
+    const clip = job.snapshot.clips[0];
+    if (job.snapshot.clips.length !== 1 || !clip ||
+        clip.source.runId !== job.upscale.source.runId ||
+        clip.source.nodeId !== job.upscale.source.nodeId ||
+        clip.source.artifactIndex !== job.upscale.source.artifactIndex ||
+        clip.artifact.sha256 !== job.upscale.sourceSha256 ||
+        clip.inSeconds !== 0 ||
+        clip.outSeconds !== clip.media.duration) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'upscale snapshot source mismatch' });
+    }
+  }
 });
 const storedExportJobSchema = z.object({ ...exportJobShape, attemptNonce: z.string().uuid() }).strict().superRefine((job, context) => {
   if (job.snapshot.boardId !== job.boardId || job.snapshot.revision !== job.timelineRevision) context.addIssue({ code: z.ZodIssueCode.custom, message: 'export snapshot identity mismatch' });
   if (job.status === 'succeeded' && !job.artifact) context.addIssue({ code: z.ZodIssueCode.custom, message: 'successful export requires artifact' });
   if (job.artifact && job.artifact.mimeType !== 'video/mp4') context.addIssue({ code: z.ZodIssueCode.custom, message: 'export must be MP4' });
+  if (job.upscale) {
+    const clip = job.snapshot.clips[0];
+    if (job.snapshot.clips.length !== 1 || !clip ||
+        clip.source.runId !== job.upscale.source.runId ||
+        clip.source.nodeId !== job.upscale.source.nodeId ||
+        clip.source.artifactIndex !== job.upscale.source.artifactIndex ||
+        clip.artifact.sha256 !== job.upscale.sourceSha256 ||
+        clip.inSeconds !== 0 ||
+        clip.outSeconds !== clip.media.duration) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'upscale snapshot source mismatch' });
+    }
+  }
 });
 const capabilitiesSchema = z.object({
   available: z.boolean(), ffmpeg: z.boolean(), ffprobe: z.boolean(),
@@ -449,6 +485,7 @@ export function parseMediaInfo(value: unknown): MediaInfo { return parseSafe(med
 export function parseArtifact(value: unknown): Artifact { return parseSafe(artifactSchema, value); }
 export function parseLocalAsset(value: unknown): LocalAsset { return parseSafe(localAssetSchema, value); }
 export function parseExportInput(value: unknown): ExportInput { return parseSafe(exportInputSchema, value); }
+export function parseUpscaleInput(value: unknown): { operationId: string; source: ClipSource; preset: 'lanczos_1080p' } { return parseSafe(upscaleInputSchema, value); }
 export function parseExportJob(value: unknown): ExportJob { return parseSafe(exportJobSchema, value); }
 export function parseStoredExportJob(value: unknown): StoredExportJob { return parseSafe(storedExportJobSchema, value); }
 export function parseEditorCapabilities(value: unknown): EditorCapabilities { return parseSafe(capabilitiesSchema, value); }
