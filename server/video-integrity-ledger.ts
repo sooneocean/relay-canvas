@@ -130,7 +130,7 @@ function applyAction(state: LedgerState, boardId: string, action: JournalAction)
     assertRecord(action, ['type', 'candidateId', 'checkpoint', 'reason', 'reviewMode'], 'approval action');
     validateCheckpoint(action.checkpoint);
     const current = state.candidates.get(action.candidateId);
-    if (!current || current.status !== 'proposed' || action.reviewMode !== 'explicit_local_operator' ||
+    if (!current || current.candidate.boardId !== boardId || current.status !== 'proposed' || action.reviewMode !== 'explicit_local_operator' ||
       typeof action.reason !== 'string' || action.reason.trim().length < 8 || action.reason.length > 500 ||
       action.checkpoint.boardId !== boardId || action.checkpoint.segmentId !== action.candidateId ||
       action.checkpoint.artifactSha256 !== current.candidate.artifactSha256 ||
@@ -140,7 +140,7 @@ function applyAction(state: LedgerState, boardId: string, action: JournalAction)
   } else if (action.type === 'reject') {
     assertRecord(action, ['type', 'candidateId', 'reason'], 'rejection action');
     const current = state.candidates.get(action.candidateId);
-    if (!current || current.status !== 'proposed' || typeof action.reason !== 'string' ||
+    if (!current || current.candidate.boardId !== boardId || current.status !== 'proposed' || typeof action.reason !== 'string' ||
       action.reason.trim().length < 8 || action.reason.length > 500) throw new Error('rejection invariant');
     current.status = 'rejected'; current.reason = action.reason;
   } else {
@@ -181,13 +181,17 @@ export class VideoIntegrityLedger {
   }
 
   private load(): { journal: Journal; state: LedgerState } {
-    if (!existsSync(this.file)) {
-      const journal: Journal = { schemaVersion: 1, commits: [] };
-      return { journal, state: initialState() };
-    }
     let raw: Buffer;
     try {
-      const metadata = lstatSync(this.file);
+      let metadata;
+      try { metadata = lstatSync(this.file); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          const journal: Journal = { schemaVersion: 1, commits: [] };
+          return { journal, state: initialState() };
+        }
+        throw error;
+      }
       if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o777) !== 0o600 ||
         metadata.size < 1 || metadata.size > LIMIT_BYTES) throw new Error('unsafe ledger');
       const fd = openSync(this.file, constants.O_RDONLY | constants.O_NOFOLLOW);
