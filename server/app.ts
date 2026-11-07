@@ -5,6 +5,7 @@ import { randomBytes } from 'node:crypto';
 import { createBoundary, validateBaseUrl, validateMediaUrl } from './security.js';
 import { CanvasService } from './service.js';
 import { AppError } from './graph.js';
+import { DexSrPlanner } from './dex-sr-planner.js';
 
 export function createApp(service: CanvasService, origin: string, token = randomBytes(32).toString('hex'), dev = false) {
   const app = express();
@@ -63,6 +64,11 @@ export function createApp(service: CanvasService, origin: string, token = random
   });
   app.post('/api/boards/:id/patch', (req, res) => { res.json(service.patch(String(req.params.id), req.body?.expectedRevision, req.body?.operations)); });
   app.post('/api/boards/:id/validate', (req, res) => { res.json(service.validate(String(req.params.id), req.body?.nodeId)); });
+  // Read-only provenance and prompt-policy preview; never starts VSR or generation.
+  const dexSrPlanner = new DexSrPlanner(service);
+  app.post('/api/boards/:id/dex-sr/plan', async (req, res) => {
+    res.json(await dexSrPlanner.plan(String(req.params.id), req.body));
+  });
   app.get('/api/editor/capabilities', async (_req, res) => { res.json(await service.editor.capabilities()); });
   app.get('/api/boards/:id/timeline', (req, res) => { res.json(service.timeline(String(req.params.id))); });
   app.put('/api/boards/:id/timeline', async (req, res) => { res.json(await service.saveTimeline(String(req.params.id), req.body)); });

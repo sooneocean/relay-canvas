@@ -12,6 +12,8 @@ cannot recreate features that were never recorded in any source frame.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -21,6 +23,10 @@ from typing import Any, Iterator
 
 import cv2
 import numpy as np
+
+from dex_sr_conditions import (
+    inject_measured_reference_detail, load_references, policy_from_prompt,
+)
 
 VERSION = "precision-temporal-vsr-v0.1"
 MAX_FRAMES = 900
@@ -210,14 +216,43 @@ def decode_rgb48(path: Path, meta: dict[str, Any]) -> Iterator[np.ndarray]:
         process.communicate()
 
 
+def read_verified_context(previous_clip: Path, current: Path,
+                          source_meta: dict[str, Any], radius: int) -> list[np.ndarray]:
+    """Use last multiple observed frames from the actual previous segment."""
+    if not previous_clip.is_file() or previous_clip.is_symlink() or previous_clip.resolve() == current.resolve():
+        raise ValueError("Previous segment must be a distinct regular local video")
+    previous = inspect_source(previous_clip)
+    if not 1 <= previous["duration"] <= 8:
+        raise ValueError("Previous context clip must contain 1-8 seconds")
+    for field in ("width", "height", "fps_rational"):
+        if previous[field] != source_meta[field]:
+            raise ValueError("Previous context clip has incompatible source geometry or FPS")
+    for field in ("color_primaries", "color_transfer", "color_space", "color_range"):
+        a, b = previous[field], source_meta[field]
+        if a not in ("unspecified", "unknown") and b not in ("unspecified", "unknown") and a != b:
+            raise ValueError("Color metadata conflict between previous and current video")
+    observed: deque[np.ndarray] = deque(maxlen=max(2, radius))
+    for frame in decode_rgb48(previous_clip, previous):
+        observed.append(frame)
+    if len(observed) < 2:
+        raise ValueError("Previous context lacks multiple frames")
+    return list(observed)
+
+
 def process_video(source: Path, output: Path, *, target_height: int | None = 1080,
                   scale: float | None = None, temporal_strength: float = 0.45,
-                  radius: int = 2) -> dict[str, Any]:
+                  radius: int = 2, previous_clip: Path | None = None,
+                  reference_specs: list[str] | None = None,
+                  prompt: str = "", reference_strength: float = 0.30) -> dict[str, Any]:
     if not source.is_file() or source.is_symlink() or output.exists() or source.resolve() == output.resolve():
         raise ValueError("Input must be a local file and output must not exist")
     if not 0 <= radius <= MAX_RADIUS:
         raise ValueError("Frame radius must be between zero and two")
     meta = inspect_source(source)
+    policy = policy_from_prompt(prompt, temporal_strength, reference_strength)
+    references = load_references(reference_specs or [])
+    prior_frames = (read_verified_context(previous_clip, source, meta, radius)
+                    if previous_clip is not None else [])
     out_size = destination_size(meta["width"], meta["height"], target_height, scale)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="precision-vsr-", dir=str(output.parent)) as temp:
@@ -235,6 +270,8 @@ def process_video(source: Path, output: Path, *, target_height: int | None = 108
         window: dict[int, np.ndarray] = {}
         next_read = 0
         produced = 0
+        matched_reference_frames = 0
+        selected_references: dict[str, int] = {}
         try:
             assert encoder.stdin is not None
             for t in range(meta["frames"]):
@@ -242,9 +279,21 @@ def process_video(source: Path, output: Path, *, target_height: int | None = 108
                     window[next_read] = next(decoder)
                     next_read += 1
                 indexes = list(range(max(0, t - radius), min(meta["frames"], t + radius + 1)))
-                images = [window[j] for j in indexes]
-                restored = reconstruct_frame(images, indexes.index(t), out_size,
-                                             temporal_strength=temporal_strength)
+                # Frame t=0 sees the last TWO frames of the trusted previous
+                # clip, not just its last JPEG. t=1 sees its final frame.
+                prefix_count = max(0, radius - t) if prior_frames else 0
+                prefix = prior_frames[-prefix_count:] if prefix_count else []
+                images = prefix + [window[j] for j in indexes]
+                center_index = len(prefix) + indexes.index(t)
+                restored = reconstruct_frame(images, center_index, out_size,
+                                             temporal_strength=policy.temporal_strength)
+                restored, detail_evidence = inject_measured_reference_detail(
+                    restored, window[t], references, policy,
+                )
+                if detail_evidence["detailTransferApplied"]:
+                    matched_reference_frames += 1
+                    key = str(detail_evidence["selectedReferenceSha256"])
+                    selected_references[key] = selected_references.get(key, 0) + 1
                 encoded_frame = np.uint16(np.clip(np.rint(restored * 65535.0), 0, 65535))
                 encoder.stdin.write(encoded_frame.astype("<u2", copy=False).tobytes())
                 produced += 1
@@ -278,8 +327,25 @@ def process_video(source: Path, output: Path, *, target_height: int | None = 108
         "inputMetadata": meta, "outputWidth": out_size[0], "outputHeight": out_size[1],
         "outputCodec": "ffv1", "outputPixelFormat": "gbrp16le",
         "inputFrames": meta["frames"], "outputFrames": produced,
-        "temporalStrength": temporal_strength, "temporalRadius": radius,
-        "method": "optical_flow_multiframe_fusion_with_lr_backprojection",
+        "temporalStrength": policy.temporal_strength, "temporalRadius": radius,
+        "promptPolicy": {
+            "intent": policy.intent,
+            "promptSha256": policy.prompt_sha256,
+            "referenceStrength": policy.reference_strength,
+            "identityLock": policy.identity_lock,
+            "allowGeneration": policy.allow_generation,
+        },
+        "previousSegment": {
+            "sha256": hashlib.sha256(previous_clip.read_bytes()).hexdigest(),
+            "acceptedContextFrames": len(prior_frames),
+        } if previous_clip is not None else None,
+        "originalReferenceAssets": [{
+            "sha256": item.sha256, "role": item.role,
+            "pixelTransferPermitted": item.role in ("scene", "detail"),
+        } for item in references],
+        "measuredReferenceDetailAppliedFrames": matched_reference_frames,
+        "referenceSelectionFrameCounts": selected_references,
+        "method": "temporal_optical_flow_with_bounded_same_view_reference_residual_and_lr_backprojection",
         "generativeModelUsed": False,
         "limitations": [
             "No reconstruction can guarantee original details absent from all source frames.",
@@ -299,10 +365,19 @@ def main() -> int:
     targets.add_argument("--scale", type=float)
     parser.add_argument("--temporal-strength", type=float, default=0.45)
     parser.add_argument("--radius", type=int, default=2, choices=(0, 1, 2))
+    parser.add_argument("--previous-clip", type=Path,
+                        help="Distinct previous 1-8s video segment; NEVER a JPEG tail frame")
+    parser.add_argument("--reference", action="append", default=[],
+                        help="ROLE:/absolute/local/reference.png (up to 8; identity/detail/scene/color)")
+    parser.add_argument("--prompt", type=str, default="",
+                        help="Bounded author intent; controls conservative numeric rules only")
+    parser.add_argument("--reference-strength", type=float, default=0.30)
     args = parser.parse_args()
     report = process_video(args.input, args.output,
         target_height=None if args.scale is not None else args.target_height,
-        scale=args.scale, temporal_strength=args.temporal_strength, radius=args.radius)
+        scale=args.scale, temporal_strength=args.temporal_strength, radius=args.radius,
+        previous_clip=args.previous_clip, reference_specs=args.reference,
+        prompt=args.prompt, reference_strength=args.reference_strength)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
