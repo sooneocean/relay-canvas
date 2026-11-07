@@ -53,12 +53,23 @@ def rational(s: str) -> float:
     return numerator / denominator
 
 
+def safe_video_input(path: Path) -> list[str]:
+    """Force local-only demuxer and disable MOV external data references."""
+    suffix = path.suffix.lower()
+    if suffix in (".mp4", ".mov"):
+        return ["-protocol_whitelist", "file", "-f", "mov",
+                "-enable_drefs", "0", "-use_absolute_path", "0", "-i", str(path)]
+    if suffix in (".webm", ".mkv"):
+        return ["-protocol_whitelist", "file", "-f", "matroska", "-i", str(path)]
+    raise ValueError("Only local MP4/MOV/WebM/MKV containers are supported")
+
+
 def inspect_source(path: Path) -> dict[str, Any]:
     result = json.loads(run_checked([
         "ffprobe", "-v", "error", "-select_streams", "v:0",
         "-count_frames", "-show_entries",
         "stream=codec_name,pix_fmt,width,height,r_frame_rate,avg_frame_rate,sample_aspect_ratio,nb_read_frames,color_primaries,color_transfer,color_space,color_range:format=duration",
-        "-of", "json", str(path),
+        "-of", "json", *safe_video_input(path),
     ]))
     streams = result.get("streams", [])
     if len(streams) != 1:
@@ -81,7 +92,7 @@ def inspect_source(path: Path) -> dict[str, Any]:
     times = json.loads(run_checked([
         "ffprobe", "-v", "error", "-select_streams", "v:0",
         "-show_frames", "-show_entries", "frame=best_effort_timestamp_time",
-        "-of", "json", str(path),
+        "-of", "json", *safe_video_input(path),
     ], timeout=60)).get("frames", [])
     if len(times) != frames:
         raise ValueError("Frame metadata and decoded count disagree")
@@ -193,7 +204,7 @@ def reconstruct_frame(frames: list[np.ndarray], center: int, out_size: tuple[int
 def decode_rgb48(path: Path, meta: dict[str, Any]) -> Iterator[np.ndarray]:
     w, h = meta["width"], meta["height"]
     args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-            "-i", str(path), "-map", "0:v:0", "-an", "-sn", "-dn",
+            *safe_video_input(path), "-map", "0:v:0", "-an", "-sn", "-dn",
             "-pix_fmt", "rgb48le", "-fps_mode", "passthrough",
             "-f", "rawvideo", "pipe:1"]
     process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -315,7 +326,7 @@ def process_video(source: Path, output: Path, *, target_height: int | None = 108
             encoder.communicate()
         run_checked([
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-            "-i", str(video_only), "-i", str(source),
+            *safe_video_input(video_only), *safe_video_input(source),
             "-map", "0:v:0", "-map", "1:a?", "-map_metadata", "1",
             "-c:v", "copy", "-c:a", "copy", "-y", str(tmp / "final.mkv"),
         ], timeout=90)
