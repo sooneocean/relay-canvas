@@ -99,6 +99,7 @@ import RunCompare from './RunCompare.js';
 import TimelineEditor, { validateTimelineHandoff, type SaveArtifact, type TimelineHandoffIntent, type UiRequest } from './TimelineEditor.js';
 import VideoThumbnail from './VideoThumbnail.js';
 import VideoUpscaleActions from './VideoUpscaleActions.js';
+import DexSrStudio from './DexSrStudio.js';
 
 type FlowNode = Node<CanvasData & { previewUrl?: string; runStatus?: Status; runError?: string }, 'canvas'>;
 type FlowEdge = Edge;
@@ -502,6 +503,7 @@ function AppShell() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [providersSaving, setProvidersSaving] = useState(false);
   const [timelineOpen, setTimelineOpen] = useState(false);
+  const [dexSrOpen, setDexSrOpen] = useState(false);
   const [compareOpen, setCompareOpen] = useState(false);
   const [handoffIntent, setHandoffIntent] = useState<TimelineHandoffIntent>();
   const [assetSaveStates, setAssetSaveStates] = useState<Record<string, AssetSaveState>>({});
@@ -570,6 +572,10 @@ function AppShell() {
   useEffect(() => { timelineOpenRef.current = timelineOpen; }, [timelineOpen]);
   useEffect(() => { handoffIntentRef.current = handoffIntent; }, [handoffIntent]);
   useEffect(() => { mediaImportRef.current = mediaImport; }, [mediaImport]);
+
+  const onDexSrJob = useCallback((job: ExportJob) => {
+    setExports(current => [job, ...current.filter(existing => existing.id !== job.id)]);
+  }, []);
 
   const notify = useCallback((message: string, tone: 'info' | 'error' | 'success' = 'info') => {
     setToast({ message, tone });
@@ -1833,6 +1839,7 @@ function AppShell() {
             <div className="canvas-toolbar-actions">
               <button className="toolbar-button" onClick={() => void validateBoard(selectedNodeId)}><Check size={14} />Validate</button>
               <button className="toolbar-button" data-testid="timeline-open" onClick={openTimeline}><Scissors size={14} />Timeline</button>
+              <button className="toolbar-button" data-testid="dex-sr-open" aria-label="dex-sr-open" onClick={() => setDexSrOpen(true)}><Sparkles size={14} />德式超分</button>
               <button className="toolbar-button" data-testid="compare-open" onClick={openCompare}><GitCompareArrows size={14} />Compare</button>
               <button className="toolbar-button" aria-label="export-board" onClick={exportBoard}><Download size={14} />Export</button>
               <button className="toolbar-button" aria-label="import-board" onClick={() => { fileInputModeRef.current = 'board'; if (fileInputRef.current) { fileInputRef.current.accept = BOARD_IMPORT_ACCEPT; fileInputRef.current.click(); } }}><Upload size={14} />Import</button>
@@ -1853,7 +1860,7 @@ function AppShell() {
               onConnect={onConnect}
               onNodeClick={(_, node) => { setSelectedNodeId(node.id); setPanel('inspector'); setPanelOpen(false); }}
               onPaneClick={() => setSelectedNodeId(undefined)}
-              deleteKeyCode={timelineOpen || compareOpen ? null : ['Backspace', 'Delete']}
+              deleteKeyCode={timelineOpen || compareOpen || dexSrOpen ? null : ['Backspace', 'Delete']}
               snapToGrid
               snapGrid={[16, 16]}
               connectionLineStyle={{ stroke: '#c8ff5a', strokeWidth: 1.5 }}
@@ -1891,6 +1898,10 @@ function AppShell() {
 
       {toast && <div className={`toast toast-${toast.tone}`} role="status"><span className="toast-icon">{toast.tone === 'success' ? <Check size={15} /> : toast.tone === 'error' ? <AlertCircle size={15} /> : <Info size={15} />}</span>{toast.message}<button onClick={() => setToast(undefined)} aria-label="close-message"><X size={14} /></button></div>}
 
+      {dexSrOpen && activeBoard && <DexSrStudio
+        boardId={activeBoard.id} localAssets={localAssets} runs={runs} exports={exports}
+        requestJson={requestJson} onJob={onDexSrJob}
+        onClose={() => setDexSrOpen(false)} />}
       {timelineOpen && activeBoard && <TimelineEditor board={activeBoard} runs={runs} exports={exports} requestJson={requestJson as UiRequest} onSaveArtifact={saveAsset as SaveArtifact} onExportJob={(job) => setExports((current) => [job, ...current.filter((candidate) => candidate.id !== job.id)])} handoffIntent={handoffIntent} onHandoffConsumed={clearHandoffIntent} onClose={() => { setTimelineOpen(false); clearHandoffIntent(); }} />}
       {compareOpen && activeBoard && <RunCompare boardId={activeBoard.id} runs={runs} requestJson={requestJson as UiRequest} assetSaveStates={assetSaveStates} onSaveAsset={saveAsset} onUseInTimeline={handoffToTimeline} onClose={() => { setCompareOpen(false); clearHandoffIntent(); }} />}
       {confirmRun && <RunConfirmDialog confirm={confirmRun} providers={providers} onCancel={() => setConfirmRun(undefined)} onConfirm={() => void startRun(confirmRun.nodeId, true, confirmRun.operationId)} />}
