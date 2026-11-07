@@ -3,6 +3,7 @@ import { CanvasService } from './service.js';
 import { VideoIntegrityLedger } from './video-integrity-ledger.js';
 import { buildVideoSignalEvidence } from '../src/shared/video-signal.js';
 import { AppError } from './graph.js';
+import { VerifiedContinuationGate } from './video-continuation-gate.js';
 
 /**
  * P0-b local-only sidecar API. Existing createBoundary middleware handles
@@ -10,7 +11,12 @@ import { AppError } from './graph.js';
  */
 export function registerVideoIntegrityRoutes(app: Express, service: CanvasService): void {
   const ledger = new VideoIntegrityLedger(service);
+  const continuation = new VerifiedContinuationGate(ledger);
   const boardId = (value: unknown) => String(value);
+  // Read-only source gate. Future paid dispatch must invoke the gate again.
+  app.post('/api/boards/:id/video-integrity/continuations/preflight', (req, res) => {
+    res.json(continuation.preflight(boardId(req.params.id), req.body));
+  });
   app.get('/api/boards/:id/video-integrity', (req, res) => {
     res.json(ledger.view(boardId(req.params.id)));
   });
@@ -29,7 +35,8 @@ export function registerVideoIntegrityRoutes(app: Express, service: CanvasServic
   app.post('/api/boards/:id/video-integrity/candidates/:candidateId/reject', (req, res) => {
     const receipt = ledger.rejectCandidate(boardId(req.params.id), String(req.params.candidateId), req.body);
     res.status(receipt.replayed ? 200 : 201).json(receipt);
-  });  app.post('/api/boards/:id/video-integrity/candidates/:candidateId/signal-evidence', async (req, res) => {
+  });
+  app.post('/api/boards/:id/video-integrity/candidates/:candidateId/signal-evidence', async (req, res) => {
     if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) || Object.keys(req.body).length !== 0) {
       throw new AppError('INVALID_VIDEO_INPUT', 'Signal evidence request must be an empty object.', 400);
     }
