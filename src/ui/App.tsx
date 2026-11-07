@@ -111,8 +111,8 @@ type BoardConflict = { boardId: string; localRevision: number; remoteRevision: n
 const MAX_IMPORT_BYTES = 6 * 1024 * 1024;
 const MAX_MEDIA_IMPORT_BYTES = 64 * 1024 * 1024;
 const MAX_LOCAL_REFERENCE_BYTES = 4 * 1024 * 1024;
-const MEDIA_IMPORT_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'video/mp4', 'video/webm']);
-const MEDIA_IMPORT_ACCEPT = 'image/png,image/jpeg,image/webp,video/mp4,video/webm';
+const MEDIA_IMPORT_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'video/mp4', 'video/webm', 'video/quicktime']);
+const MEDIA_IMPORT_ACCEPT = 'image/png,image/jpeg,image/webp,video/mp4,video/webm,video/quicktime,.mov';
 const BOARD_IMPORT_ACCEPT = 'application/json,.json';
 
 const terminalStatuses = new Set<Status>(['succeeded', 'failed', 'cancelled', 'interrupted', 'needs_review']);
@@ -309,9 +309,15 @@ function artifactUrl(artifact?: Artifact): string | undefined {
   return artifact?.localUrl ?? artifact?.url;
 }
 
+function mediaMimeForFile(file: File): string {
+  // Some browsers report empty MIME for .mov. Server still validates ftyp/qt brand.
+  if (!file.type && /\.mov$/i.test(file.name)) return 'video/quicktime';
+  return file.type;
+}
 function mediaKindForFile(file: File): 'image' | 'video' | undefined {
-  if (file.type.startsWith('image/')) return 'image';
-  if (file.type.startsWith('video/')) return 'video';
+  const mime = mediaMimeForFile(file);
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('video/')) return 'video';
   return undefined;
 }
 
@@ -1197,7 +1203,7 @@ function AppShell() {
       });
       const result = await requestJson<ImportAssetResult>(`/api/boards/${encodeURIComponent(boardId)}/imports?${query.toString()}`, {
         method: 'POST',
-        headers: { 'Content-Type': request.file.type },
+        headers: { 'Content-Type': mediaMimeForFile(request.file) },
         body: request.file,
       });
       const responseBoardIsCurrent = activeBoardIdRef.current === boardId
@@ -1248,8 +1254,8 @@ function AppShell() {
     if (!file) return;
     const kind = mediaKindForFile(file);
     const board = boardsRef.current.find((candidate) => candidate.id === activeBoardIdRef.current);
-    if (!MEDIA_IMPORT_TYPES.has(file.type) || !kind) {
-      notify('只支援 PNG、JPEG、WebP、MP4 或 WebM 素材。', 'error');
+    if (!MEDIA_IMPORT_TYPES.has(mediaMimeForFile(file)) || !kind) {
+      notify('只支援 PNG、JPEG、WebP、MP4、MOV 或 WebM 素材。', 'error');
       return;
     }
     if (file.size > MAX_MEDIA_IMPORT_BYTES) {
@@ -1977,7 +1983,7 @@ function AssetsPage({ assets, totalCount, query, filter, navigationPending, onQu
 }
 
 function assetDownloadName(asset: AssetItem): string {
-  const extension = asset.kind === 'video' ? (asset.artifact.mimeType === 'video/webm' ? 'webm' : 'mp4') : (asset.artifact.mimeType === 'image/jpeg' ? 'jpg' : asset.artifact.mimeType === 'image/webp' ? 'webp' : 'png');
+  const extension = asset.kind === 'video' ? (asset.artifact.mimeType === 'video/webm' ? 'webm' : asset.artifact.mimeType === 'video/quicktime' ? 'mov' : 'mp4') : (asset.artifact.mimeType === 'image/jpeg' ? 'jpg' : asset.artifact.mimeType === 'image/webp' ? 'webp' : 'png');
   return `relay-${asset.kind}-${asset.artifactIndex}.${extension}`;
 }
 
@@ -2087,7 +2093,7 @@ function ResultBlock({ result, runId, nodeId, saveState, onSave }: { result: Nod
   const url = artifactUrl(artifact);
   const saved = Boolean(artifact?.localUrl || artifact?.localId || saveState?.status === 'saved');
   const assetKey = runId && nodeId ? `${runId}:${nodeId}:0` : '';
-  const extension = artifact?.kind === 'video' ? (artifact.mimeType === 'video/webm' ? 'webm' : 'mp4') : artifact?.mimeType === 'image/jpeg' ? 'jpg' : artifact?.mimeType === 'image/webp' ? 'webp' : artifact?.mimeType === 'image/svg+xml' ? 'svg' : 'png';
+  const extension = artifact?.kind === 'video' ? (artifact.mimeType === 'video/webm' ? 'webm' : artifact.mimeType === 'video/quicktime' ? 'mov' : 'mp4') : artifact?.mimeType === 'image/jpeg' ? 'jpg' : artifact?.mimeType === 'image/webp' ? 'webp' : artifact?.mimeType === 'image/svg+xml' ? 'svg' : 'png';
   return <div className="result-block"><div className="result-heading"><span>LAST RESULT</span><span className={`result-status ${statusClass(result.status)}`}>{statusLabel(result.status)}</span></div>{url && artifact && <div className="result-asset"><span>{artifact.demo ? 'DEMO OUTPUT' : 'OUTPUT'}</span>{artifact.kind === 'image' ? <img src={url} alt="Generated output" referrerPolicy="no-referrer" crossOrigin="anonymous" /> : <video src={url} controls muted playsInline crossOrigin="anonymous" />}<div className="result-asset-actions">{onSave && <button className="asset-save-button" aria-label={`save-asset-${assetKey}`} disabled={saved || saveState?.status === 'saving'} onClick={onSave}>{saveState?.status === 'saving' ? <LoaderCircle className="spin" size={13} /> : saveState?.status === 'failed' ? <RefreshCw size={13} /> : <Save size={13} />}{saveState?.status === 'failed' ? '重試保存' : saved ? '已保存本機' : '保存本機'}</button>}{saved && <a className="asset-download-button" aria-label={`download-asset-${assetKey}`} href={url} download={`relay-${artifact.kind}-0.${extension}`}><Download size={13} />下載</a>}</div></div>}{result.error && <p className="result-error"><AlertCircle size={13} />{result.error}</p>}{result.referenceUrl && <p className="result-reference">Reference bound from this run</p>}</div>;
 }
 
