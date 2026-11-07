@@ -99,6 +99,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: npm run check
       - run: npm test
+      - run: npm run benchmark:graph
       - run: npm run test:release
       - run: npm run build
       - name: Install Playwright Chromium and system dependencies
