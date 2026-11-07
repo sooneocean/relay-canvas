@@ -34,7 +34,7 @@ export function createApp(service: CanvasService, origin: string, token = random
       const encoding = req.headers['content-encoding'];
       if (encoding !== undefined && encoding !== 'identity') throw new AppError('INVALID_INPUT', '不支援壓縮的匯入內容。', 400);
       const mimeType = req.headers['content-type'];
-      if (typeof mimeType !== 'string' || !['image/png', 'image/jpeg', 'image/webp', 'video/mp4', 'video/webm'].includes(mimeType)) throw new AppError('INVALID_INPUT', 'Content-Type 無效。', 400);
+      if (typeof mimeType !== 'string' || !['image/png', 'image/jpeg', 'image/webp', 'video/mp4', 'video/webm', 'video/quicktime'].includes(mimeType)) throw new AppError('INVALID_INPUT', 'Content-Type 無效。', 400);
       const controller = new AbortController();
       const abort = () => controller.abort();
       req.once('aborted', abort);
