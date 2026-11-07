@@ -37,7 +37,8 @@ type PatchOutcome =
 
 function rejectionCode(error: unknown): string {
   if (error instanceof AppError) return error.code;
-  if (error instanceof Error && error.name === 'ZodError') return 'INVALID_SCHEMA';
+  // schema.ts intentionally converts Zod failures into a safe public Error('Invalid request').
+  if (error instanceof Error && (error.name === 'ZodError' || error.message === 'Invalid request')) return 'INVALID_SCHEMA';
   return 'UNEXPECTED_ERROR';
 }
 

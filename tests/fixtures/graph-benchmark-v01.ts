@@ -96,7 +96,7 @@ export const GRAPH_BENCHMARK_V1: readonly GraphBenchmarkCase[] = [
   { id: 'plan-selected-frame', category: 'planning', instruction: 'Limit execution to the selected image and ancestors',
     challenge: { kind: 'plan', selected: 'frame', expectedOrder: ['brief', 'frame'], generations: 1 } },
   { id: 'plan-unknown-selected', category: 'planning', instruction: 'Reject planning for an unknown selected node',
-    challenge: { kind: 'plan', selected: 'not-found', expectedOrder: [], generations: 0, errorsContain: ['找不到選取的節點'] } },
+    challenge: { kind: 'plan', selected: 'not-found', expectedOrder: ['brief', 'direction', 'frame', 'motion'], generations: 0, errorsContain: ['找不到選取的節點'] } },
   { id: 'plan-missing-provider', category: 'planning', instruction: 'Detect missing provider mapping',
     setup: [update('frame', { providerId: 'missing' })],
     challenge: { kind: 'plan', expectedOrder: ['brief', 'direction', 'frame', 'motion'], generations: 1, errorsContain: ['請選擇供應商'] } },
