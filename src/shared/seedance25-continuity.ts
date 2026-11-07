@@ -104,3 +104,39 @@ export function buildSeedance25ExtensionPlan(options: SeedanceExtensionOptions):
     limits: { maxReferenceImages: 30, maxReferenceVideos: 10 },
   };
 }
+
+
+/**
+ * Official Seedance 2.5 Draft -> 1080p final task plan.
+ * Reuses Draft task conditioning/model state server-side. Do not resend original
+ * references, prompt, duration or seed when finalizing a Draft.
+ */
+export function buildSeedance25DraftFinalPlan(region: SeedanceRegion, draftTaskId: string): {
+  endpoint: string;
+  request: {
+    model: 'dreamina-seedance-2-5-260628' | 'doubao-seedance-2-5-260628';
+    content: [{ type: 'draft_task'; draft_task: { id: string } }];
+    resolution: '1080p';
+    output_format: 'mov';
+    return_last_frame: true;
+  };
+  purpose: 'draft_final_fixture_only';
+} {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(draftTaskId)) throw new Error('Invalid Seedance draft task ID');
+  const seed = buildSeedance25ExtensionPlan({
+    region,
+    previousVideoUrl: 'https://example.com/draft-fixture.mov',
+    originalReferenceImages: ['https://example.com/anchor-fixture.png'],
+    instruction: 'Continue the scene.',
+    durationSeconds: 4,
+  });
+  return {
+    endpoint: seed.endpoint,
+    request: {
+      model: seed.request.model,
+      content: [{ type: 'draft_task', draft_task: { id: draftTaskId } }],
+      resolution: '1080p', output_format: 'mov', return_last_frame: true,
+    },
+    purpose: 'draft_final_fixture_only',
+  };
+}
