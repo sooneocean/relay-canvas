@@ -21,7 +21,7 @@ function clip(dir: string, name: string, brightness: number) {
   const file = path.join(dir, name + '.mp4');
   execFileSync('ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-nostdin',
-    '-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=6:duration=2',
+    '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=6:duration=2',
     '-vf', 'eq=brightness=' + brightness,
     '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '27',
     '-pix_fmt', 'yuv420p', '-y', file,
