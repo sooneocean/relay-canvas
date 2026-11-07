@@ -8,14 +8,16 @@ import type { Artifact, ExportJob } from '../shared/types.js';
 export default function VideoUpscaleActions({
   source,
   job,
+  starting = false,
   onUpscale,
 }: {
   source: Artifact;
   job?: ExportJob;
+  starting?: boolean;
   onUpscale: () => void;
 }) {
   if (source.kind !== 'video' || !source.localId || !source.localUrl) return null;
-  const working = job?.status === 'pending' || job?.status === 'running';
+  const working = starting || job?.status === 'pending' || job?.status === 'running';
   const succeeded = job?.status === 'succeeded' && Boolean(job.artifact?.localUrl);
   return (
     <>
