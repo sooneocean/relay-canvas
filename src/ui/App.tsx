@@ -98,6 +98,7 @@ import { deriveAssets, deriveProjects, type AssetItem, type ProjectCard } from '
 import RunCompare from './RunCompare.js';
 import TimelineEditor, { validateTimelineHandoff, type SaveArtifact, type TimelineHandoffIntent, type UiRequest } from './TimelineEditor.js';
 import VideoThumbnail from './VideoThumbnail.js';
+import VideoUpscaleActions from './VideoUpscaleActions.js';
 
 type FlowNode = Node<CanvasData & { previewUrl?: string; runStatus?: Status; runError?: string }, 'canvas'>;
 type FlowEdge = Edge;
@@ -504,6 +505,7 @@ function AppShell() {
   const [compareOpen, setCompareOpen] = useState(false);
   const [handoffIntent, setHandoffIntent] = useState<TimelineHandoffIntent>();
   const [assetSaveStates, setAssetSaveStates] = useState<Record<string, AssetSaveState>>({});
+  const [upscaleBusyAssets, setUpscaleBusyAssets] = useState<Record<string, boolean>>({});
   const [conflict, setConflict] = useState<BoardConflict>();
   const [mediaImport, setMediaImport] = useState<MediaImportState>();
   const [mediaImportNotice, setMediaImportNotice] = useState<string>();
@@ -1490,6 +1492,67 @@ function AppShell() {
     return operation;
   }, [apiState, notify, requestJson]);
 
+  const startUpscale = useCallback(async (asset: AssetItem) => {
+    if (asset.kind !== 'video' || !asset.artifact.localId ||
+        asset.artifact.localId !== asset.artifact.sha256 ||
+        apiState !== 'ready' || !tokenRef.current) {
+      notify('請先將影片保存本機，確認服務連線後再進行1080p升頻。', 'error');
+      return;
+    }
+    if (upscaleBusyAssets[asset.id]) return;
+    setUpscaleBusyAssets(current => ({ ...current, [asset.id]: true }));
+    try {
+      const job = await requestJson<ExportJob>(
+        '/api/boards/' + encodeURIComponent(asset.boardId) + '/upscale',
+        { method: 'POST', body: JSON.stringify({
+          operationId: crypto.randomUUID(),
+          source: {
+            runId: asset.runId, nodeId: asset.nodeId,
+            artifactIndex: asset.artifactIndex,
+          },
+          preset: 'lanczos_1080p',
+        }) },
+      );
+      setExports(current => [job, ...current.filter(previous => previous.id !== job.id)]);
+      notify('已送出本機1080p保真升頻，原影片不會被取代。', 'info');
+    } catch (error) {
+      notify('升頻無法啟動：' + errorMessage(error), 'error');
+    } finally {
+      setUpscaleBusyAssets(current => ({ ...current, [asset.id]: false }));
+    }
+  }, [apiState, notify, requestJson, upscaleBusyAssets]);
+
+  useEffect(() => {
+    if (apiState !== 'ready') return;
+    const pending = exports.filter(job => job.upscale &&
+      (job.status === 'pending' || job.status === 'running'));
+    if (!pending.length) return;
+    let disposed = false;
+    let polling = false;
+    const poll = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        for (const job of pending) {
+          try {
+            const latest = await requestJson<ExportJob>('/api/exports/' + encodeURIComponent(job.id));
+            if (disposed) break;
+            setExports(current => current.map(existing =>
+              existing.id === latest.id ? latest : existing));
+            if (latest.status === 'succeeded' && job.status !== 'succeeded') {
+              notify('1080p升頻完成，已可下載新影片。', 'success');
+            } else if (latest.status === 'failed' && job.status !== 'failed') {
+              notify('1080p升頻失敗；原始影片未變動。', 'error');
+            }
+          } catch { /* retry through next poll; no blind submit */ }
+        }
+      } finally { polling = false; }
+    };
+    void poll();
+    const timer = window.setInterval(() => { void poll(); }, 3000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [apiState, exports, notify, requestJson]);
+
   const updateProviderDraft = useCallback((patch: Partial<Provider>) => {
     const draftId = providerDraftIdRef.current;
     providerEditVersionRef.current += 1;
@@ -1690,6 +1753,9 @@ function AppShell() {
       onCreate={() => void createBoard()}
       assetSaveStates={assetSaveStates}
       onSaveAsset={saveAsset}
+      upscaleJobs={exports}
+      upscaleBusyAssets={upscaleBusyAssets}
+      onUpscale={startUpscale}
     >{toastView}</AssetsPage>;
   }
 
