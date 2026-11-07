@@ -10,11 +10,12 @@ import type { Artifact, EditorCapabilities, MediaInfo, Timeline } from '../src/s
 import { parseMediaInfo } from '../src/shared/schema.js';
 import { upscaleBounds } from '../src/shared/upscale.js';
 import { MediaStore, MAX_MEDIA_BYTES, type MediaReservation } from './media.js';
+import type { DexSrBundle, DexSrReferenceRole } from '../src/shared/types.js';
 
 const MAX_EPHEMERAL = 192 * 1024 * 1024;
 const MAX_SEGMENTS = 64 * 1024 * 1024;
 const OUTPUT_LIMIT = 256 * 1024;
-const KNOWN = /^(?:source|segment)-\d{3}\.(?:mp4|webm)$|^segments\.txt$|^output\.mp4$/;
+const KNOWN = /^(?:source|segment)-\d{3}\.(?:mp4|webm)$|^reference-\d{3}\.(?:png|jpg|webp)$|^master\.mkv$|^segments\.txt$|^output\.mp4$/;
 
 interface Binary { path: string; dev: bigint; ino: bigint }
 interface CommandResult { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; truncated: boolean }
@@ -43,7 +44,7 @@ function validateExecutable(binary: Binary): void {
 }
 
 function sanitizedEnv(): Record<string, string> {
-  return { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C', HOME: '/nonexistent' };
+  return { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C', HOME: '/nonexistent', OPENCV_IO_MAX_IMAGE_PIXELS: '16777216', OPENBLAS_NUM_THREADS: '1', OMP_NUM_THREADS: '2' };
 }
 
 function runSupervised(binary: Binary, args: string[], cwd: string, timeoutMs: number, signal?: AbortSignal): { child: ChildProcess; result: Promise<CommandResult> } {
@@ -157,6 +158,9 @@ function inputArgs(file: string, mimeType: string): string[] {
 export class EditorRuntime {
   private readonly ffmpeg?: Binary;
   private readonly ffprobe?: Binary;
+  private readonly python?: Binary;
+  private readonly precisionScript: string;
+  private precisionAvailable?: Promise<boolean>;
   private readonly workspace: EphemeralWorkspace;
   private capability?: Promise<EditorCapabilities>;
   private probes = 0;
@@ -164,6 +168,8 @@ export class EditorRuntime {
     this.workspace = new EphemeralWorkspace(directory);
     this.ffmpeg = resolveExecutable('ffmpeg', workspaceRoot, pathValue);
     this.ffprobe = resolveExecutable('ffprobe', workspaceRoot, pathValue);
+    this.python = resolveExecutable('python3', workspaceRoot, pathValue);
+    this.precisionScript = path.join(workspaceRoot, 'tools', 'precision_vsr.py');
   }
   capabilities(): Promise<EditorCapabilities> {
     this.capability ??= this.detectCapabilities(); return this.capability;
@@ -210,6 +216,166 @@ export class EditorRuntime {
       return parseMediaInfo({ duration: Number(parsed.format?.duration), width: video.width, height: video.height, hasAudio: parsed.streams?.some(stream => stream.codec_type === 'audio') ?? false });
     } finally { this.probes--; if (job) this.workspace.cleanup(job); release(); }
   }
+  /**
+   * Optional reconstruction engine availability. Requires operator-installed
+   * numpy/OpenCV; no remote install, no provider calls and no implicit fallback.
+   */
+  async dexSrAvailable(): Promise<boolean> {
+    this.precisionAvailable ??= (async () => {
+      try {
+        if (!this.python || !this.ffmpeg || !this.ffprobe) return false;
+        for (const name of ['precision_vsr.py', 'dex_sr_conditions.py']) {
+          const file = path.join(path.dirname(this.precisionScript), name);
+          const stat = lstatSync(file);
+          if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 100) return false;
+        }
+        const test = await runSupervised(
+          this.python, ['-B', '-c', 'import cv2,numpy'], this.directory, 10_000,
+        ).result;
+        return test.code === 0 && !test.truncated;
+      } catch { return false; }
+    })();
+    return this.precisionAvailable;
+  }
+
+  /**
+   * Run a bounded, non-generative optical-flow VSR from immutable local media.
+   * All paths originate from MediaStore-owned file descriptors. The Python
+   * worker sees only verified private copies, no user paths or network URLs.
+   * The temporary FFV1 master is transcoded to a browser MP4 delivery copy.
+   * Persistent archival of FFV1 masters is intentionally NOT claimed here.
+   */
+  async restoreDexSr(
+    inputs: {
+      current: Artifact;
+      previous?: Artifact;
+      originals: Array<{ artifact: Artifact; role: DexSrReferenceRole }>;
+      request: DexSrBundle;
+    },
+    commit: (artifact: Artifact) => void,
+    isReferenced: (localId: string) => boolean,
+    signal?: AbortSignal,
+  ): Promise<Artifact> {
+    if (!(await this.dexSrAvailable()) || !this.python || !this.ffmpeg || !this.ffprobe) {
+      throw new Error('Optional DE-X SR runtime unavailable (python3 + cv2 + numpy)');
+    }
+    if (signal?.aborted) throw new Error('DE-X SR cancelled');
+    const videoType = (a: Artifact) => a.kind === 'video' &&
+      ['video/mp4', 'video/webm'].includes(a.mimeType ?? '');
+    if (!videoType(inputs.current) ||
+        (inputs.previous && !videoType(inputs.previous)) ||
+        inputs.originals.length < 1 || inputs.originals.length > 8 ||
+        inputs.originals.some(item =>
+          item.artifact.kind !== 'image' ||
+          !['image/png', 'image/jpeg', 'image/webp'].includes(item.artifact.mimeType ?? '') ||
+          !['identity', 'detail', 'scene', 'color'].includes(item.role))) {
+      throw new Error('Unsupported DE-X SR local inputs');
+    }
+    const sourceInfo = await this.probe(inputs.current);
+    if (sourceInfo.duration < 1 || sourceInfo.duration > 8 ||
+        sourceInfo.width * sourceInfo.height > 1280 * 720 ||
+        Math.min(sourceInfo.width, sourceInfo.height) < 64) {
+      throw new Error('DE-X SR execution limited to 1-8s source up to 720p');
+    }
+    if (inputs.previous) {
+      const previousInfo = await this.probe(inputs.previous);
+      if (previousInfo.duration < 1 || previousInfo.duration > 8 ||
+          previousInfo.width !== sourceInfo.width ||
+          previousInfo.height !== sourceInfo.height) {
+        throw new Error('Incompatible DE-X SR context clip');
+      }
+    }
+    const release = this.workspace.reserve(MAX_EPHEMERAL);
+    let reservation: MediaReservation | undefined;
+    let job: ReturnType<EphemeralWorkspace['create']> | undefined;
+    let committed = false;
+    try {
+      reservation = await this.media.reserveDerived(MAX_MEDIA_BYTES);
+      job = this.workspace.create();
+      const videoName = (index: number, artifact: Artifact) =>
+        'source-' + String(index).padStart(3, '0') + '.' +
+          (artifact.mimeType === 'video/webm' ? 'webm' : 'mp4');
+      const currentName = videoName(0, inputs.current);
+      copyVerified(this.media, inputs.current, path.join(job.directory, currentName));
+      let previousName: string | undefined;
+      if (inputs.previous) {
+        previousName = videoName(1, inputs.previous);
+        copyVerified(this.media, inputs.previous, path.join(job.directory, previousName));
+      }
+      const refs: string[] = [];
+      for (const [index, ref] of inputs.originals.entries()) {
+        const mime = ref.artifact.mimeType;
+        const ext = mime === 'image/png' ? 'png' : mime === 'image/jpeg' ? 'jpg' : 'webp';
+        const name = 'reference-' + String(index).padStart(3, '0') + '.' + ext;
+        copyVerified(this.media, ref.artifact, path.join(job.directory, name));
+        refs.push(ref.role + ':' + path.join(job.directory, name));
+      }
+      if (signal?.aborted) throw new Error('DE-X SR cancelled');
+      const script = lstatSync(this.precisionScript);
+      if (!script.isFile() || script.isSymbolicLink()) throw new Error('Untrusted DE-X SR script');
+      const args = [
+        '-B', this.precisionScript,
+        '--input', path.join(job.directory, currentName),
+        '--output', path.join(job.directory, 'master.mkv'),
+        '--target-height', '1080',
+        '--radius', String(inputs.request.temporalRadius),
+        '--temporal-strength', '0.45', '--reference-strength', '0.30',
+        '--prompt', inputs.request.prompt,
+        ...(previousName ? ['--previous-clip', path.join(job.directory, previousName)] : []),
+        ...refs.flatMap(value => ['--reference', value]),
+      ];
+      const reconstructed = await runSupervised(
+        this.python, args, job.directory, 180_000, signal,
+      ).result;
+      if (reconstructed.code !== 0 || reconstructed.truncated || signal?.aborted) {
+        throw new Error('DE-X SR reconstruction failed or was cancelled');
+      }
+      const master = path.join(job.directory, 'master.mkv');
+      const masterStat = lstatSync(master);
+      if (!masterStat.isFile() || masterStat.isSymbolicLink() ||
+          masterStat.size < 1 || masterStat.size > MAX_EPHEMERAL) {
+        throw new Error('DE-X SR master exceeds temporary quota');
+      }
+
+      // Preview is a delivery encode; it does not replace the verified original.
+      const argsMp4 = [
+        '-hide_banner', '-loglevel', 'error', '-nostdin',
+        '-max_alloc', String(MAX_MEDIA_BYTES), '-filter_threads', '2',
+        '-f', 'matroska', '-protocol_whitelist', 'file',
+        '-i', 'master.mkv', '-map', '0:v:0', '-map', '0:a:0?',
+        '-fps_mode:v', 'passthrough',
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+        '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k',
+        '-threads', '2', '-movflags', '+faststart',
+        '-fs', String(reservation.bytes + 1), '-y', 'output.mp4',
+      ];
+      const encoded = await runSupervised(
+        this.ffmpeg, argsMp4, job.directory, 180_000, signal,
+      ).result;
+      if (encoded.code !== 0 || encoded.truncated || signal?.aborted) {
+        throw new Error('DE-X SR delivery encoding failed or was cancelled');
+      }
+      const output = path.join(job.directory, 'output.mp4');
+      const stat = lstatSync(output);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 ||
+          stat.size > reservation.bytes || this.workspace.check(job) > MAX_EPHEMERAL) {
+        throw new Error('DE-X SR output exceeds temporary quota');
+      }
+      const fd = openSync(output, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const verified = await this.media.commitDerived(
+          reservation, fd, stat.size, commit, isReferenced,
+        );
+        committed = true;
+        return verified;
+      } finally { closeSync(fd); }
+    } finally {
+      if (!committed && reservation) await this.media.releaseReservation(reservation);
+      if (job) this.workspace.cleanup(job);
+      release();
+    }
+  }
+
   /**
    * Non-generative, per-frame Lanczos resampling to a 1080p display canvas.
    * Source timestamps and frame cadence are passed through: no frame picking,
