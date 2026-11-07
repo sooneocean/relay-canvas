@@ -112,7 +112,7 @@ function detect(bytes: Buffer): { mimeType: string; extension: string; kind: Med
   if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9) return { mimeType: 'image/jpeg', extension: 'jpg', kind: 'image' };
   if (bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP' && bytes.readUInt32LE(4) + 8 === bytes.length) return { mimeType: 'image/webp', extension: 'webp', kind: 'image' };
   if (bytes.length >= 12 && bytes.toString('ascii', 4, 8) === 'ftyp') {
-    const box = bytes.readUInt32BE(0); if (box >= 8 && box <= bytes.length) return { mimeType: 'video/mp4', extension: 'mp4', kind: 'video' };
+    const box = bytes.readUInt32BE(0); if (box >= 8 && box <= bytes.length) return bytes.toString('ascii', 8, 12) === 'qt  ' ? { mimeType: 'video/quicktime', extension: 'mov', kind: 'video' } : { mimeType: 'video/mp4', extension: 'mp4', kind: 'video' };
   }
   if (bytes.length >= 4 && bytes.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))) return { mimeType: 'video/webm', extension: 'webm', kind: 'video' };
   return undefined;
@@ -123,7 +123,7 @@ function detectStreamed(prefix: Buffer, suffix: Buffer, bytes: number): { mimeTy
   if (prefix.length >= 2 && prefix[0] === 0xff && prefix[1] === 0xd8 && suffix.length >= 2 && suffix[suffix.length - 2] === 0xff && suffix[suffix.length - 1] === 0xd9) return { mimeType: 'image/jpeg', extension: 'jpg', kind: 'image' };
   if (prefix.length >= 12 && prefix.toString('ascii', 0, 4) === 'RIFF' && prefix.toString('ascii', 8, 12) === 'WEBP' && prefix.readUInt32LE(4) + 8 === bytes) return { mimeType: 'image/webp', extension: 'webp', kind: 'image' };
   if (prefix.length >= 12 && prefix.toString('ascii', 4, 8) === 'ftyp') {
-    const box = prefix.readUInt32BE(0); if (box >= 8 && box <= bytes) return { mimeType: 'video/mp4', extension: 'mp4', kind: 'video' };
+    const box = prefix.readUInt32BE(0); if (box >= 8 && box <= bytes) return prefix.toString('ascii', 8, 12) === 'qt  ' ? { mimeType: 'video/quicktime', extension: 'mov', kind: 'video' } : { mimeType: 'video/mp4', extension: 'mp4', kind: 'video' };
   }
   if (prefix.length >= 4 && prefix.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))) return { mimeType: 'video/webm', extension: 'webm', kind: 'video' };
   return undefined;
@@ -314,7 +314,7 @@ export class MediaStore {
         if (!opened.isFile() || opened.dev !== metadata.dev || opened.ino !== metadata.ino || streamedHash(fd) !== upload.sha256) throw mediaError('Unsafe media store');
       } finally { closeSync(fd); }
       if (options.signal?.aborted) throw mediaError('Media import aborted');
-      const extension = ({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'video/mp4': 'mp4', 'video/webm': 'webm' } as Record<string, string>)[upload.mimeType];
+      const extension = ({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov' } as Record<string, string>)[upload.mimeType];
       const destination = path.join(this.directory, `${upload.sha256}.${extension}`);
       const artifact: Artifact = { kind: upload.kind, url: `/api/media/${upload.sha256}`, localId: upload.sha256, localUrl: `/api/media/${upload.sha256}`, bytes: upload.bytes, sha256: upload.sha256, mimeType: upload.mimeType };
       let created = false;
@@ -481,7 +481,7 @@ export class MediaStore {
   fileFor(artifact: Artifact): { file: string; fd: number; size: number } {
     this.assertDirectories();
     if (!artifact.localId || artifact.localId !== artifact.sha256 || !/^[a-f0-9]{64}$/.test(artifact.localId) || !artifact.mimeType) throw mediaError('Unknown media');
-    const extension = ({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/svg+xml': 'svg', 'video/mp4': 'mp4', 'video/webm': 'webm' } as Record<string, string>)[artifact.mimeType];
+    const extension = ({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/svg+xml': 'svg', 'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov' } as Record<string, string>)[artifact.mimeType];
     if (!extension) throw mediaError('Unknown media');
     const file = path.join(this.directory, `${artifact.localId}.${extension}`);
     if (!file.startsWith(`${this.directory}${path.sep}`) || !existsSync(file)) throw mediaError('Unknown media');
