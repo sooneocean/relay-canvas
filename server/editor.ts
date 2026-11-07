@@ -281,6 +281,12 @@ export class EditorRuntime {
           !['identity', 'detail', 'scene', 'color'].includes(item.role))) {
       throw new Error('Unsupported DE-X SR local inputs');
     }
+    const totalSourceBytes = [inputs.current, inputs.previous, ...inputs.originals.map(item => item.artifact)]
+      .filter((item): item is Artifact => item !== undefined)
+      .reduce((sum, item) => sum + (item.bytes ?? MAX_MEDIA_BYTES + 1), 0);
+    if (totalSourceBytes > 48 * 1024 * 1024) {
+      throw new Error('DE-X SR input media exceeds 48 MiB sandbox staging budget');
+    }
     const sourceInfo = await this.probe(inputs.current);
     if (sourceInfo.duration < 1 || sourceInfo.duration > 8 ||
         sourceInfo.width * sourceInfo.height > 1280 * 720 ||
