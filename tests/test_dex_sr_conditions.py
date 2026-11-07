@@ -80,8 +80,8 @@ class DexSrConditionsTest(unittest.TestCase):
     def test_nonmatching_references_cannot_paste_new_faces_or_change_colors(self):
         with tempfile.TemporaryDirectory() as d:
             red, blue = Path(d) / "red.png", Path(d) / "blue.png"
-            cv2.imwrite(str(red), np.uint8(image([240, 0, 0])))
-            cv2.imwrite(str(blue), np.uint8(image([0, 0, 240])))
+            cv2.imwrite(str(red), cv2.cvtColor(np.uint8(image([240, 0, 0])), cv2.COLOR_RGB2BGR))
+            cv2.imwrite(str(blue), cv2.cvtColor(np.uint8(image([0, 0, 240])), cv2.COLOR_RGB2BGR))
             low = image([0, 0, 1], (64, 96))
             base = cv2.resize(low, (192, 128), interpolation=cv2.INTER_LANCZOS4)
             refs = load_references([f"identity:{blue}", f"detail:{red}"])
