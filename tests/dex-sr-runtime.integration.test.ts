@@ -51,7 +51,7 @@ function countFrames(file: string) {
   return Number(data.trim());
 }
 
-test('authenticated local job path uses real Python temporal SR and publishes independent 1080p MP4', { timeout: 200_000 }, async () => {
+test('authenticated local job path uses real Python temporal SR and publishes independent 1080p MP4', { timeout: 200_000, skip: process.env.DEX_SR_RUNTIME_E2E !== '1' }, async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'relay-dex-sr-full-'));
   try {
     const service = new CanvasService(new Store(directory), policy);
