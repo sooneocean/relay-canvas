@@ -249,11 +249,11 @@ const localAssetSchema = z.object({
   }
   const valid = artifact.kind === 'image'
     ? ['image/png', 'image/jpeg', 'image/webp'].includes(artifact.mimeType)
-    : ['video/mp4', 'video/webm'].includes(artifact.mimeType);
+    : ['video/mp4', 'video/webm', 'video/quicktime'].includes(artifact.mimeType);
   if (!valid) context.addIssue({ code: z.ZodIssueCode.custom, message: 'local asset kind mismatch' });
 });
 const savedVideoArtifactSchema = artifactSchema.superRefine((artifact, context) => {
-  if (artifact.kind !== 'video' || !artifact.localId || !['video/mp4', 'video/webm'].includes(artifact.mimeType ?? '')) {
+  if (artifact.kind !== 'video' || !artifact.localId || !['video/mp4', 'video/webm', 'video/quicktime'].includes(artifact.mimeType ?? '')) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: 'timeline source must be a saved video' });
   }
 });
