@@ -41,6 +41,26 @@ class PrecisionVsrTest(unittest.TestCase):
         self.assertLess(np.mean(np.abs(replay - pattern)), 0.015)
         self.assertTrue(np.isfinite(out).all())
 
+    def test_synthetic_subpixel_shift_recovery_beats_single_frame_lanczos(self):
+        # Controlled evidence: shifted samples contain complementary data.
+        # This is not proof of identity or accuracy on real human faces.
+        h, w = 128, 192
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        base = np.clip(0.4 + 0.2 * np.sin(xx / 3) * np.cos(yy / 3)
+                       + 0.1 * np.sin(xx / 1.9), 0, 1)
+        truth = np.stack([base, base * 0.8 + 0.1, base * 0.7 + 0.1], axis=-1)
+        low = []
+        for dx in (-0.8, 0, 0.8):
+            warp = cv2.warpAffine(truth, np.float32([[1, 0, dx * 2], [0, 1, 0]]),
+                                  (w, h), flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_REFLECT)
+            low.append(cv2.resize(warp, (w // 2, h // 2),
+                                  interpolation=cv2.INTER_AREA).astype(np.float32))
+        temporal = reconstruct_frame(low, 1, (w, h))
+        baseline = cv2.resize(low[1], (w, h), interpolation=cv2.INTER_LANCZOS4)
+        psnr = lambda x: -10 * np.log10(np.mean((np.clip(x, 0, 1) - truth) ** 2))
+        self.assertGreater(psnr(temporal), psnr(baseline) + 1.0)
+
     def test_size_boundaries(self):
         self.assertEqual(destination_size(854,480,1080,None), (1920, 1080))
         self.assertEqual(destination_size(480,854,1080,None), (1080,1920))
