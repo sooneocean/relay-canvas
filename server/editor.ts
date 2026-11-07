@@ -14,7 +14,7 @@ import { MediaStore, MAX_MEDIA_BYTES, type MediaReservation } from './media.js';
 const MAX_EPHEMERAL = 192 * 1024 * 1024;
 const MAX_SEGMENTS = 64 * 1024 * 1024;
 const OUTPUT_LIMIT = 256 * 1024;
-const KNOWN = /^(?:source|segment)-\d{3}\.(?:mp4|webm)$|^segments\.txt$|^output\.mp4$/;
+const KNOWN = /^(?:source|segment)-\d{3}\.(?:mp4|webm|mov)$|^segments\.txt$|^output\.mp4$/;
 
 interface Binary { path: string; dev: bigint; ino: bigint }
 interface CommandResult { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; truncated: boolean }
@@ -149,7 +149,7 @@ function copyVerified(media: MediaStore, artifact: Artifact, destination: string
 }
 
 function inputArgs(file: string, mimeType: string): string[] {
-  if (mimeType === 'video/mp4') return ['-f', 'mov', '-protocol_whitelist', 'file', '-enable_drefs', '0', '-use_absolute_path', '0', '-threads', '2', '-i', file];
+  if (mimeType === 'video/mp4' || mimeType === 'video/quicktime') return ['-f', 'mov', '-protocol_whitelist', 'file', '-enable_drefs', '0', '-use_absolute_path', '0', '-threads', '2', '-i', file];
   if (mimeType === 'video/webm') return ['-f', 'matroska', '-protocol_whitelist', 'file', '-threads', '2', '-i', file];
   throw new Error('Unsupported editor source');
 }
@@ -192,7 +192,7 @@ export class EditorRuntime {
     if (!this.ffprobe) throw new Error('Editor tools unavailable');
     if (this.probes >= 2) throw new Error('Editor probe busy');
     const release = this.workspace.reserve(MAX_MEDIA_BYTES); let job: ReturnType<EphemeralWorkspace['create']> | undefined; this.probes++;
-    const ext = artifact.mimeType === 'video/mp4' ? 'mp4' : artifact.mimeType === 'video/webm' ? 'webm' : '';
+    const ext = artifact.mimeType === 'video/mp4' ? 'mp4' : artifact.mimeType === 'video/webm' ? 'webm' : artifact.mimeType === 'video/quicktime' ? 'mov' : '';
     try {
       job = this.workspace.create();
       const source = path.join(job.directory, `source-000.${ext}`);
@@ -205,7 +205,7 @@ export class EditorRuntime {
       const parsed = JSON.parse(result.stdout) as { format?: { duration?: string; format_name?: string }; streams?: Array<{ codec_type?: string; width?: number; height?: number }> };
       const video = parsed.streams?.find(stream => stream.codec_type === 'video');
       if (!video || !Number.isInteger(video.width) || !Number.isInteger(video.height)) throw new Error('Media probe failed');
-      if (artifact.mimeType === 'video/mp4' && !String(parsed.format?.format_name).split(',').includes('mov')) throw new Error('Media probe failed');
+      if (['video/mp4', 'video/quicktime'].includes(artifact.mimeType ?? '') && !String(parsed.format?.format_name).split(',').includes('mov')) throw new Error('Media probe failed');
       if (artifact.mimeType === 'video/webm' && !/matroska|webm/.test(String(parsed.format?.format_name))) throw new Error('Media probe failed');
       return parseMediaInfo({ duration: Number(parsed.format?.duration), width: video.width, height: video.height, hasAudio: parsed.streams?.some(stream => stream.codec_type === 'audio') ?? false });
     } finally { this.probes--; if (job) this.workspace.cleanup(job); release(); }
@@ -225,7 +225,7 @@ export class EditorRuntime {
     signal?: AbortSignal,
   ): Promise<Artifact> {
     if (!this.ffmpeg || !this.ffprobe || source.kind !== 'video' ||
-        !['video/mp4', 'video/webm'].includes(source.mimeType ?? '')) {
+        !['video/mp4', 'video/webm', 'video/quicktime'].includes(source.mimeType ?? '')) {
       throw new Error('Upscale requires locally saved MP4/WebM and FFmpeg');
     }
     const media = await this.probe(source);
@@ -239,7 +239,7 @@ export class EditorRuntime {
       if (signal?.aborted) throw new Error('Upscale cancelled');
       reservation = await this.media.reserveDerived(MAX_MEDIA_BYTES);
       job = this.workspace.create();
-      const inputName = source.mimeType === 'video/mp4' ? 'source-000.mp4' : 'source-000.webm';
+      const inputName = source.mimeType === 'video/mp4' ? 'source-000.mp4' : source.mimeType === 'video/quicktime' ? 'source-000.mov' : 'source-000.webm';
       copyVerified(this.media, source, path.join(job.directory, inputName));
       if (!(await this.capabilities()).available) throw new Error('Editor tools unavailable');
       // No fps filter and no image sequence: use actual source timestamps.
@@ -303,7 +303,7 @@ export class EditorRuntime {
       for (let index = 0; index < timeline.clips.length; index++) {
         if (signal?.aborted) throw new Error('Export cancelled');
         const clip = timeline.clips[index], tag = String(index).padStart(3, '0');
-        const ext = clip.artifact.mimeType === 'video/mp4' ? 'mp4' : 'webm';
+        const ext = clip.artifact.mimeType === 'video/mp4' ? 'mp4' : clip.artifact.mimeType === 'video/quicktime' ? 'mov' : 'webm';
         const sourceName = `source-${tag}.${ext}`, segmentName = `segment-${tag}.mp4`;
         const source = path.join(job.directory, sourceName), segment = path.join(job.directory, segmentName);
         copyVerified(this.media, clip.artifact, source);
