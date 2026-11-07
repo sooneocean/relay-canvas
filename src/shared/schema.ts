@@ -367,6 +367,36 @@ const comparisonSchema = z.object({
   if (comparison.left.boardId !== comparison.boardId || comparison.right.boardId !== comparison.boardId) context.addIssue({ code: z.ZodIssueCode.custom, message: 'comparison board mismatch' });
   if (comparison.left.id === comparison.right.id) context.addIssue({ code: z.ZodIssueCode.custom, message: 'comparison runs must differ' });
 });
+// Learning metadata is intentionally strict: no arbitrary project content can enter
+// the local-only outbox. These records are never exposed through the AppState API.
+const learningBase = {
+  schemaVersion: z.literal(1),
+  eventId: z.string().uuid(),
+  occurredAt: isoDateSchema,
+  episodeId: z.string().min(1).max(135),
+  actor: z.literal('unattributed'),
+  scope: z.literal('local_only'),
+  boardId: idSchema,
+  revision: revisionSchema,
+};
+const learningEventSchema = z.discriminatedUnion('type', [
+  z.object({ ...learningBase, type: z.literal('board.revision_committed'),
+    nodes: z.number().int().min(0).max(100), edges: z.number().int().min(0).max(200) }).strict(),
+  z.object({ ...learningBase, type: z.literal('board.patch_committed'),
+    operationTypes: z.array(z.enum(['add_node', 'update_node', 'remove_node', 'connect', 'remove_edge'])).max(200) }).strict(),
+  z.object({ ...learningBase, type: z.literal('run.started'), runId: idSchema,
+    generations: z.number().int().min(0).max(100), remote: z.boolean() }).strict(),
+  z.object({ ...learningBase, type: z.literal('run.finished'), runId: idSchema,
+    status: z.enum(['succeeded', 'failed', 'cancelled', 'interrupted', 'needs_review']),
+    succeededNodes: z.number().int().min(0).max(100), artifactCount: z.number().int().min(0).max(10000) }).strict()
+]).superRefine((event, context) => {
+  const expectedEpisode = (event.type === 'run.started' || event.type === 'run.finished')
+    ? event.runId : `${event.boardId}:${event.revision}`;
+  if (event.episodeId !== expectedEpisode) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'learning episode mismatch' });
+  }
+});
+
 const storeDataSchema = z.object({
   schemaVersion: z.literal(1),
   boards: z.array(boardSchema).max(20),
@@ -375,7 +405,15 @@ const storeDataSchema = z.object({
   timelines: z.array(timelineSchema).max(20).optional(),
   exports: z.array(storedExportJobSchema).max(100).optional(),
   localAssets: z.array(localAssetSchema).max(200).optional(),
+  learningOutbox: z.array(learningEventSchema).max(1024).optional(),
+  learningObservedRuns: z.array(idSchema).max(200).optional(),
+  learningDroppedEvents: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
 }).strict().superRefine((data, context) => {
+  const events = data.learningOutbox ?? [];
+  if (new Set(events.map(event => event.eventId)).size !== events.length)
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate learning event id' });
+  if (new Set(data.learningObservedRuns ?? []).size !== (data.learningObservedRuns ?? []).length)
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate observed run id' });
   const boardIds = new Set(data.boards.map(board => board.id));
   if (boardIds.size !== data.boards.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate board id' });
   if (new Set(data.providers.map(provider => provider.id)).size !== data.providers.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate provider id' });

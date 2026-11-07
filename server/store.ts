@@ -110,7 +110,7 @@ export class Store {
       const value = JSON.parse(original.toString('utf8')) as StoreData;
       if (value.schemaVersion !== 1 || !Array.isArray(value.boards) || !Array.isArray(value.runs) || value.boards.length > 20 || value.runs.length > 200) throw new Error('Unsupported or corrupt workspace; original file preserved.');
       const parsed = parseStoreData(value);
-      value.boards = parsed.boards; value.providers = parsed.providers; value.runs = parsed.runs; value.timelines = parsed.timelines; value.exports = parsed.exports; value.localAssets = parsed.localAssets;
+      value.boards = parsed.boards; value.providers = parsed.providers; value.runs = parsed.runs; value.timelines = parsed.timelines; value.exports = parsed.exports; value.localAssets = parsed.localAssets; value.learningOutbox = parsed.learningOutbox; value.learningObservedRuns = parsed.learningObservedRuns; value.learningDroppedEvents = parsed.learningDroppedEvents;
       validateArtifactMetadata(value);
       ensureV07Upgrade(this.directory, original);
       const v04Backup = path.join(directory, 'workspace.pre-v0.4.json');
