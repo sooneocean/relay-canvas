@@ -69,6 +69,21 @@ export function createApp(service: CanvasService, origin: string, token = random
   app.post('/api/boards/:id/dex-sr/plan', async (req, res) => {
     res.json(await dexSrPlanner.plan(String(req.params.id), req.body));
   });
+  app.get('/api/dex-sr/capabilities', async (_req, res) => {
+    res.json({
+      available: await service.editor.dexSrAvailable(),
+      engine: 'precision-temporal-vsr',
+      generatesPixels: false,
+      targetHeight: 1080,
+      maxSeconds: 8,
+      persistentMaster: false,
+      outputFormat: 'video/mp4',
+      reason: 'Optional Python/OpenCV worker; separate delivery encode, source never replaced.',
+    });
+  });
+  app.post('/api/boards/:id/dex-sr/jobs', async (req, res) => {
+    res.status(202).json(await service.startDexSr(String(req.params.id), req.body));
+  });
   app.get('/api/editor/capabilities', async (_req, res) => { res.json(await service.editor.capabilities()); });
   app.get('/api/boards/:id/timeline', (req, res) => { res.json(service.timeline(String(req.params.id))); });
   app.put('/api/boards/:id/timeline', async (req, res) => { res.json(await service.saveTimeline(String(req.params.id), req.body)); });

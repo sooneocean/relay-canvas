@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type {
   Artifact,
   Board,
+  DexSrBundle,
   ClipSource,
   CanonicalRun,
   EditorCapabilities,
@@ -300,6 +301,34 @@ const upscaleInputSchema = z.object({
   source: clipSourceSchema,
   preset: z.literal('lanczos_1080p'),
 }).strict();
+const dexSrRefSchema = z.object({ artifactSha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
+const dexSrBundleSchema = z.object({
+  schemaVersion: z.literal(1),
+  currentVideo: dexSrRefSchema,
+  previousSegment: dexSrRefSchema.optional(),
+  originals: z.array(z.object({
+    artifactSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    role: z.enum(['identity', 'detail', 'scene', 'color']),
+  }).strict()).min(1).max(8),
+  prompt: z.string().max(1200),
+  temporalRadius: z.union([z.literal(0), z.literal(1), z.literal(2)]),
+  targetHeight: z.literal(1080),
+}).strict().superRefine((bundle, ctx) => {
+  const ids = bundle.originals.map(item => item.artifactSha256);
+  if (new Set(ids).size !== ids.length ||
+      bundle.previousSegment?.artifactSha256 === bundle.currentVideo.artifactSha256) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'invalid Dex SR reference identity' });
+  }
+});
+const dexSrJobInputSchema = z.object({
+  operationId: idSchema,
+  bundle: dexSrBundleSchema,
+}).strict();
+const dexSrDescriptorSchema = z.object({
+  schemaVersion: z.literal(1),
+  request: dexSrBundleSchema,
+  requestSha256: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
 const exportInputSchema = z.object({ expectedRevision: revisionSchema, operationId: idSchema }).strict();
 const exportStatusSchema = z.enum(['pending', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted']);
 const exportJobShape = {
@@ -313,12 +342,17 @@ const exportJobShape = {
   error: z.string().max(1000).optional(),
   snapshot: timelineSchema,
   upscale: upscaleDescriptorSchema.optional(),
+  dexSr: dexSrDescriptorSchema.optional(),
   artifact: savedVideoArtifactSchema.optional(),
 };
 const exportJobSchema = z.object(exportJobShape).strict().superRefine((job, context) => {
   if (job.snapshot.boardId !== job.boardId || job.snapshot.revision !== job.timelineRevision) context.addIssue({ code: z.ZodIssueCode.custom, message: 'export snapshot identity mismatch' });
   if (job.status === 'succeeded' && !job.artifact) context.addIssue({ code: z.ZodIssueCode.custom, message: 'successful export requires artifact' });
   if (job.artifact && job.artifact.mimeType !== 'video/mp4') context.addIssue({ code: z.ZodIssueCode.custom, message: 'export must be MP4' });
+  if (job.dexSr && (job.upscale || job.snapshot.clips.length !== 0 ||
+      job.timelineRevision !== 0 || job.snapshot.revision !== 0)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Dex SR jobs must have isolated empty timeline snapshots' });
+  }
   if (job.upscale) {
     const clip = job.snapshot.clips[0];
     if (job.snapshot.clips.length !== 1 || !clip ||
@@ -336,6 +370,10 @@ const storedExportJobSchema = z.object({ ...exportJobShape, attemptNonce: z.stri
   if (job.snapshot.boardId !== job.boardId || job.snapshot.revision !== job.timelineRevision) context.addIssue({ code: z.ZodIssueCode.custom, message: 'export snapshot identity mismatch' });
   if (job.status === 'succeeded' && !job.artifact) context.addIssue({ code: z.ZodIssueCode.custom, message: 'successful export requires artifact' });
   if (job.artifact && job.artifact.mimeType !== 'video/mp4') context.addIssue({ code: z.ZodIssueCode.custom, message: 'export must be MP4' });
+  if (job.dexSr && (job.upscale || job.snapshot.clips.length !== 0 ||
+      job.timelineRevision !== 0 || job.snapshot.revision !== 0)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Dex SR jobs must have isolated empty timeline snapshots' });
+  }
   if (job.upscale) {
     const clip = job.snapshot.clips[0];
     if (job.snapshot.clips.length !== 1 || !clip ||
@@ -486,6 +524,7 @@ export function parseArtifact(value: unknown): Artifact { return parseSafe(artif
 export function parseLocalAsset(value: unknown): LocalAsset { return parseSafe(localAssetSchema, value); }
 export function parseExportInput(value: unknown): ExportInput { return parseSafe(exportInputSchema, value); }
 export function parseUpscaleInput(value: unknown): { operationId: string; source: ClipSource; preset: 'lanczos_1080p' } { return parseSafe(upscaleInputSchema, value); }
+export function parseDexSrJobInput(value: unknown): { operationId: string; bundle: DexSrBundle } { return parseSafe(dexSrJobInputSchema, value); }
 export function parseExportJob(value: unknown): ExportJob { return parseSafe(exportJobSchema, value); }
 export function parseStoredExportJob(value: unknown): StoredExportJob { return parseSafe(storedExportJobSchema, value); }
 export function parseEditorCapabilities(value: unknown): EditorCapabilities { return parseSafe(capabilitiesSchema, value); }

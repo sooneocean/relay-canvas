@@ -6,6 +6,12 @@ on:
       - 'tools/precision_vsr.py'
       - 'tools/dex_sr_conditions.py'
       - 'tests/test_dex_sr_conditions.py'
+      - 'tests/dex-sr-runtime.integration.test.ts'
+      - 'server/editor.ts'
+      - 'server/service.ts'
+      - 'server/dex-sr-planner.ts'
+      - 'src/shared/schema.ts'
+      - 'src/shared/types.ts'
       - 'tools/requirements-precision-vsr.txt'
       - 'tests/test_precision_vsr.py'
       - '.github/workflows/precision-vsr.yml'
@@ -34,3 +40,14 @@ jobs:
         run: python -m unittest discover -s tests -p 'test_precision_vsr.py' -v
       - name: Test multi-reference segment-context DE-X SR
         run: python -m unittest discover -s tests -p 'test_dex_sr_conditions.py' -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install local Canvas integration test dependencies
+        run: npm ci
+      - name: Verify full local Python worker to durable MP4 artifact
+        timeout-minutes: 7
+        env:
+          DEX_SR_RUNTIME_E2E: '1'
+        run: npx tsx --test tests/dex-sr-runtime.integration.test.ts

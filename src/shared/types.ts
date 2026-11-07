@@ -84,6 +84,21 @@ export interface EditorCapabilities {
 }
 export type ExportStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
 import type { UpscaleDescriptor } from './upscale.js';
+export type DexSrReferenceRole = 'identity' | 'detail' | 'scene' | 'color';
+export interface DexSrBundle {
+  schemaVersion: 1;
+  currentVideo: { artifactSha256: string };
+  previousSegment?: { artifactSha256: string };
+  originals: Array<{ artifactSha256: string; role: DexSrReferenceRole }>;
+  prompt: string;
+  temporalRadius: 0 | 1 | 2;
+  targetHeight: 1080;
+}
+export interface DexSrJobDescriptor {
+  schemaVersion: 1;
+  request: DexSrBundle;
+  requestSha256: string;
+}
 export interface ExportJob {
   id: string;
   boardId: string;
@@ -95,6 +110,7 @@ export interface ExportJob {
   error?: string;
   snapshot: Timeline;
   upscale?: UpscaleDescriptor;
+  dexSr?: DexSrJobDescriptor;
   artifact?: Artifact;
 }
 export interface StoredExportJob extends ExportJob { attemptNonce: string }

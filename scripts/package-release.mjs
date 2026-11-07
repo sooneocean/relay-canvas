@@ -11,7 +11,7 @@ const archiveName = `${pkg.name}-${pkg.version}.tar.gz`;
 const archive = resolve(releaseDir, archiveName);
 const shaFile = `${archive}.sha256`;
 
-const required = ['dist', 'build/server', 'build/src/shared', 'package.json', 'package-lock.json', 'README.md', 'CHANGELOG.md', 'LICENSE', 'docs', '.env.example'];
+const required = ['dist', 'build/server', 'build/src/shared', 'package.json', 'package-lock.json', 'README.md', 'CHANGELOG.md', 'LICENSE', 'docs', '.env.example', 'tools/precision_vsr.py', 'tools/dex_sr_conditions.py', 'tools/requirements-precision-vsr.txt'];
 const missing = required.filter((entry) => !existsSync(resolve(root, entry)));
 if (missing.length) {
   console.error(`release prerequisites missing: ${missing.join(', ')}`);
