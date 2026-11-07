@@ -989,3 +989,13 @@ body { background: #121212; color: #f1f1ec; }
   .media-import-notice { top: 132px; }
   .canvas-toolbar-actions { max-width: calc(100vw - 128px); justify-content: flex-end; }
 }
+
+/* Explicit local-only comparison feedback: opt-in and separate from media playback. */
+.compare-feedback { border: 1px solid var(--border, #485261); border-radius: 12px; padding: 14px; display: grid; gap: 10px; margin: 14px 0; }
+.compare-feedback-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.compare-feedback-head > div { display: grid; gap: 6px; min-width: 0; }
+.compare-feedback small { font-size: 12px; opacity: .83; line-height: 1.5; }
+.compare-feedback-settings, .compare-feedback-choices { display: grid; gap: 9px; }
+.compare-feedback-choices label { display: grid; gap: 5px; font-size: 12px; }
+.compare-feedback-choices select { max-width: 240px; }
+.compare-feedback-actions { display: flex; gap: 8px; flex-wrap: wrap; }
