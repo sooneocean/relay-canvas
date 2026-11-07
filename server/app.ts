@@ -5,6 +5,7 @@ import { randomBytes } from 'node:crypto';
 import { createBoundary, validateBaseUrl, validateMediaUrl } from './security.js';
 import { CanvasService } from './service.js';
 import { AppError } from './graph.js';
+import { registerVideoIntegrityRoutes } from './video-integrity-routes.js';
 
 export function createApp(service: CanvasService, origin: string, token = randomBytes(32).toString('hex'), dev = false) {
   const app = express();
@@ -49,6 +50,7 @@ export function createApp(service: CanvasService, origin: string, token = random
     }
   });
   app.use(express.json({ limit: '6mb', strict: true }));
+  registerVideoIntegrityRoutes(app, service);
   app.get('/healthz', (_req, res) => { res.json({ ok: true, version: '0.7.0' }); });
   app.get('/api/session', (_req, res) => {
     res.setHeader('Set-Cookie', `relay_canvas_media=${token}; HttpOnly; SameSite=Strict; Path=/api/media`);
