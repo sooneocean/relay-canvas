@@ -2,11 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseWorldIR, worldIRSchema, type WorldIR } from '../src/shared/world-ir.js';
 
-const transform = {
-  positionM: [0, 0, 0] as [number, number, number],
-  rotation: [0, 0, 0, 1] as [number, number, number, number],
-  scale: [1, 1, 1] as [number, number, number],
-};
+function makeTransform() {
+  return {
+    positionM: [0, 0, 0] as [number, number, number],
+    rotation: [0, 0, 0, 1] as [number, number, number, number],
+    scale: [1, 1, 1] as [number, number, number],
+  };
+}
 function fixture(): WorldIR {
   return {
     schemaVersion: 1,
@@ -17,12 +19,12 @@ function fixture(): WorldIR {
     timebase: { fpsNumerator: 24000, fpsDenominator: 1000 },
     durationSeconds: 6,
     entities: [
-      { id: 'actor_a', label: 'Lead', kind: 'character', transform, authority: 'approved',
+      { id: 'actor_a', label: 'Lead', kind: 'character', transform: makeTransform(), authority: 'approved',
         provenance: { origin: 'human' } },
-      { id: 'prop_window', label: 'Window', kind: 'prop', transform, authority: 'approved' },
+      { id: 'prop_window', label: 'Window', kind: 'prop', transform: makeTransform(), authority: 'approved' },
     ],
     cameras: [
-      { id: 'cam_a', label: 'A camera', transform, authority: 'approved',
+      { id: 'cam_a', label: 'A camera', transform: makeTransform(), authority: 'approved',
         lens: { focalLengthMm: 50, sensorWidthMm: 36, focusDistanceM: 3, fStop: 2.8 } },
     ],
     shots: [
