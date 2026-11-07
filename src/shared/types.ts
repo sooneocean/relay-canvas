@@ -126,6 +126,24 @@ export interface RunComparisonDifference { nodeId: string; fields: RunComparison
 export interface RunComparison { boardId: string; left: CanonicalRun; right: CanonicalRun; differences: RunComparisonDifference[] }
 export interface ArtifactInfo { source: ClipSource; artifact: Artifact; media: MediaInfo }
 export interface ExportInput { expectedRevision: number; operationId: string }
+/** Local-only, allowlisted learning events. No free text, prompts, credentials or media. */
+export interface LearningEventBase {
+  schemaVersion: 1;
+  eventId: string;
+  occurredAt: string;
+  episodeId: string;
+  actor: 'unattributed';
+  scope: 'local_only';
+  boardId: string;
+  revision: number;
+}
+export type LearningEventRecord = LearningEventBase & (
+  | { type: 'board.revision_committed'; nodes: number; edges: number }
+  | { type: 'board.patch_committed'; operationTypes: Array<'add_node' | 'update_node' | 'remove_node' | 'connect' | 'remove_edge'> }
+  | { type: 'run.started'; runId: string; generations: number; remote: boolean }
+  | { type: 'run.finished'; runId: string; status: 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | 'needs_review'; succeededNodes: number; artifactCount: number }
+);
+
 export interface StoreData {
   schemaVersion: 1;
   boards: Board[];
@@ -134,8 +152,14 @@ export interface StoreData {
   timelines?: Timeline[];
   exports?: StoredExportJob[];
   localAssets?: LocalAsset[];
+  /** Canonical local event outbox. Persisted atomically with workspace changes. */
+  learningOutbox?: LearningEventRecord[];
+  /** Opt-in runs whose terminal event has not yet been queued. */
+  learningObservedRuns?: string[];
+  /** Observations dropped when outbox is full. Never blocks primary operations. */
+  learningDroppedEvents?: number;
 }
-export interface AppState extends Omit<StoreData, 'exports'> {
+export interface AppState extends Omit<StoreData, 'exports' | 'learningOutbox' | 'learningObservedRuns' | 'learningDroppedEvents'> {
   exports?: ExportJob[];
   settings: { remoteEnabled: boolean; mediaOrigins: string[]; providerOrigins: string[] };
 }
