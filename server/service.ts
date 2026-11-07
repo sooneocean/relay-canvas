@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { AppError, modelFor, plan, topology } from './graph.js';
 import { Store } from './store.js';
+import { LocalLearningJournal, type TerminalRunStatus } from './learning-events.js';
 import { generate, preflightGeneration } from './providers.js';
 import { providerDiagnostics, providerModels, type ProviderTransport } from './providers.js';
 import { MediaStore } from './media.js';
@@ -36,15 +37,18 @@ export class CanvasService {
   private activeImports = 0;
   readonly media: MediaStore;
   readonly editor: EditorRuntime;
+  private readonly learning?: LocalLearningJournal;
   constructor(
     readonly store: Store,
     readonly policy = readPolicy(),
     private generator: Generator = (p, r) => generate(p, r, { policy }),
     media?: MediaStore,
     editor?: EditorRuntime,
+    learning?: LocalLearningJournal,
   ) {
     this.media = media ?? new MediaStore(store.directory, policy);
     this.editor = editor ?? new EditorRuntime(store.directory, this.media);
+    this.learning = learning ?? (process.env.RELAY_LEARNING_EVENTS === 'local' ? new LocalLearningJournal(store.directory) : undefined);
   }
   state() {
     const data = this.store.read();
@@ -79,13 +83,16 @@ export class CanvasService {
     const initial = this.store.read();
     this.validateBoardAssets(board, initial.localAssets ?? []);
     topology(board);
-    return this.store.transaction(data => {
+    const saved = this.store.transaction(data => {
       const index = data.boards.findIndex(b => b.id === id);
       if (index < 0) throw new AppError('NOT_FOUND', '找不到畫布。', 404);
       if (data.boards[index].revision !== expectedRevision) throw new AppError('REVISION_CONFLICT', '畫布已被其他視窗或 Agent 更新。請先載入最新版本。', 409);
       this.validateBoardAssets(board, data.localAssets ?? []);
       data.boards[index] = { ...board, revision: expectedRevision + 1 }; return data.boards[index];
     });
+    this.learning?.record({ type: 'board.revision_committed', boardId: saved.id, revision: saved.revision,
+      nodes: saved.nodes.length, edges: saved.edges.length });
+    return saved;
   }
 
   async importAsset(
@@ -174,7 +181,10 @@ export class CanvasService {
       if (op.type === 'connect') board.edges.push(op.edge);
       if (op.type === 'remove_edge') board.edges = board.edges.filter(e => e.id !== op.id);
     }
-    return this.save(id, expectedRevision, board);
+    const saved = this.save(id, expectedRevision, board);
+    this.learning?.record({ type: 'board.patch_committed', boardId: saved.id, revision: saved.revision,
+      operationTypes: operations.map(operation => operation.type) });
+    return saved;
   }
   providers(input: unknown) {
     const providers = parseProviders(input);
@@ -399,7 +409,23 @@ export class CanvasService {
     if (exported) return exported;
     throw new AppError('NOT_FOUND', '找不到素材。', 404);
   }
-  private updateRun(id: string, change: (run: Run) => void) { return this.store.transaction(data => { const run = data.runs.find(r => r.id === id)!; change(run); return run; }); }
+  private updateRun(id: string, change: (run: Run) => void) {
+    let previous: Run['status'] | undefined;
+    const updated = this.store.transaction(data => {
+      const run = data.runs.find(r => r.id === id)!;
+      previous = run.status;
+      change(run);
+      return run;
+    });
+    const terminal: TerminalRunStatus[] = ['succeeded', 'failed', 'cancelled', 'interrupted', 'needs_review'];
+    if (previous !== updated.status && terminal.some(status => status === updated.status)) {
+      this.learning?.record({ type: 'run.finished', boardId: updated.boardId, revision: updated.revision,
+        runId: updated.id, status: updated.status as TerminalRunStatus,
+        succeededNodes: Object.values(updated.results).filter(result => result.status === 'succeeded').length,
+        artifactCount: Object.values(updated.results).reduce((count, result) => count + result.artifacts.length, 0) });
+    }
+    return updated;
+  }
   private validateGenerationArtifacts(provider: Provider, kind: 'image' | 'video', output: unknown): Artifact[] {
     const invalid = (): never => { throw new AppError('INVALID_OUTPUT', '供應商未回傳預期的媒體。'); };
     if (!output || typeof output !== 'object' || !Object.prototype.hasOwnProperty.call(output, 'artifacts')) return invalid();
@@ -459,6 +485,8 @@ export class CanvasService {
     const id = randomUUID(), controller = new AbortController();
     const run: Run = { id, boardId: board.id, revision: board.revision, operationId: request.operationId, status: 'pending', startedAt: new Date().toISOString(), snapshot: board, providers: data.providers, order: execution.order, results: Object.fromEntries(execution.order.map(nodeId => [nodeId, { nodeId, status: 'pending', artifacts: [] }])) };
     this.store.transaction(data => { data.runs.unshift(run); });
+    this.learning?.record({ type: 'run.started', boardId: run.boardId, revision: run.revision,
+      runId: run.id, generations: execution.generations.length, remote });
     this.active = { id, controller };
     // Persist the run before scheduling any provider work.
     const task = Promise.resolve().then(() => this.execute(run, controller.signal)).finally(() => { if (this.active?.id === id) this.active = undefined; this.tasks.delete(id); });
