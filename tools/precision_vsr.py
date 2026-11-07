@@ -101,7 +101,10 @@ def destination_size(w: int, h: int, target_height: int | None, scale: float | N
     if target_height is not None:
         if target_height not in (720, 1080):
             raise ValueError("Target height must be 720 or 1080")
-        ratio = target_height / (h if w >= h else w)
+        if w >= h:
+            ratio = min(target_height / h, (target_height * 16 / 9) / w)
+        else:
+            ratio = min(target_height / w, (target_height * 16 / 9) / h)
     else:
         ratio = float(scale)
     if not 1.05 <= ratio <= MAX_SCALE:
