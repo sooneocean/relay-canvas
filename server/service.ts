@@ -482,6 +482,35 @@ export class CanvasService {
     this.artifactSaves.set(key, operation);
     return await operation;
   }
+  /**
+   * Look up only board-owned, persisted, succeeded video sources. A matching
+   * hash on a different board is never sufficient to grant access.
+   */
+  boardVideoArtifact(boardId: string, localId: string): Artifact {
+    this.board(boardId);
+    if (!/^[a-f0-9]{64}$/.test(localId)) throw new AppError('INVALID_INPUT', 'Invalid video source hash.', 400);
+    const data = this.store.read();
+    const byHash = (value: Artifact | undefined) =>
+      value?.kind === 'video' && value.localId === localId &&
+      value.sha256 === localId && value.localUrl === '/api/media/' + localId;
+    let artifact = (data.localAssets ?? [])
+      .find(asset => asset.boardId === boardId && byHash(asset.artifact))?.artifact;
+    if (!artifact) for (const run of data.runs) {
+      if (run.boardId !== boardId || run.status !== 'succeeded') continue;
+      for (const result of Object.values(run.results)) {
+        if (result.status !== 'succeeded') continue;
+        artifact = result.artifacts.find(item => byHash(item));
+        if (artifact) break;
+      }
+      if (artifact) break;
+    }
+    artifact ??= (data.exports ?? []).find(job =>
+      job.boardId === boardId && job.status === 'succeeded' && byHash(job.artifact))?.artifact;
+    if (!artifact) throw new AppError('VIDEO_NOT_FOUND', 'Video is not registered on this board.', 404);
+    try { return this.media.verifyArtifact(artifact); }
+    catch { throw new AppError('VIDEO_CORRUPT', 'Local video bytes no longer match SHA-256.', 409); }
+  }
+
   mediaArtifact(localId: string): Artifact {
     if (!/^[a-f0-9]{64}$/.test(localId)) throw new AppError('INVALID_INPUT', '素材 ID 無效。', 400);
     const data = this.store.read();
