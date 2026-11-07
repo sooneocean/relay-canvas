@@ -1,0 +1,29 @@
+.cloudflare-preview-notice {
+  position: fixed;
+  z-index: 99999;
+  bottom: 14px;
+  left: 14px;
+  right: 14px;
+  max-width: 940px;
+  margin: 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px 12px;
+  align-items: center;
+  padding: 11px 16px;
+  border: 1px solid rgba(220,235,220,.23);
+  border-radius: 12px;
+  background: rgba(10,20,22,.96);
+  color: #f3f6f4;
+  box-shadow: 0 10px 32px rgba(0,0,0,.27);
+  font: 13px/1.5 system-ui,-apple-system,"Noto Sans TC",sans-serif;
+}
+.cloudflare-preview-notice__status {
+  color: #bceab9;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.cloudflare-preview-notice a { color: #c6f17c; text-decoration: underline; }
+@media (max-width:600px) {
+  .cloudflare-preview-notice { bottom: 8px; left: 8px; right: 8px; padding: 9px 11px; font-size: 12px; }
+}
