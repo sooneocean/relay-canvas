@@ -1,0 +1,52 @@
+name: Build ReachFlow Cloudflare frontend preview
+
+on:
+  push:
+    branches:
+      - deploy/reachflow-cloudflare-frontend
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reachflow-cloudflare-preview-build
+  cancel-in-progress: true
+
+jobs:
+  frontend-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Compile React/Vite frontend
+        run: npm run build
+      - name: Verify static output
+        run: |
+          test -s dist/index.html
+          test -f dist/cloudflare-preview.css
+          test -f dist/_headers
+          test -d dist/assets
+          # A keyEnv identifier in the UI is not an actual provider credential.
+          find dist -type f -printf '%P %s bytes\n' | sort
+      - name: Publish static output into isolated artifacts branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          publish_dir="$(mktemp -d)"
+          cd "$publish_dir"
+          git init -b build
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp -a "$GITHUB_WORKSPACE/dist/." .
+          git add -A
+          git commit -m "build(preview): ${GITHUB_SHA}"
+          git -c credential.helper= -c core.askPass= -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" \
+            push --force "https://github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/deploy/reachflow-static-built
