@@ -397,6 +397,30 @@ const learningEventSchema = z.discriminatedUnion('type', [
   }
 });
 
+// Strict local-only metadata. No arbitrary content, media URL or free-text reason.
+const localFeedbackChoice = z.enum(['left', 'right', 'tie', 'neither']);
+const localFeedbackReason = z.enum(['identity', 'motion', 'composition', 'instruction', 'technical', 'other']);
+const artifactIndex = z.number().int().min(0).max(99);
+const localFeedbackConsentSchema = z.object({ enabled: z.boolean(), revision: revisionSchema, updatedAt: isoDateSchema }).strict();
+const localFeedbackRecordSchema = z.object({
+  id: z.string().uuid(), operationId: idSchema, boardId: idSchema, nodeId: idSchema,
+  leftRunId: idSchema, rightRunId: idSchema,
+  leftArtifactIndex: artifactIndex, rightArtifactIndex: artifactIndex,
+  choice: localFeedbackChoice, reason: localFeedbackReason.optional(),
+  consentRevision: revisionSchema, source: z.literal('local_ui_unverified'),
+  createdAt: isoDateSchema,
+}).strict().refine(record => record.leftRunId !== record.rightRunId);
+const localFeedbackConsentInputSchema = z.object({
+  enabled: z.boolean(), expectedRevision: revisionSchema,
+}).strict();
+const localFeedbackInputSchema = z.object({
+  operationId: idSchema, boardId: idSchema, nodeId: idSchema,
+  leftRunId: idSchema, rightRunId: idSchema,
+  leftArtifactIndex: artifactIndex, rightArtifactIndex: artifactIndex,
+  choice: localFeedbackChoice, reason: localFeedbackReason.optional(),
+  consentRevision: revisionSchema,
+}).strict().refine(record => record.leftRunId !== record.rightRunId);
+
 const storeDataSchema = z.object({
   schemaVersion: z.literal(1),
   boards: z.array(boardSchema).max(20),
@@ -408,7 +432,16 @@ const storeDataSchema = z.object({
   learningOutbox: z.array(learningEventSchema).max(1024).optional(),
   learningObservedRuns: z.array(idSchema).max(200).optional(),
   learningDroppedEvents: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  learningFeedbackConsent: localFeedbackConsentSchema.optional(),
+  learningFeedback: z.array(localFeedbackRecordSchema).max(200).optional(),
 }).strict().superRefine((data, context) => {
+  const feedback = data.learningFeedback ?? [];
+  if (new Set(feedback.map(record => record.id)).size !== feedback.length ||
+      new Set(feedback.map(record => record.operationId)).size !== feedback.length)
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate local feedback id' });
+  if (feedback.length && (!data.learningFeedbackConsent?.enabled ||
+      feedback.some(record => record.consentRevision !== data.learningFeedbackConsent?.revision)))
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'local feedback consent mismatch' });
   const events = data.learningOutbox ?? [];
   if (new Set(events.map(event => event.eventId)).size !== events.length)
     context.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate learning event id' });
@@ -505,3 +538,17 @@ export const schemaLimits = Object.freeze({
   maxTimelineSeconds: 180,
   maxRequestBytes: 6 * 1024 * 1024,
 });
+
+export function parseLearningConsentInput(value: unknown): { enabled: boolean; expectedRevision: number } {
+  return parseSafe(localFeedbackConsentInputSchema, value);
+}
+export function parseLearningFeedbackInput(value: unknown): {
+  operationId: string; boardId: string; nodeId: string;
+  leftRunId: string; rightRunId: string;
+  leftArtifactIndex: number; rightArtifactIndex: number;
+  choice: 'left' | 'right' | 'tie' | 'neither';
+  reason?: 'identity' | 'motion' | 'composition' | 'instruction' | 'technical' | 'other';
+  consentRevision: number;
+} {
+  return parseSafe(localFeedbackInputSchema, value);
+}

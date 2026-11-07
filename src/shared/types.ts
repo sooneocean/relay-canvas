@@ -144,6 +144,22 @@ export type LearningEventRecord = LearningEventBase & (
   | { type: 'run.finished'; runId: string; status: 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | 'needs_review'; succeededNodes: number; artifactCount: number }
 );
 
+/** UI session channel is not cryptographic proof of a human actor. */
+export type LocalFeedbackChoice = 'left' | 'right' | 'tie' | 'neither';
+export type LocalFeedbackReason = 'identity' | 'motion' | 'composition' | 'instruction' | 'technical' | 'other';
+export interface LocalFeedbackConsent { enabled: boolean; revision: number; updatedAt: string }
+export interface LocalFeedbackRecord {
+  id: string; operationId: string; boardId: string; nodeId: string;
+  leftRunId: string; rightRunId: string;
+  leftArtifactIndex: number; rightArtifactIndex: number;
+  choice: LocalFeedbackChoice; reason?: LocalFeedbackReason; consentRevision: number;
+  source: 'local_ui_unverified'; createdAt: string;
+}
+export interface LocalFeedbackStatus {
+  enabled: boolean; revision: number; recordCount: number;
+  scope: 'local_only'; attribution: 'unverified';
+}
+
 export interface StoreData {
   schemaVersion: 1;
   boards: Board[];
@@ -158,8 +174,10 @@ export interface StoreData {
   learningObservedRuns?: string[];
   /** Observations dropped when outbox is full. Never blocks primary operations. */
   learningDroppedEvents?: number;
+  learningFeedbackConsent?: LocalFeedbackConsent;
+  learningFeedback?: LocalFeedbackRecord[];
 }
-export interface AppState extends Omit<StoreData, 'exports' | 'learningOutbox' | 'learningObservedRuns' | 'learningDroppedEvents'> {
+export interface AppState extends Omit<StoreData, 'exports' | 'learningOutbox' | 'learningObservedRuns' | 'learningDroppedEvents' | 'learningFeedbackConsent' | 'learningFeedback'> {
   exports?: ExportJob[];
   settings: { remoteEnabled: boolean; mediaOrigins: string[]; providerOrigins: string[] };
 }
