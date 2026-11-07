@@ -32,7 +32,7 @@ function scene(worldId = 'world_demo', sceneId = 'scene_demo'): WorldIR {
     events: [], relations: [], constraints: [],
   };
 }
-function writeInput(value: WorldIR, expectedRevision: number, operationId = randomUUID()) {
+function writeInput(value: WorldIR, expectedRevision: number, operationId: string = randomUUID()) {
   return { expectedRevision, operationId, confirmApproved: true, scene: value };
 }
 function fixture() {
