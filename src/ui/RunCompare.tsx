@@ -242,7 +242,7 @@ export default function RunCompare({ boardId, runs, requestJson, assetSaveStates
   const [feedbackNotice, setFeedbackNotice] = useState('');
   const [feedbackError, setFeedbackError] = useState('');
   const [feedbackChoice, setFeedbackChoice] = useState<LocalFeedbackChoice>();
-  const feedbackAttemptRef = useRef<{ key: string; operationId: string }>();
+  const feedbackAttemptRef = useRef<{ key: string; operationId: string } | undefined>(undefined);
   const leftVideoRef = useRef<VideoRef>(null);
   const rightVideoRef = useRef<VideoRef>(null);
   const videoIdentityRef = useRef<{ left?: string; right?: string }>({});
