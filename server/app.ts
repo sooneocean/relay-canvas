@@ -94,6 +94,9 @@ export function createApp(service: CanvasService, origin: string, token = random
     if (!/^(?:0|[1-9][0-9]?)$/.test(String(req.params.index))) throw new AppError('INVALID_INPUT', '素材索引無效。', 400);
     res.json(await service.artifactInfo(String(req.params.runId), String(req.params.nodeId), Number(req.params.index)));
   });
+  app.post('/api/boards/:id/upscale', async (req, res) => {
+    res.status(202).json(await service.startUpscale(String(req.params.id), req.body));
+  });
   app.get('/api/exports/:id', (req, res) => { res.json(service.getExport(String(req.params.id))); });
   app.post('/api/exports/:id/cancel', async (req, res) => {
     if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) || Object.keys(req.body).length !== 0) throw new AppError('INVALID_INPUT', '請求內容必須為空物件。', 400);
