@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSeedance25ExtensionPlan } from '../src/shared/seedance25-continuity.js';
+import { buildSeedance25ExtensionPlan, buildSeedance25DraftFinalPlan } from '../src/shared/seedance25-continuity.js';
 
 const opts = {
   region: 'byteplus-ap-southeast' as const,
@@ -50,4 +50,18 @@ test('extension plan rejects unsafe URLs, illegal lengths, missing original anch
     { ...opts, generateAudio: 'yes' },
   ];
   for (const bad of invalid) assert.throws(() => buildSeedance25ExtensionPlan(bad as typeof opts), /Seedance|Invalid/);
+});
+
+
+test('Seedance 2.5 Draft final uses only draft_task id and 1080p output; no extra generation params', () => {
+  const plan = buildSeedance25DraftFinalPlan('byteplus-ap-southeast', 'task_001-valid');
+  assert.equal(plan.purpose, 'draft_final_fixture_only');
+  assert.equal(plan.request.resolution, '1080p');
+  assert.equal(plan.request.output_format, 'mov');
+  assert.equal(plan.request.return_last_frame, true);
+  assert.deepEqual(plan.request.content, [{ type: 'draft_task', draft_task: { id: 'task_001-valid' } }]);
+  assert.deepEqual(Object.keys(plan.request).sort(), ['content','model','output_format','resolution','return_last_frame'].sort());
+  const cn = buildSeedance25DraftFinalPlan('volcengine-cn', 'task_002');
+  assert.equal(cn.request.model, 'doubao-seedance-2-5-260628');
+  assert.throws(() => buildSeedance25DraftFinalPlan('volcengine-cn', '../exfiltrate'), /Invalid Seedance/);
 });
