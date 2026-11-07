@@ -395,8 +395,9 @@ export class CanvasService {
     const plan = await planner.plan(boardId, parsed.bundle);
     // Bound the first real service executor more strictly than the offline CLI.
     // This avoids admitting >8s CPU-heavy videos into a 3-minute process window.
-    if (plan.current.duration > 8) {
-      throw new AppError('DEX_SR_LENGTH_LIMIT', 'First DE-X SR executor accepts 1-8 second clips.', 422);
+    if (plan.current.duration > 8 || Math.min(plan.current.width, plan.current.height) < 270) {
+      throw new AppError('DEX_SR_LENGTH_LIMIT',
+        'First DE-X SR executor accepts 1-8s clips with at least 270px short side for <=4x enlargement.', 422);
     }
     if (!(await this.editor.dexSrAvailable())) {
       throw new AppError('DEX_SR_UNAVAILABLE',
