@@ -260,6 +260,16 @@ export class EditorRuntime {
       throw new Error('Optional DE-X SR runtime unavailable (python3 + cv2 + numpy)');
     }
     if (signal?.aborted) throw new Error('DE-X SR cancelled');
+    const req = inputs.request;
+    if (inputs.current.sha256 !== req.currentVideo.artifactSha256 ||
+        Boolean(inputs.previous) !== Boolean(req.previousSegment) ||
+        (inputs.previous && inputs.previous.sha256 !== req.previousSegment?.artifactSha256) ||
+        inputs.originals.length !== req.originals.length ||
+        inputs.originals.some((item, index) =>
+          item.artifact.sha256 !== req.originals[index].artifactSha256 ||
+          item.role !== req.originals[index].role)) {
+      throw new Error('DE-X SR input bundle no longer matches original verified provenance');
+    }
     const videoType = (a: Artifact) => a.kind === 'video' &&
       ['video/mp4', 'video/webm'].includes(a.mimeType ?? '');
     if (!videoType(inputs.current) ||
