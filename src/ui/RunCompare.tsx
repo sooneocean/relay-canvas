@@ -11,7 +11,7 @@ import {
   X,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Artifact, CanonicalNodeResult, Run, RunComparison } from '../shared/types.js';
+import type { Artifact, CanonicalNodeResult, LocalFeedbackChoice, LocalFeedbackReason, LocalFeedbackRecord, LocalFeedbackStatus, Run, RunComparison } from '../shared/types.js';
 import { validateTimelineHandoff, type TimelineHandoffIntent, type UiRequest } from './TimelineEditor.js';
 import useModalFocus from './useModalFocus.js';
 
@@ -235,6 +235,14 @@ export default function RunCompare({ boardId, runs, requestJson, assetSaveStates
   const [durations, setDurations] = useState({ left: 0, right: 0 });
   const [durationByArtifact, setDurationByArtifact] = useState<Record<string, number>>({});
   const [pendingHandoff, setPendingHandoff] = useState(false);
+  const [feedbackConsent, setFeedbackConsent] = useState<LocalFeedbackStatus>();
+  const [feedbackBusy, setFeedbackBusy] = useState(false);
+  const [feedbackLoading, setFeedbackLoading] = useState(true);
+  const [feedbackReason, setFeedbackReason] = useState<LocalFeedbackReason | ''>('');
+  const [feedbackNotice, setFeedbackNotice] = useState('');
+  const [feedbackError, setFeedbackError] = useState('');
+  const [feedbackChoice, setFeedbackChoice] = useState<LocalFeedbackChoice>();
+  const feedbackAttemptRef = useRef<{ key: string; operationId: string }>();
   const leftVideoRef = useRef<VideoRef>(null);
   const rightVideoRef = useRef<VideoRef>(null);
   const videoIdentityRef = useRef<{ left?: string; right?: string }>({});
@@ -246,6 +254,19 @@ export default function RunCompare({ boardId, runs, requestJson, assetSaveStates
   const requestVersionRef = useRef(0);
 
   const terminalRuns = useMemo(() => boardRuns.filter((run) => terminalStatuses.has(run.status)), [boardRuns]);
+  useEffect(() => {
+    let current = true;
+    setFeedbackLoading(true);
+    void requestJson<LocalFeedbackStatus>('/api/learning/feedback/consent', {
+      headers: { 'X-Canvas-Client': 'ui' },
+    }).then(value => {
+      if (current) setFeedbackConsent(value);
+    }).catch(() => {
+      if (current) setFeedbackError('無法讀取本機回饋設定。');
+    }).finally(() => { if (current) setFeedbackLoading(false); });
+    return () => { current = false; };
+  }, [requestJson]);
+
   useEffect(() => {
     if (!leftId || !terminalRuns.some((run) => run.id === leftId)) setLeftId(terminalRuns[0]?.id ?? '');
     if (!rightId || !terminalRuns.some((run) => run.id === rightId) || rightId === leftId) setRightId(terminalRuns.find((run) => run.id !== (leftId || terminalRuns[0]?.id))?.id ?? '');
@@ -454,6 +475,66 @@ export default function RunCompare({ boardId, runs, requestJson, assetSaveStates
     });
   }, [currentEntries]);
 
+  const feedbackPairKey = `${boardId}:${leftId}:${rightId}:${nodeId}`;
+  useEffect(() => {
+    setFeedbackChoice(undefined);
+    setFeedbackNotice('');
+    setFeedbackError('');
+    setFeedbackReason('');
+    feedbackAttemptRef.current = undefined;
+  }, [feedbackPairKey]);
+
+  const setLocalFeedbackConsent = useCallback(async (enabled: boolean) => {
+    if (!feedbackConsent || feedbackBusy) return;
+    setFeedbackBusy(true);
+    setFeedbackError('');
+    try {
+      const value = await requestJson<LocalFeedbackStatus>('/api/learning/feedback/consent', {
+        method: 'PUT', headers: { 'X-Canvas-Client': 'ui' },
+        body: JSON.stringify({ enabled, expectedRevision: feedbackConsent.revision }),
+      });
+      setFeedbackConsent(value);
+      setFeedbackChoice(undefined);
+      setFeedbackNotice(enabled ? '已啟用本機偏好紀錄（不會上傳或訓練模型）。' : '已停止並清除所有本機偏好紀錄。');
+    } catch (err) {
+      setFeedbackError(errorText(err));
+    } finally { setFeedbackBusy(false); }
+  }, [feedbackConsent, feedbackBusy, requestJson]);
+
+  const firstA = comparison?.left.results[nodeId]?.artifacts[0];
+  const firstB = comparison?.right.results[nodeId]?.artifacts[0];
+  const eligibleFeedback = !loading && !error && comparison?.left.id === leftId &&
+    comparison?.right.id === rightId && comparison.left.boardId === boardId &&
+    comparison.right.boardId === boardId &&
+    comparison.left.status === 'succeeded' && comparison.right.status === 'succeeded' &&
+    comparison.left.results[nodeId]?.status === 'succeeded' &&
+    comparison.right.results[nodeId]?.status === 'succeeded' &&
+    !!firstA && !!firstB && firstA.kind === firstB.kind && firstA.url !== firstB.url;
+
+  const submitLocalFeedback = useCallback(async (choice: LocalFeedbackChoice) => {
+    if (!eligibleFeedback || !feedbackConsent?.enabled || feedbackBusy || feedbackChoice) return;
+    setFeedbackBusy(true);
+    setFeedbackError('');
+    const previous = feedbackAttemptRef.current;
+    const operationId = previous?.key === feedbackPairKey ? previous.operationId : makeToken();
+    feedbackAttemptRef.current = { key: feedbackPairKey, operationId };
+    try {
+      await requestJson<LocalFeedbackRecord>('/api/learning/feedback', {
+        method: 'POST', headers: { 'X-Canvas-Client': 'ui' },
+        body: JSON.stringify({
+          operationId, boardId, nodeId, leftRunId: leftId, rightRunId: rightId,
+          leftArtifactIndex: 0, rightArtifactIndex: 0, choice,
+          ...(feedbackReason ? { reason: feedbackReason } : {}),
+          consentRevision: feedbackConsent.revision,
+        }),
+      });
+      setFeedbackChoice(choice);
+      setFeedbackNotice('已記錄本機比較偏好。此訊號不代表已驗證的人類身分。');
+      setFeedbackConsent(value => value ? { ...value, recordCount: value.recordCount + 1 } : value);
+    } catch (err) { setFeedbackError(errorText(err)); }
+    finally { setFeedbackBusy(false); }
+  }, [eligibleFeedback, feedbackConsent, feedbackBusy, feedbackChoice, feedbackPairKey, feedbackReason, requestJson, boardId, nodeId, leftId, rightId]);
+
   const leftResult = leftRun ? canonicalNode(leftRun, nodeId) : undefined;
   const rightResult = rightRun ? canonicalNode(rightRun, nodeId) : undefined;
   const requestHandoff = useCallback(async (intent: TimelineHandoffIntent): Promise<boolean> => {
@@ -477,6 +558,41 @@ export default function RunCompare({ boardId, runs, requestJson, assetSaveStates
       <div className="compare-differences" data-testid="compare-differences"><span className="panel-eyebrow">DIFFERENCES</span>{comparison.differences.length ? comparison.differences.map((difference) => <button className={difference.nodeId === nodeId ? 'is-active' : ''} key={difference.nodeId} onClick={() => setNodeId(difference.nodeId)}><strong>{difference.nodeId}</strong><span>{difference.fields.join(' · ')}</span></button>) : <p><Check size={13} />這兩筆 run 沒有可見差異。</p>}</div>
       <div className="compare-columns"><article className="compare-side compare-side-a"><div className="compare-side-heading"><span className="compare-run-letter">A</span><div><strong>{leftRun.id.slice(0, 12)}</strong><small>{statusLabel(leftRun.status)} · revision {leftRun.revision}</small></div></div><RunMeta run={leftRun} nodeId={nodeId} result={leftResult} /><Output boardId={boardId} runId={leftRun.id} nodeId={nodeId} result={leftResult} currentRuns={runs} side="left" mediaIdentity={mediaIdentity} startedAt={leftRun.startedAt} durationByArtifact={durationByArtifact} assetSaveStates={assetSaveStates} pendingHandoff={pendingHandoff} onSaveAsset={onSaveAsset} onUseInTimeline={requestHandoff} onVideo={setVideo} onDuration={setDuration} onTimeUpdate={handleTimeUpdate} onPlay={handlePlay} onPause={handlePause} onEnded={handleEnded} /></article><article className="compare-side compare-side-b"><div className="compare-side-heading"><span className="compare-run-letter">B</span><div><strong>{rightRun.id.slice(0, 12)}</strong><small>{statusLabel(rightRun.status)} · revision {rightRun.revision}</small></div></div><RunMeta run={rightRun} nodeId={nodeId} result={rightResult} /><Output boardId={boardId} runId={rightRun.id} nodeId={nodeId} result={rightResult} currentRuns={runs} side="right" mediaIdentity={mediaIdentity} startedAt={rightRun.startedAt} durationByArtifact={durationByArtifact} assetSaveStates={assetSaveStates} pendingHandoff={pendingHandoff} onSaveAsset={onSaveAsset} onUseInTimeline={requestHandoff} onVideo={setVideo} onDuration={setDuration} onTimeUpdate={handleTimeUpdate} onPlay={handlePlay} onPause={handlePause} onEnded={handleEnded} /></article></div>
       <div className="compare-video-controls"><button className="primary-button" data-testid="compare-play" onClick={togglePlay}><span>{playing ? <Pause size={14} /> : <Play size={14} fill="currentColor" />}</span>{playing ? 'Pause videos' : 'Play videos'}</button><input data-testid="compare-scrub" aria-label="比較影片播放位置" type="range" min="0" max={Math.max(durations.left, durations.right, 0.01)} step="0.01" value={Math.min(currentTime, Math.max(durations.left, durations.right, 0.01))} onChange={(event) => seek(Number(event.target.value))} /><span>{currentTime.toFixed(2)}s</span>{durations.left !== durations.right && (durations.left || durations.right) > 0 && <small>不同長度：A {durations.left.toFixed(2)}s / B {durations.right.toFixed(2)}s</small>}</div>
+      <div className="compare-feedback" data-testid="learning-feedback-panel">
+        <div className="compare-feedback-head">
+          <div><strong>本機比較偏好</strong><small>預設關閉。僅記錄Run／Node／輸出索引、A/B選擇及選填原因；不保存作品內容、不上傳、不進行全域訓練。來源為未驗證的本機UI通道。</small></div>
+          <span className="compare-local-badge">{feedbackConsent?.enabled ? '本機啟用' : '尚未啟用'}</span>
+        </div>
+        {feedbackLoading ? <small role="status">讀取本機設定…</small> :
+          feedbackConsent ? <div className="compare-feedback-settings">
+            <button type="button" className="secondary-button"
+              data-testid="learning-feedback-consent-toggle" disabled={feedbackBusy}
+              onClick={() => void setLocalFeedbackConsent(!feedbackConsent.enabled)}>
+              {feedbackConsent.enabled ? '停用並刪除本機回饋' : '啟用本機比較回饋'}
+            </button>
+            <small>已保存{feedbackConsent.recordCount}筆。停用將立即刪除全部本機偏好紀錄。</small>
+          </div> : null}
+        {feedbackConsent?.enabled && eligibleFeedback &&
+          <div className="compare-feedback-choices">
+            <span>比較目前節點的A／B第一個輸出。請主動選擇，下載或加入Timeline不會自動視為偏好。</span>
+            <label>主要原因（選填）<select data-testid="learning-feedback-reason" value={feedbackReason}
+              onChange={event => setFeedbackReason(event.target.value as LocalFeedbackReason | '')} disabled={feedbackBusy || !!feedbackChoice}>
+              <option value="">未指定</option><option value="identity">角色一致性</option>
+              <option value="motion">動作自然度</option><option value="composition">構圖</option>
+              <option value="instruction">符合需求</option><option value="technical">技術品質</option>
+              <option value="other">其他</option>
+            </select></label>
+            <div className="compare-feedback-actions">
+              <button type="button" className="secondary-button" data-testid="learning-feedback-left" disabled={feedbackBusy || !!feedbackChoice} onClick={() => void submitLocalFeedback('left')}>採納A</button>
+              <button type="button" className="secondary-button" data-testid="learning-feedback-right" disabled={feedbackBusy || !!feedbackChoice} onClick={() => void submitLocalFeedback('right')}>採納B</button>
+              <button type="button" className="secondary-button" data-testid="learning-feedback-tie" disabled={feedbackBusy || !!feedbackChoice} onClick={() => void submitLocalFeedback('tie')}>兩者相當</button>
+              <button type="button" className="secondary-button" data-testid="learning-feedback-neither" disabled={feedbackBusy || !!feedbackChoice} onClick={() => void submitLocalFeedback('neither')}>都不符合</button>
+            </div>
+          </div>}
+        {feedbackConsent?.enabled && !eligibleFeedback && <small>只有同一節點、兩筆成功Run且內容不同的第一個輸出能提供偏好回饋。</small>}
+        {feedbackNotice && <small role="status" data-testid="learning-feedback-success">{feedbackNotice}</small>}
+        {feedbackError && <small role="alert">{feedbackError}</small>}
+      </div>
       <div className="compare-dialog-foot"><span>prompt、provider/model、params 與 outputs 皆依選定 run/node exact identity 顯示。</span><button className="ghost-button" onClick={onClose}>Close</button></div>
     </>}
   </section></div>;
