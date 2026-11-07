@@ -84,7 +84,7 @@ function promptPolicy(text: string): DexSrPlan['promptPolicy'] {
 export class DexSrPlanner {
   constructor(private readonly service: CanvasService) {}
 
-  private savedMedia(boardId: string, digest: string, kind: 'video' | 'image',
+  verifiedMedia(boardId: string, digest: string, kind: 'video' | 'image',
     importedOnly: boolean): Artifact {
     const workspace = this.service.store.read();
     const matches = (art: Artifact | undefined) =>
@@ -117,13 +117,13 @@ export class DexSrPlanner {
     const parsed = planInput.safeParse(input);
     if (!parsed.success) fail('DEX_SR_INVALID_INPUT', 'Invalid DE-X SR reference bundle.');
     const request = parsed.data;
-    const current = this.savedMedia(boardId, request.currentVideo.artifactSha256, 'video', false);
+    const current = this.verifiedMedia(boardId, request.currentVideo.artifactSha256, 'video', false);
     const previous = request.previousSegment
-      ? this.savedMedia(boardId, request.previousSegment.artifactSha256, 'video', false)
+      ? this.verifiedMedia(boardId, request.previousSegment.artifactSha256, 'video', false)
       : undefined;
     const references = request.originals.map(item => ({
       ref: item,
-      artifact: this.savedMedia(boardId, item.artifactSha256, 'image', true),
+      artifact: this.verifiedMedia(boardId, item.artifactSha256, 'image', true),
     }));
     let currentInfo;
     let previousInfo;
