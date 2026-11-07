@@ -257,6 +257,33 @@ export class VideoIntegrityLedger {
     };
   }
 
+  /**
+   * Provides read-only evidence access only for an existing board-owned and
+   * byte-verified saved candidate. Never promotes it to a verified checkpoint.
+   */
+  analysisSource(boardId: string, candidateId: string): { candidate: SegmentCandidate; artifact: Artifact } {
+    this.assertBoard(boardId);
+    if (!id(candidateId)) fail('INVALID_VIDEO_INPUT', 'Invalid candidate ID.');
+    const { state } = this.load();
+    const registered = state.candidates.get(candidateId);
+    if (!registered || registered.candidate.boardId !== boardId) {
+      fail('VIDEO_CANDIDATE_NOT_FOUND', 'Candidate does not belong to this board.', 404);
+    }
+    const candidate = registered.candidate;
+    const artifact = this.findMedia(boardId, candidate.artifactSha256, 'video');
+    for (const anchorId of candidate.anchorIds) {
+      const anchor = state.anchors.get(anchorId);
+      if (!anchor || anchor.boardId !== boardId) fail('VIDEO_ANCHOR_NOT_FOUND', 'Anchor is missing or unverified.', 409);
+      this.findMedia(boardId, anchor.artifactSha256, anchor.kind, true);
+    }
+    if (candidate.parentCheckpointId) {
+      const parent = state.checkpoints.get(candidate.parentCheckpointId);
+      if (!parent || parent.boardId !== boardId) fail('VIDEO_PARENT_NOT_VERIFIED', 'Parent checkpoint is missing.', 409);
+      this.findMedia(boardId, parent.artifactSha256, 'video');
+    }
+    return { candidate, artifact };
+  }
+
   private replayOrNext(operationId: string, requestSha256: string, expectedRevision: number) {
     const { journal, state } = this.load();
     const prior = state.operations.get(operationId);
