@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { AppError, modelFor, plan, topology } from './graph.js';
 import { Store } from './store.js';
@@ -15,6 +15,8 @@ import type {
 import { recommendedReferenceField } from '../src/shared/defaults.js';
 import { parseUpscaleInput } from '../src/shared/schema.js';
 import { upscaleBounds } from '../src/shared/upscale.js';
+import { DexSrPlanner } from './dex-sr-planner.js';
+import { parseDexSrJobInput } from '../src/shared/schema.js';
 
 type Generator = (provider: Provider, request: GenerationRequest) => Promise<GenerationOutput>;
 const NODE_FOOTPRINT = { width: 340, height: 240 } as const;
@@ -365,6 +367,112 @@ export class CanvasService {
             : 'Video upscale failed; source preserved. Check FFmpeg and storage quota.';
         });
       } catch { /* cancelled/durable terminal state wins */ }
+    }
+  }
+
+  /**
+   * Build a durable opt-in DE-X SR restoration task from an authoritative,
+   * same-board local media bundle. This does not trigger any paid generation.
+   * Source ownership, content hashes and operation keys are rechecked at
+   * dispatch; a completed output is a separate local derivative.
+   */
+  async startDexSr(boardId: string, input: unknown): Promise<ExportJob> {
+    this.board(boardId);
+    const parsed = parseDexSrJobInput(input);
+    const digest = createHash('sha256').update(JSON.stringify(parsed.bundle)).digest('hex');
+    const previous = () => this.store.read().exports?.find(job => job.operationId === parsed.operationId);
+    const replay = (old: StoredExportJob): ExportJob => {
+      if (old.boardId !== boardId || old.dexSr?.requestSha256 !== digest) {
+        throw new AppError('OPERATION_CONFLICT', 'Operation ID already belongs to different work.', 409);
+      }
+      return this.publicExport(old);
+    };
+    const prior = previous();
+    if (prior) return replay(prior);
+    if (this.activeExport) throw new AppError('BUSY', 'Another local media job is active.', 409);
+
+    const planner = new DexSrPlanner(this);
+    const plan = await planner.plan(boardId, parsed.bundle);
+    // Bound the first real service executor more strictly than the offline CLI.
+    // This avoids admitting >8s CPU-heavy videos into a 3-minute process window.
+    if (plan.current.duration > 8) {
+      throw new AppError('DEX_SR_LENGTH_LIMIT', 'First DE-X SR executor accepts 1-8 second clips.', 422);
+    }
+    if (!(await this.editor.dexSrAvailable())) {
+      throw new AppError('DEX_SR_UNAVAILABLE',
+        'Install local Python 3, NumPy, OpenCV and FFmpeg to run non-generative restoration.', 503);
+    }
+    const raced = previous();
+    if (raced) return replay(raced);
+    if (this.activeExport) throw new AppError('BUSY', 'Another local media job is active.', 409);
+    if ((this.store.read().exports?.length ?? 0) >= 100) {
+      throw new AppError('LIMIT', 'Local media job journal reached its limit.', 409);
+    }
+    const timeline: Timeline = {
+      boardId, revision: 0, format: plan.current.height > plan.current.width ? 'portrait' : 'landscape',
+      clips: [],
+    };
+    const id = randomUUID(), attemptNonce = randomUUID(), controller = new AbortController();
+    const job: StoredExportJob = {
+      id, boardId, timelineRevision: 0, operationId: parsed.operationId,
+      status: 'pending', startedAt: new Date().toISOString(),
+      snapshot: timeline, attemptNonce,
+      dexSr: { schemaVersion: 1, request: parsed.bundle, requestSha256: digest },
+    };
+    this.store.transaction(data => {
+      if (data.exports?.some(item => item.operationId === parsed.operationId)) {
+        throw new AppError('OPERATION_CONFLICT', 'DE-X SR operation already submitted.', 409);
+      }
+      data.exports ??= [];
+      data.exports.unshift(job);
+    });
+    this.activeExport = { id, attemptNonce, controller };
+    const task = Promise.resolve().then(() => this.executeDexSr(job, controller.signal)).finally(() => {
+      if (this.activeExport?.id === id && this.activeExport.attemptNonce === attemptNonce) {
+        this.activeExport = undefined;
+      }
+      this.exportTasks.delete(id);
+    });
+    this.exportTasks.set(id, task);
+    void task.catch(() => undefined);
+    return this.publicExport(job);
+  }
+
+  private async executeDexSr(initial: StoredExportJob, signal: AbortSignal): Promise<void> {
+    try {
+      this.updateExport(initial.id, initial.attemptNonce, job => { job.status = 'running'; });
+      const request = initial.dexSr!.request;
+      const planner = new DexSrPlanner(this);
+      // Nothing cached from a previous plan is trusted at dispatch time.
+      await planner.plan(initial.boardId, request);
+      const video = planner.verifiedMedia(initial.boardId, request.currentVideo.artifactSha256, 'video', false);
+      const previous = request.previousSegment
+        ? planner.verifiedMedia(initial.boardId, request.previousSegment.artifactSha256, 'video', false)
+        : undefined;
+      const originals = request.originals.map(item => ({
+        role: item.role,
+        artifact: planner.verifiedMedia(initial.boardId, item.artifactSha256, 'image', true),
+      }));
+      await this.editor.restoreDexSr(
+        { current: video, ...(previous ? { previous } : {}), originals, request },
+        artifact => {
+          this.updateExport(initial.id, initial.attemptNonce, job => {
+            job.status = 'succeeded';
+            job.artifact = artifact;
+            job.finishedAt = new Date().toISOString();
+          });
+        },
+        localId => this.store.artifactReferenced(localId), signal,
+      );
+    } catch {
+      try {
+        this.updateExport(initial.id, initial.attemptNonce, job => {
+          job.status = signal.aborted ? 'cancelled' : 'failed';
+          job.finishedAt = new Date().toISOString();
+          job.error = signal.aborted ? 'DE-X SR cancelled; original video retained.' :
+            'Local non-generative restoration failed; original video retained.';
+        });
+      } catch { /* cancellation or durable fencing already won */ }
     }
   }
 
