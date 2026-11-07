@@ -99,7 +99,7 @@ export class CanvasService {
     signal?: AbortSignal,
   ): Promise<ImportAssetResult> {
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(boardId) || !/^[A-Za-z0-9_-]{1,64}$/.test(input.operationId) || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0 || !['image', 'video'].includes(input.kind) || typeof input.name !== 'string' || input.name.length < 1 || input.name.length > 120 || input.name.trim() !== input.name) throw new AppError('INVALID_INPUT', '匯入參數無效。', 400);
-    const allowed = input.kind === 'image' ? ['image/png', 'image/jpeg', 'image/webp'] : ['video/mp4', 'video/webm'];
+    const allowed = input.kind === 'image' ? ['image/png', 'image/jpeg', 'image/webp'] : ['video/mp4', 'video/webm', 'video/quicktime'];
     if (!allowed.includes(mimeType) || !Number.isSafeInteger(declaredBytes) || declaredBytes < 1 || declaredBytes > 64 * 1024 * 1024) throw new AppError('INVALID_INPUT', '匯入媒體類型或長度無效。', 400);
     const first = this.store.read();
     const prior = first.localAssets?.find(asset => asset.id === input.operationId);
@@ -199,7 +199,7 @@ export class CanvasService {
     const result = run.results[source.nodeId];
     if (run.status !== 'succeeded' || result?.status !== 'succeeded') throw new AppError('SOURCE_NOT_SUCCEEDED', '只有成功且已保存的影片可以加入時間軸。', 409);
     const artifact = result.artifacts[source.artifactIndex];
-    if (!artifact || artifact.kind !== 'video' || !artifact.localId || artifact.localId !== artifact.sha256 || !artifact.localUrl || !artifact.bytes || !['video/mp4', 'video/webm'].includes(artifact.mimeType ?? '')) {
+    if (!artifact || artifact.kind !== 'video' || !artifact.localId || artifact.localId !== artifact.sha256 || !artifact.localUrl || !artifact.bytes || !['video/mp4', 'video/webm', 'video/quicktime'].includes(artifact.mimeType ?? '')) {
       throw new AppError('SOURCE_NOT_SAVED', '請先將影片保存到本機，再加入時間軸。', 409);
     }
     return artifact;
