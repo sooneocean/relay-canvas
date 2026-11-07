@@ -1,0 +1,32 @@
+name: Precision Temporal VSR (non-generative)
+
+on:
+  pull_request:
+    paths:
+      - 'tools/precision_vsr.py'
+      - 'tools/requirements-precision-vsr.txt'
+      - 'tests/test_precision_vsr.py'
+      - '.github/workflows/precision-vsr.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  restoration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: tools/requirements-precision-vsr.txt
+      - name: Install non-generative restoration dependencies
+        run: |
+          python -m pip install -r tools/requirements-precision-vsr.txt
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Test real FFmpeg clip, temporal reconstruction and scene-cut safeguards
+        run: python -m unittest discover -s tests -p 'test_precision_vsr.py' -v
