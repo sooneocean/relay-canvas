@@ -67,7 +67,12 @@ test('upscale size guard preserves aspect-ratio footprint and refuses no-op/huge
 test('real saved 320p H264 12fps clip upscales to 1080p while preserving frame count and original source', async () => {
   const f = await fixture();
   try {
-    const sourceBefore = readFileSync(f.service.media.fileFor(f.source).file);
+    const readSavedSource = () => {
+      const opened = f.service.media.fileFor(f.source);
+      try { return readFileSync(opened.file); }
+      finally { f.service.media.releaseFile(opened.fd); }
+    };
+    const sourceBefore = readSavedSource();
     const infoBefore = await f.service.editor.probe(f.source);
     assert.equal(infoBefore.width, 320);
     assert.equal(infoBefore.height, 180);
@@ -84,7 +89,7 @@ test('real saved 320p H264 12fps clip upscales to 1080p while preserving frame c
     assert.ok(Math.abs(result.duration - infoBefore.duration) < 0.15);
     const sourceAfter = f.service.media.verifyArtifact(f.source);
     assert.equal(sourceAfter.sha256, f.source.sha256);
-    assert.deepEqual(readFileSync(f.service.media.fileFor(f.source).file), sourceBefore);
+    assert.deepEqual(readSavedSource(), sourceBefore);
     assert.equal(f.service.mediaArtifact(saved.artifact!.sha256!).sha256, saved.artifact!.sha256);
     const count = (artifact: typeof f.source) => {
       const fpath = f.service.media.fileFor(artifact);
