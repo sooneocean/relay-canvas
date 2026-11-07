@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Artifact, EditorCapabilities, MediaInfo, Timeline } from '../src/shared/types.js';
 import { parseMediaInfo } from '../src/shared/schema.js';
+import { parseSignalstats, type VideoSignalFrame } from '../src/shared/video-signal.js';
 import { MediaStore, MAX_MEDIA_BYTES, type MediaReservation } from './media.js';
 
 const MAX_EPHEMERAL = 192 * 1024 * 1024;
@@ -159,6 +160,7 @@ export class EditorRuntime {
   private readonly workspace: EphemeralWorkspace;
   private capability?: Promise<EditorCapabilities>;
   private probes = 0;
+  private signalAnalyses = 0;
   constructor(private readonly directory: string, private readonly media: MediaStore, workspaceRoot = process.cwd(), pathValue = process.env.PATH ?? '') {
     this.workspace = new EphemeralWorkspace(directory);
     this.ffmpeg = resolveExecutable('ffmpeg', workspaceRoot, pathValue);
@@ -208,6 +210,43 @@ export class EditorRuntime {
       if (artifact.mimeType === 'video/webm' && !/matroska|webm/.test(String(parsed.format?.format_name))) throw new Error('Media probe failed');
       return parseMediaInfo({ duration: Number(parsed.format?.duration), width: video.width, height: video.height, hasAudio: parsed.streams?.some(stream => stream.codec_type === 'audio') ?? false });
     } finally { this.probes--; if (job) this.workspace.cleanup(job); release(); }
+  }
+  /**
+   * Read-only, low-resolution 2 Hz FFmpeg signalstats sampling of a verified
+   * local video. Returns raw luminance evidence only; NOT an identity or
+   * semantic drift verdict. Uses the same process-group supervisor and
+   * copyVerified sandbox as timeline export.
+   */
+  async signalFrames(artifact: Artifact): Promise<VideoSignalFrame[]> {
+    if (!this.ffmpeg || !['video/mp4', 'video/webm'].includes(artifact.mimeType ?? '') ||
+      artifact.kind !== 'video') throw new Error('Video signal analyzer unavailable');
+    if (this.signalAnalyses >= 1) throw new Error('Video signal analyzer busy');
+    const release = this.workspace.reserve(MAX_MEDIA_BYTES);
+    let job: ReturnType<EphemeralWorkspace['create']> | undefined;
+    this.signalAnalyses += 1;
+    try {
+      job = this.workspace.create();
+      const extension = artifact.mimeType === 'video/mp4' ? 'mp4' : 'webm';
+      const sourceName = 'source-000.' + extension;
+      copyVerified(this.media, artifact, path.join(job.directory, sourceName));
+      const capabilities = await this.capabilities();
+      if (!capabilities.ffmpeg) throw new Error('Video signal analyzer unavailable');
+      const args = [
+        '-hide_banner', '-loglevel', 'error', '-nostdin',
+        '-max_alloc', String(MAX_MEDIA_BYTES), '-filter_threads', '2',
+        ...inputArgs(sourceName, artifact.mimeType!),
+        '-t', '60', '-map', '0:v:0',
+        '-vf', 'fps=2,scale=64:36:flags=fast_bilinear,signalstats,metadata=print:file=-',
+        '-frames:v', '120', '-an', '-sn', '-dn', '-f', 'null', '-',
+      ];
+      const result = await runSupervised(this.ffmpeg, args, job.directory, 30_000).result;
+      if (result.code !== 0 || result.truncated) throw new Error('Video signal decode failed');
+      return parseSignalstats(result.stdout);
+    } finally {
+      this.signalAnalyses -= 1;
+      if (job) this.workspace.cleanup(job);
+      release();
+    }
   }
   async export(
     timeline: Timeline,
