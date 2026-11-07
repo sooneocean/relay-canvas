@@ -123,17 +123,16 @@ export function buildSeedance25DraftFinalPlan(region: SeedanceRegion, draftTaskI
   purpose: 'draft_final_fixture_only';
 } {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(draftTaskId)) throw new Error('Invalid Seedance draft task ID');
-  const seed = buildSeedance25ExtensionPlan({
-    region,
-    previousVideoUrl: 'https://example.com/draft-fixture.mov',
-    originalReferenceImages: ['https://example.com/anchor-fixture.png'],
-    instruction: 'Continue the scene.',
-    durationSeconds: 4,
-  });
+  if (region !== 'byteplus-ap-southeast' && region !== 'volcengine-cn') {
+    throw new Error('Unsupported Seedance region');
+  }
+  const isByteplus = region === 'byteplus-ap-southeast';
   return {
-    endpoint: seed.endpoint,
+    endpoint: isByteplus
+      ? 'https://ark.ap-southeast.bytepluses.com/api/v3/contents/generations/tasks'
+      : 'https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks',
     request: {
-      model: seed.request.model,
+      model: isByteplus ? 'dreamina-seedance-2-5-260628' : 'doubao-seedance-2-5-260628',
       content: [{ type: 'draft_task', draft_task: { id: draftTaskId } }],
       resolution: '1080p', output_format: 'mov', return_last_frame: true,
     },
