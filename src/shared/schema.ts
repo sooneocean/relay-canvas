@@ -390,7 +390,8 @@ const learningEventSchema = z.discriminatedUnion('type', [
     status: z.enum(['succeeded', 'failed', 'cancelled', 'interrupted', 'needs_review']),
     succeededNodes: z.number().int().min(0).max(100), artifactCount: z.number().int().min(0).max(10000) }).strict()
 ]).superRefine((event, context) => {
-  const expectedEpisode = event.type.startsWith('run.') ? event.runId : `${event.boardId}:${event.revision}`;
+  const expectedEpisode = (event.type === 'run.started' || event.type === 'run.finished')
+    ? event.runId : `${event.boardId}:${event.revision}`;
   if (event.episodeId !== expectedEpisode) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: 'learning episode mismatch' });
   }

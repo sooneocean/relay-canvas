@@ -158,7 +158,7 @@ test('outbox capacity is bounded, records observation loss, and does not block g
 test('torn journal tail blocks new writes but retains committed outbox for manual repair', () => {
   const f = fixture();
   try {
-    writeFileSync(journalPath(f.dir), '{"incomplete":');
+    writeFileSync(journalPath(f.dir), '{"incomplete":', { mode: 0o600 });
     const saved = f.service.patch('welcome', 0, [{ type: 'remove_node', id: 'direction' }]);
     assert.equal(saved.revision, 1);
     assert.equal(f.store.read().learningOutbox?.length, 2);
