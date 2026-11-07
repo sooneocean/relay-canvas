@@ -9,12 +9,13 @@ import { fileURLToPath } from 'node:url';
 import type { Artifact, EditorCapabilities, MediaInfo, Timeline } from '../src/shared/types.js';
 import { parseMediaInfo } from '../src/shared/schema.js';
 import { upscaleBounds } from '../src/shared/upscale.js';
+import { compareSeamPixels, type VideoColorMetadata, type VideoSeamEvidence } from '../src/shared/video-seam.js';
 import { MediaStore, MAX_MEDIA_BYTES, type MediaReservation } from './media.js';
 
 const MAX_EPHEMERAL = 192 * 1024 * 1024;
 const MAX_SEGMENTS = 64 * 1024 * 1024;
 const OUTPUT_LIMIT = 256 * 1024;
-const KNOWN = /^(?:source|segment)-\d{3}\.(?:mp4|webm|mov)$|^segments\.txt$|^output\.mp4$/;
+const KNOWN = /^(?:source|segment)-\d{3}\.(?:mp4|webm|mov)$|^segments\.txt$|^output\.mp4$|^(?:tail|head)\.ppm$/;
 
 interface Binary { path: string; dev: bigint; ino: bigint }
 interface CommandResult { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; truncated: boolean }
@@ -160,6 +161,7 @@ export class EditorRuntime {
   private readonly workspace: EphemeralWorkspace;
   private capability?: Promise<EditorCapabilities>;
   private probes = 0;
+  private seamAnalyses = 0;
   constructor(private readonly directory: string, private readonly media: MediaStore, workspaceRoot = process.cwd(), pathValue = process.env.PATH ?? '') {
     this.workspace = new EphemeralWorkspace(directory);
     this.ffmpeg = resolveExecutable('ffmpeg', workspaceRoot, pathValue);
@@ -210,6 +212,112 @@ export class EditorRuntime {
       return parseMediaInfo({ duration: Number(parsed.format?.duration), width: video.width, height: video.height, hasAudio: parsed.streams?.some(stream => stream.codec_type === 'audio') ?? false });
     } finally { this.probes--; if (job) this.workspace.cleanup(job); release(); }
   }
+  /**
+   * Verify two saved local videos, decode a low-resolution boundary frame from
+   * the end of source and the beginning of continuation, then measure RGB
+   * differences plus immutable ffprobe video/color metadata. Never accepts
+   * user-controlled filesystem paths or triggers generation/publishing.
+   */
+  async inspectSeam(previous: Artifact, next: Artifact): Promise<VideoSeamEvidence> {
+    const allowed = (artifact: Artifact) =>
+      artifact.kind === 'video' &&
+      ['video/mp4', 'video/webm', 'video/quicktime'].includes(artifact.mimeType ?? '');
+    if (!this.ffmpeg || !this.ffprobe || !allowed(previous) || !allowed(next)) {
+      throw new Error('Video seam analyzer unavailable');
+    }
+    if (this.seamAnalyses >= 1) throw new Error('Video seam analyzer busy');
+    const release = this.workspace.reserve(MAX_MEDIA_BYTES * 2);
+    let job: ReturnType<EphemeralWorkspace['create']> | undefined;
+    this.seamAnalyses += 1;
+    try {
+      if (!(await this.capabilities()).available) throw new Error('Video seam analyzer unavailable');
+      job = this.workspace.create();
+      const ext = (artifact: Artifact) =>
+        artifact.mimeType === 'video/mp4' ? 'mp4' :
+        artifact.mimeType === 'video/quicktime' ? 'mov' : 'webm';
+      const firstName = 'source-000.' + ext(previous);
+      const secondName = 'source-001.' + ext(next);
+      copyVerified(this.media, previous, path.join(job.directory, firstName));
+      copyVerified(this.media, next, path.join(job.directory, secondName));
+
+      const probeProfile = async (name: string, mimeType: string): Promise<VideoColorMetadata> => {
+        const args = [
+          '-v', 'error', '-max_alloc', String(MAX_MEDIA_BYTES),
+          '-analyzeduration', '10000000', '-probesize', String(8 * 1024 * 1024),
+          ...inputArgs(name, mimeType),
+          '-show_entries',
+          'format=duration:stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,color_primaries,color_transfer,color_space,color_range',
+          '-of', 'json',
+        ];
+        const output = await runSupervised(this.ffprobe!, args, job!.directory, 10_000).result;
+        if (output.code !== 0 || output.truncated) throw new Error('Failed to probe source video metadata');
+        const data = JSON.parse(output.stdout) as {
+          streams?: Array<Record<string, unknown>>;
+          format?: { duration?: string };
+        };
+        const video = data.streams?.find(item => item.codec_type === 'video');
+        if (!video) throw new Error('Video stream not found');
+        const rate = String(video.avg_frame_rate ?? '').split('/');
+        if (rate.length !== 2) throw new Error('Video frame rate unspecified');
+        const n = Number(rate[0]), d = Number(rate[1]);
+        const width = Number(video.width), height = Number(video.height);
+        const durationSeconds = Number(data.format?.duration);
+        if (!Number.isSafeInteger(n) || !Number.isSafeInteger(d) || n <= 0 || d <= 0 ||
+            !Number.isInteger(width) || !Number.isInteger(height) || width < 64 || height < 64 ||
+            !Number.isFinite(durationSeconds) || durationSeconds < 0.5 || durationSeconds > 60) {
+          throw new Error('Unsupported continuity source');
+        }
+        const tag = (value: unknown): string | null =>
+          typeof value === 'string' && value.length <= 40 &&
+          value !== 'unknown' && value !== 'unspecified' ? value : null;
+        return {
+          codec: String(video.codec_name ?? 'unknown').slice(0, 40),
+          pixelFormat: String(video.pix_fmt ?? 'unknown').slice(0, 40),
+          width, height, durationSeconds,
+          fps: { numerator: n, denominator: d },
+          colorPrimaries: tag(video.color_primaries),
+          colorTransfer: tag(video.color_transfer),
+          colorSpace: tag(video.color_space),
+          colorRange: tag(video.color_range),
+        };
+      };
+      const prevProfile = await probeProfile(firstName, previous.mimeType!);
+      const nextProfile = await probeProfile(secondName, next.mimeType!);
+
+      const capture = async (
+        name: string, mime: string, outputName: 'tail.ppm' | 'head.ppm', tail: boolean,
+      ): Promise<Uint8Array> => {
+        const args = [
+          '-hide_banner', '-loglevel', 'error', '-nostdin',
+          '-max_alloc', String(MAX_MEDIA_BYTES), '-filter_threads', '2',
+          ...(tail ? ['-sseof', '-0.5'] : []),
+          ...inputArgs(name, mime),
+          '-map', '0:v:0',
+          '-vf', 'scale=64:36:flags=fast_bilinear,format=rgb24',
+          ...(tail ? [] : ['-frames:v', '1']),
+          '-an', '-sn', '-dn', '-f', 'image2', '-c:v', 'ppm', '-update', '1',
+          '-y', outputName,
+        ];
+        const outcome = await runSupervised(this.ffmpeg!, args, job!.directory, 30_000).result;
+        if (outcome.code !== 0 || outcome.truncated) throw new Error('Video seam frame decoding failed');
+        const buf = readFileSync(path.join(job!.directory, outputName));
+        const header = Buffer.from('P6\n64 36\n255\n', 'ascii');
+        if (buf.length !== header.length + 64 * 36 * 3 ||
+            !buf.subarray(0, header.length).equals(header)) {
+          throw new Error('Unexpected video seam RGB sample');
+        }
+        return buf.subarray(header.length);
+      };
+      const tail = await capture(firstName, previous.mimeType!, 'tail.ppm', true);
+      const head = await capture(secondName, next.mimeType!, 'head.ppm', false);
+      return compareSeamPixels(tail, head, prevProfile, nextProfile);
+    } finally {
+      this.seamAnalyses -= 1;
+      if (job) this.workspace.cleanup(job);
+      release();
+    }
+  }
+
   /**
    * Non-generative, per-frame Lanczos resampling to a 1080p display canvas.
    * Source timestamps and frame cadence are passed through: no frame picking,
