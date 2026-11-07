@@ -8,10 +8,10 @@ import { providerDiagnostics, providerModels, type ProviderTransport } from './p
 import { MediaStore } from './media.js';
 import { EditorRuntime } from './editor.js';
 import { readPolicy, validateBaseUrl, validateMediaUrl } from './security.js';
-import { parseArtifact, parseBoard, parseExportInput, parseOperations, parseProviders, parseRunInput, parseTimelineInput } from '../src/shared/schema.js';
+import { parseArtifact, parseBoard, parseExportInput, parseLearningConsentInput, parseLearningFeedbackInput, parseOperations, parseProviders, parseRunInput, parseTimelineInput } from '../src/shared/schema.js';
 import type {
   Artifact, ArtifactInfo, Board, CanonicalArtifact, CanonicalRun, ClipSource, ExportJob, GenerationOutput,
-  GenerationRequest, ImportAssetInput, ImportAssetResult, LocalAsset, Operation, Provider, Run, RunComparison, RunComparisonField, StoredExportJob, Timeline,
+  GenerationRequest, ImportAssetInput, ImportAssetResult, LocalAsset, LocalFeedbackRecord, LocalFeedbackStatus, Operation, Provider, Run, RunComparison, RunComparisonField, StoredExportJob, Timeline,
 } from '../src/shared/types.js';
 import { recommendedReferenceField } from '../src/shared/defaults.js';
 
@@ -58,10 +58,88 @@ export class CanvasService {
   }
   state() {
     const data = this.store.read();
-    const { learningOutbox: _pending, learningObservedRuns: _runs, learningDroppedEvents: _dropped, ...publicData } = data;
+    const { learningOutbox: _pending, learningObservedRuns: _runs, learningDroppedEvents: _dropped,
+      learningFeedbackConsent: _consent, learningFeedback: _feedback, ...publicData } = data;
     const exports = data.exports?.map(({ attemptNonce: _attemptNonce, ...job }) => job);
     return { ...publicData, exports, settings: this.policy };
   }
+  learningFeedbackStatus(): LocalFeedbackStatus {
+    const data = this.store.read();
+    return {
+      enabled: data.learningFeedbackConsent?.enabled ?? false,
+      revision: data.learningFeedbackConsent?.revision ?? 0,
+      recordCount: data.learningFeedback?.length ?? 0,
+      scope: 'local_only', attribution: 'unverified',
+    };
+  }
+
+  setLearningFeedbackConsent(input: unknown): LocalFeedbackStatus {
+    const request = parseLearningConsentInput(input);
+    this.store.transaction(data => {
+      const current = data.learningFeedbackConsent ?? { enabled: false, revision: 0 };
+      if (current.revision !== request.expectedRevision) {
+        // Idempotent transport retry only for the immediately preceding transition.
+        if (current.revision === request.expectedRevision + 1 && current.enabled === request.enabled) return;
+        throw new AppError('CONSENT_REVISION_CONFLICT', '回饋設定已改變，請重新載入。', 409);
+      }
+      data.learningFeedbackConsent = {
+        enabled: request.enabled, revision: current.revision + 1, updatedAt: new Date().toISOString(),
+      };
+      // Revocation removes local preference records in the same atomic transaction.
+      if (!request.enabled) data.learningFeedback = [];
+    });
+    return this.learningFeedbackStatus();
+  }
+
+  recordLocalFeedback(input: unknown): LocalFeedbackRecord {
+    const request = parseLearningFeedbackInput(input);
+    return this.store.transaction(data => {
+      const consent = data.learningFeedbackConsent;
+      if (!consent?.enabled) throw new AppError('FEEDBACK_DISABLED', '請先啟用本機回饋。', 403);
+      if (consent.revision !== request.consentRevision)
+        throw new AppError('CONSENT_REVISION_CONFLICT', '授權版本已改變，請重新載入。', 409);
+      const entries = data.learningFeedback ?? [];
+      const existing = entries.find(entry => entry.operationId === request.operationId);
+      if (existing) {
+        const fields = ['boardId','nodeId','leftRunId','rightRunId','leftArtifactIndex',
+          'rightArtifactIndex','choice','reason','consentRevision'] as const;
+        if (fields.some(field => (existing[field] ?? undefined) !== (request[field] ?? undefined)))
+          throw new AppError('FEEDBACK_OPERATION_CONFLICT', '操作識別已用於其他回饋。', 409);
+        return existing;
+      }
+      const left = data.runs.find(run => run.id === request.leftRunId);
+      const right = data.runs.find(run => run.id === request.rightRunId);
+      if (!left || !right || left.boardId !== request.boardId || right.boardId !== request.boardId)
+        throw new AppError('RUN_BOARD_MISMATCH', '來源不存在或不屬於此畫布。', 400);
+      if (left.status !== 'succeeded' || right.status !== 'succeeded' ||
+          left.results[request.nodeId]?.status !== 'succeeded' ||
+          right.results[request.nodeId]?.status !== 'succeeded')
+        throw new AppError('FEEDBACK_NOT_ELIGIBLE', '僅可比較同一節點的成功輸出。', 409);
+      const a = left.results[request.nodeId].artifacts[request.leftArtifactIndex];
+      const b = right.results[request.nodeId].artifacts[request.rightArtifactIndex];
+      if (!a || !b || a.kind !== b.kind || a.url === b.url)
+        throw new AppError('FEEDBACK_NOT_ELIGIBLE', '輸出必須存在、類型相同且內容不同。', 409);
+      const artifactKey = (runId: string, index: number) => `${runId}:${index}`;
+      const pair = [artifactKey(request.leftRunId, request.leftArtifactIndex),
+        artifactKey(request.rightRunId, request.rightArtifactIndex)].sort().join('|');
+      if (entries.some(entry => entry.boardId === request.boardId && entry.nodeId === request.nodeId &&
+          [artifactKey(entry.leftRunId, entry.leftArtifactIndex),
+            artifactKey(entry.rightRunId, entry.rightArtifactIndex)].sort().join('|') === pair))
+        throw new AppError('FEEDBACK_ALREADY_RECORDED', '這組輸出已有回饋，請勿重複提交。', 409);
+      if (entries.length >= 200) throw new AppError('FEEDBACK_LIMIT', '本機回饋已達200筆上限。', 409);
+      const record: LocalFeedbackRecord = {
+        id: randomUUID(), operationId: request.operationId, boardId: request.boardId, nodeId: request.nodeId,
+        leftRunId: request.leftRunId, rightRunId: request.rightRunId,
+        leftArtifactIndex: request.leftArtifactIndex, rightArtifactIndex: request.rightArtifactIndex,
+        choice: request.choice, ...(request.reason ? { reason: request.reason } : {}),
+        consentRevision: consent.revision, source: 'local_ui_unverified', createdAt: new Date().toISOString(),
+      };
+      data.learningFeedback ??= [];
+      data.learningFeedback.push(record);
+      return record;
+    });
+  }
+
   board(id: string) { const board = this.store.read().boards.find(b => b.id === id); if (!board) throw new AppError('NOT_FOUND', '找不到畫布。', 404); return board; }
   private validateBoardAssets(board: Board, assets: LocalAsset[]): void {
     const byId = new Map(assets.map(asset => [asset.id, asset]));

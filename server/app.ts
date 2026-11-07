@@ -55,6 +55,23 @@ export function createApp(service: CanvasService, origin: string, token = random
     res.json({ token });
   });
   app.get('/api/state', (_req, res) => { res.json(service.state()); });
+  // A shared loopback token is workspace authentication, not human identity proof.
+  // The UI channel header is advisory and can be imitated by local code.
+  const requireUiChannel: express.RequestHandler = (req, _res, next) => {
+    if (req.get('X-Canvas-Client') !== 'ui')
+      return next(new AppError('UI_CHANNEL_REQUIRED', '此功能限定本機UI通道。', 403));
+    next();
+  };
+  app.get('/api/learning/feedback/consent', requireUiChannel, (_req, res) => {
+    res.json(service.learningFeedbackStatus());
+  });
+  app.put('/api/learning/feedback/consent', requireUiChannel, (req, res) => {
+    res.json(service.setLearningFeedbackConsent(req.body));
+  });
+  app.post('/api/learning/feedback', requireUiChannel, (req, res) => {
+    res.status(201).json(service.recordLocalFeedback(req.body));
+  });
+
   app.post('/api/boards', (req, res) => { res.status(201).json(service.create(req.body?.name)); });
   app.put('/api/boards/:id', (req, res) => {
     const board = req.body?.board;
