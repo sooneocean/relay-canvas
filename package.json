@@ -5,7 +5,9 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "engines": { "node": ">=22.12" },
+  "engines": {
+    "node": ">=22.12"
+  },
   "scripts": {
     "dev": "tsx --env-file-if-exists=.env server/main.ts --dev",
     "start": "node --env-file-if-exists=.env build/server/main.js",
@@ -17,7 +19,8 @@
     "test:release": "node --test scripts/release-gate.test.mjs",
     "smoke": "tsx scripts/smoke.ts && tsx scripts/editor-smoke.ts && tsx scripts/source-browser-runner.ts && tsx scripts/thumbnail-smoke.ts && tsx scripts/relay-flow-smoke.ts && tsx scripts/media-sources-smoke.ts && tsx scripts/media-network-smoke.ts",
     "package:release": "node scripts/package-release.mjs",
-    "smoke:package": "node scripts/package-smoke.mjs"
+    "smoke:package": "node scripts/package-smoke.mjs",
+    "benchmark:graph": "tsx scripts/graph-benchmark.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.0",
