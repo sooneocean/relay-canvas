@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { AppError, modelFor, plan, topology } from './graph.js';
 import { Store } from './store.js';
-import { LocalLearningJournal, type TerminalRunStatus } from './learning-events.js';
+import { LocalLearningJournal, LocalLearningOutbox, type TerminalRunStatus } from './learning-events.js';
 import { generate, preflightGeneration } from './providers.js';
 import { providerDiagnostics, providerModels, type ProviderTransport } from './providers.js';
 import { MediaStore } from './media.js';
@@ -11,7 +11,7 @@ import { readPolicy, validateBaseUrl, validateMediaUrl } from './security.js';
 import { parseArtifact, parseBoard, parseExportInput, parseOperations, parseProviders, parseRunInput, parseTimelineInput } from '../src/shared/schema.js';
 import type {
   Artifact, ArtifactInfo, Board, CanonicalArtifact, CanonicalRun, ClipSource, ExportJob, GenerationOutput,
-  GenerationRequest, ImportAssetInput, ImportAssetResult, LocalAsset, Provider, Run, RunComparison, RunComparisonField, StoredExportJob, Timeline,
+  GenerationRequest, ImportAssetInput, ImportAssetResult, LocalAsset, Operation, Provider, Run, RunComparison, RunComparisonField, StoredExportJob, Timeline,
 } from '../src/shared/types.js';
 import { recommendedReferenceField } from '../src/shared/defaults.js';
 
@@ -38,6 +38,7 @@ export class CanvasService {
   readonly media: MediaStore;
   readonly editor: EditorRuntime;
   private readonly learning?: LocalLearningJournal;
+  private readonly learningOutbox?: LocalLearningOutbox;
   constructor(
     readonly store: Store,
     readonly policy = readPolicy(),
@@ -49,11 +50,17 @@ export class CanvasService {
     this.media = media ?? new MediaStore(store.directory, policy);
     this.editor = editor ?? new EditorRuntime(store.directory, this.media);
     this.learning = learning ?? (process.env.RELAY_LEARNING_EVENTS === 'local' ? new LocalLearningJournal(store.directory) : undefined);
+    this.learningOutbox = this.learning ? new LocalLearningOutbox(store, this.learning) : undefined;
+    // Store recovery already marked crashed runs 'interrupted'. Queue their terminal
+    // observations before delivering any pending committed events.
+    this.learningOutbox?.recoverTerminals();
+    this.learningOutbox?.flush();
   }
   state() {
     const data = this.store.read();
+    const { learningOutbox: _pending, learningObservedRuns: _runs, learningDroppedEvents: _dropped, ...publicData } = data;
     const exports = data.exports?.map(({ attemptNonce: _attemptNonce, ...job }) => job);
-    return { ...data, exports, settings: this.policy };
+    return { ...publicData, exports, settings: this.policy };
   }
   board(id: string) { const board = this.store.read().boards.find(b => b.id === id); if (!board) throw new AppError('NOT_FOUND', '找不到畫布。', 404); return board; }
   private validateBoardAssets(board: Board, assets: LocalAsset[]): void {
@@ -76,7 +83,7 @@ export class CanvasService {
       data.boards.push(board); return board;
     });
   }
-  save(id: string, expectedRevision: number, input: unknown) {
+  save(id: string, expectedRevision: number, input: unknown, patchTypes?: Operation['type'][]) {
     const board = parseBoard(input);
     if (board.id !== id) throw new AppError('IDENTITY', '畫布 ID 不符。');
     for (const node of board.nodes) if (node.data.assetUrl) validateMediaUrl(node.data.assetUrl, this.policy);
@@ -88,10 +95,17 @@ export class CanvasService {
       if (index < 0) throw new AppError('NOT_FOUND', '找不到畫布。', 404);
       if (data.boards[index].revision !== expectedRevision) throw new AppError('REVISION_CONFLICT', '畫布已被其他視窗或 Agent 更新。請先載入最新版本。', 409);
       this.validateBoardAssets(board, data.localAssets ?? []);
-      data.boards[index] = { ...board, revision: expectedRevision + 1 }; return data.boards[index];
+      const committed = { ...board, revision: expectedRevision + 1 };
+      data.boards[index] = committed;
+      if (this.learningOutbox) {
+        this.learningOutbox.enqueue(data, { type: 'board.revision_committed', boardId: id, revision: committed.revision,
+          nodes: committed.nodes.length, edges: committed.edges.length });
+        if (patchTypes) this.learningOutbox.enqueue(data, { type: 'board.patch_committed',
+          boardId: id, revision: committed.revision, operationTypes: patchTypes });
+      }
+      return committed;
     });
-    this.learning?.record({ type: 'board.revision_committed', boardId: saved.id, revision: saved.revision,
-      nodes: saved.nodes.length, edges: saved.edges.length });
+    this.learningOutbox?.flush();
     return saved;
   }
 
@@ -181,10 +195,7 @@ export class CanvasService {
       if (op.type === 'connect') board.edges.push(op.edge);
       if (op.type === 'remove_edge') board.edges = board.edges.filter(e => e.id !== op.id);
     }
-    const saved = this.save(id, expectedRevision, board);
-    this.learning?.record({ type: 'board.patch_committed', boardId: saved.id, revision: saved.revision,
-      operationTypes: operations.map(operation => operation.type) });
-    return saved;
+    return this.save(id, expectedRevision, board, operations.map(operation => operation.type));
   }
   providers(input: unknown) {
     const providers = parseProviders(input);
@@ -410,20 +421,24 @@ export class CanvasService {
     throw new AppError('NOT_FOUND', '找不到素材。', 404);
   }
   private updateRun(id: string, change: (run: Run) => void) {
-    let previous: Run['status'] | undefined;
+    const terminal: TerminalRunStatus[] = ['succeeded', 'failed', 'cancelled', 'interrupted', 'needs_review'];
     const updated = this.store.transaction(data => {
       const run = data.runs.find(r => r.id === id)!;
-      previous = run.status;
+      const previous = run.status;
       change(run);
+      // Terminal event and terminal Run must be atomically committed together.
+      if (this.learningOutbox && previous !== run.status && terminal.includes(run.status as TerminalRunStatus) &&
+          (data.learningObservedRuns ?? []).includes(id)) {
+        const queued = this.learningOutbox.enqueue(data, { type: 'run.finished',
+          boardId: run.boardId, revision: run.revision, runId: run.id,
+          status: run.status as TerminalRunStatus,
+          succeededNodes: Object.values(run.results).filter(result => result.status === 'succeeded').length,
+          artifactCount: Object.values(run.results).reduce((count, result) => count + result.artifacts.length, 0) });
+        if (queued) data.learningObservedRuns = data.learningObservedRuns!.filter(runId => runId !== id);
+      }
       return run;
     });
-    const terminal: TerminalRunStatus[] = ['succeeded', 'failed', 'cancelled', 'interrupted', 'needs_review'];
-    if (previous !== updated.status && terminal.some(status => status === updated.status)) {
-      this.learning?.record({ type: 'run.finished', boardId: updated.boardId, revision: updated.revision,
-        runId: updated.id, status: updated.status as TerminalRunStatus,
-        succeededNodes: Object.values(updated.results).filter(result => result.status === 'succeeded').length,
-        artifactCount: Object.values(updated.results).reduce((count, result) => count + result.artifacts.length, 0) });
-    }
+    this.learningOutbox?.flush();
     return updated;
   }
   private validateGenerationArtifacts(provider: Provider, kind: 'image' | 'video', output: unknown): Artifact[] {
@@ -484,9 +499,16 @@ export class CanvasService {
     for (const node of board.nodes.filter(n => execution.order.includes(n.id))) if (node.data.assetUrl) validateMediaUrl(node.data.assetUrl, this.policy);
     const id = randomUUID(), controller = new AbortController();
     const run: Run = { id, boardId: board.id, revision: board.revision, operationId: request.operationId, status: 'pending', startedAt: new Date().toISOString(), snapshot: board, providers: data.providers, order: execution.order, results: Object.fromEntries(execution.order.map(nodeId => [nodeId, { nodeId, status: 'pending', artifacts: [] }])) };
-    this.store.transaction(data => { data.runs.unshift(run); });
-    this.learning?.record({ type: 'run.started', boardId: run.boardId, revision: run.revision,
-      runId: run.id, generations: execution.generations.length, remote });
+    this.store.transaction(data => {
+      data.runs.unshift(run);
+      if (this.learningOutbox && this.learningOutbox.enqueue(data, { type: 'run.started',
+        boardId: run.boardId, revision: run.revision, runId: run.id,
+        generations: execution.generations.length, remote })) {
+        data.learningObservedRuns ??= [];
+        data.learningObservedRuns.push(run.id);
+      }
+    });
+    this.learningOutbox?.flush();
     this.active = { id, controller };
     // Persist the run before scheduling any provider work.
     const task = Promise.resolve().then(() => this.execute(run, controller.signal)).finally(() => { if (this.active?.id === id) this.active = undefined; this.tasks.delete(id); });
