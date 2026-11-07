@@ -5,9 +5,11 @@ import { randomBytes } from 'node:crypto';
 import { createBoundary, validateBaseUrl, validateMediaUrl } from './security.js';
 import { CanvasService } from './service.js';
 import { AppError } from './graph.js';
+import { WorldSceneStore } from './world-store.js';
 
 export function createApp(service: CanvasService, origin: string, token = randomBytes(32).toString('hex'), dev = false) {
   const app = express();
+  const worlds = new WorldSceneStore(service.store.directory);
   app.disable('x-powered-by');
   app.use((req, res, next) => {
     if (req.method === 'POST' && /^\/api\/boards\/[^/]+\/imports$/.test(req.path)) res.setHeader('Connection', 'close');
@@ -56,6 +58,30 @@ export function createApp(service: CanvasService, origin: string, token = random
   });
   app.get('/api/state', (_req, res) => { res.json(service.state()); });
   app.post('/api/boards', (req, res) => { res.status(201).json(service.create(req.body?.name)); });
+  // World IR is a sidecar API: no Board v1 / DAG / existing Run changes.
+  app.get('/api/worlds/:worldId/scenes/:sceneId/revisions', (req, res) => {
+    if (Object.keys(req.query).length) throw new AppError('INVALID_WORLD_QUERY', 'Unexpected world query parameters.', 400);
+    res.json(worlds.listRevisions(String(req.params.worldId), String(req.params.sceneId)));
+  });
+  app.get('/api/worlds/:worldId/scenes/:sceneId', (req, res) => {
+    const keys = Object.keys(req.query);
+    if (keys.length > 1 || (keys.length === 1 && keys[0] !== 'revision')) {
+      throw new AppError('INVALID_WORLD_QUERY', 'Unexpected world query parameters.', 400);
+    }
+    let revision: number | undefined;
+    if (keys.length) {
+      const raw = req.query.revision;
+      if (typeof raw !== 'string' || !/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+        throw new AppError('INVALID_WORLD_REVISION', 'Invalid scene revision.', 400);
+      }
+      revision = Number(raw);
+    }
+    res.json(worlds.read(String(req.params.worldId), String(req.params.sceneId), revision));
+  });
+  app.put('/api/worlds/:worldId/scenes/:sceneId', (req, res) => {
+    const result = worlds.save(String(req.params.worldId), String(req.params.sceneId), req.body);
+    res.status(!result.replayed && result.committedRevision === 1 ? 201 : 200).json(result);
+  });
   app.put('/api/boards/:id', (req, res) => {
     const board = req.body?.board;
     if (Array.isArray(board?.nodes)) for (const node of board.nodes) if (node?.data?.assetUrl) validateMediaUrl(node.data.assetUrl, service.policy);
