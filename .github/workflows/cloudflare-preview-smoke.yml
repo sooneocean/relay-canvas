@@ -1,0 +1,22 @@
+name: Cloudflare ReachFlow preview live smoke
+
+on:
+  push:
+    branches:
+      - deploy/reachflow-cloudflare-frontend
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Probe deployed frontend (not the unshipped build output)
+        run: node scripts/cloudflare-live-smoke.mjs
