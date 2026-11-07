@@ -27,6 +27,8 @@ For accurate color diagnosis use ffprobe color_primaries, color_transfer, color_
 - Can refer to up to 30 images, 10 videos, 10 audios; first/last frame modes are also available.
 - `output_format='mov'` uses H.264 video with yuv444p chroma + PCM audio and is recommended for video editing/extension where color fidelity matters. Player compatibility may vary.
 - `return_last_frame=true` asks API to return a last-frame asset. Download original outputs promptly; output URLs may expire.
+- Seedance 2.5 also supports an official Draft -> 1080p final workflow. The final request uses `content:[{type:'draft_task',draft_task:{id}}]`, `resolution:'1080p'`, and may request MOV and `return_last_frame`. It must **not** resubmit prior prompt, reference assets, duration, ratio, or seed. The original draft task is validated by the provider. Draft IDs created on or after 2026-10-28 have a published 14-day validity limit (older Draft IDs: 7 days). Build and store a 1080p final *from the provider task*, rather than using a sequence of separately upscaled tail-frame JPEGs.
+- `buildSeedance25DraftFinalPlan` produces this request offline. It does not invoke paid inference or confirm account balance.
 - For actual continuation, prefer last **full video** plus independently approved character/scene reference images. Only use first-last-frame mode for planned inbetween sequences; re-extracting last frames and JPEG-encoding them every round should not be the default.
 
 ## API integration status
