@@ -5,6 +5,7 @@ import { randomBytes } from 'node:crypto';
 import { createBoundary, validateBaseUrl, validateMediaUrl } from './security.js';
 import { CanvasService } from './service.js';
 import { AppError } from './graph.js';
+import { z } from 'zod';
 
 export function createApp(service: CanvasService, origin: string, token = randomBytes(32).toString('hex'), dev = false) {
   const app = express();
@@ -96,6 +97,26 @@ export function createApp(service: CanvasService, origin: string, token = random
   });
   app.post('/api/boards/:id/upscale', async (req, res) => {
     res.status(202).json(await service.startUpscale(String(req.params.id), req.body));
+  });
+  app.post('/api/boards/:id/video/continuity/compare', async (req, res) => {
+    const request = z.object({
+      previousSha256: z.string().regex(/^[a-f0-9]{64}$/),
+      nextSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    }).strict().safeParse(req.body);
+    if (!request.success) throw new AppError('INVALID_VIDEO_COMPARE', 'Invalid video continuity comparison request.', 400);
+    const boardId = String(req.params.id);
+    const previous = service.boardVideoArtifact(boardId, request.data.previousSha256);
+    const next = service.boardVideoArtifact(boardId, request.data.nextSha256);
+    try {
+      const evidence = await service.editor.inspectSeam(previous, next);
+      res.json({ boardId, previousSha256: previous.sha256, nextSha256: next.sha256, evidence });
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      const missing = error instanceof Error && /unavailable|busy/i.test(error.message);
+      throw new AppError(missing ? 'VIDEO_SEAM_UNAVAILABLE' : 'VIDEO_SEAM_FAILED',
+        missing ? 'Video seam analysis is unavailable.' : 'Video seam analysis failed without modifying the originals.',
+        missing ? 503 : 422);
+    }
   });
   app.get('/api/exports/:id', (req, res) => { res.json(service.getExport(String(req.params.id))); });
   app.post('/api/exports/:id/cancel', async (req, res) => {
