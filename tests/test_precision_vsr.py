@@ -42,8 +42,8 @@ class PrecisionVsrTest(unittest.TestCase):
         self.assertTrue(np.isfinite(out).all())
 
     def test_size_boundaries(self):
-        self.assertEqual(destination_size(854,480,1080,None), (1922, 1080))
-        self.assertEqual(destination_size(480,854,1080,None), (1080,1922))
+        self.assertEqual(destination_size(854,480,1080,None), (1920, 1080))
+        self.assertEqual(destination_size(480,854,1080,None), (1080,1920))
         with self.assertRaises(ValueError): destination_size(64,64,1080,None)
         with self.assertRaises(ValueError): destination_size(1920,1080,1080,None)
 
