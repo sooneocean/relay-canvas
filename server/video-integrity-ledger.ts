@@ -265,7 +265,7 @@ export class VideoIntegrityLedger {
       return { replay: prior, journal, state };
     }
     if (state.revision !== expectedRevision) fail('VIDEO_REVISION_CONFLICT', 'Video ledger changed; reload before writing.', 409);
-    return { journal, state };
+    return { replay: undefined, journal, state };
   }
 
   private commit(journal: Journal, state: LedgerState, boardId: string, operationId: string,
